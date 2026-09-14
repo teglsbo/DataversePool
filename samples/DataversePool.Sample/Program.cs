@@ -27,7 +27,7 @@ if (string.IsNullOrWhiteSpace(connectionString))
     Console.WriteLine();
     Console.WriteLine("DATAVERSEPOOL_SAMPLE_CONNECTION_STRING is not set — skipping the live Dataverse smoke test.");
     Console.WriteLine("To run it for real:");
-    Console.WriteLine("  export DATAVERSEPOOL_SAMPLE_CONNECTION_STRING=\"AuthType=ClientSecret;Url=https://yourorg.crm.dynamics.com;ClientId=...;ClientSecret=...;\"");
+    Console.WriteLine("  export DATAVERSEPOOL_SAMPLE_CONNECTION_STRING=\"AuthType=ClientSecret;Url=https://yourorg.crm.dynamics.com;ClientId=...;ClientSecret=...;EnableAffinityCookie=false;\"");
     Console.WriteLine("  dotnet run --project samples/DataversePool.Sample");
     Console.WriteLine("Optionally also set _2 / _3 suffixed variants to additionally exercise the group pool.");
     return;

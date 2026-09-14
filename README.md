@@ -69,7 +69,7 @@ using ConnectionPool.Dataverse;
 
 var pool = new DataverseUserPool(
     name: "primary",
-    connectionString: "AuthType=ClientSecret;Url=...;ClientId=...;ClientSecret=...;",
+    connectionString: "AuthType=ClientSecret;Url=...;ClientId=...;ClientSecret=...;EnableAffinityCookie=false;",
     options: new PoolOptions { MaxSize = 8, PrewarmCount = 2 });
 
 await pool.WarmupAsync(); // sequential, see ADR-0002 — do this once at startup
@@ -81,6 +81,15 @@ await using (var lease = await pool.AcquireAsync())
 }
 // disposing the lease returns the ServiceClient to the pool (or recycles it, if unhealthy)
 ```
+
+> **`EnableAffinityCookie=false`** is recommended in the connection string for any pooled scenario.
+> Dataverse's server affinity cookie (on by default) pins all requests from one `ServiceClient` to
+> a single backend node — good for a single interactive session, but counter-productive here: a
+> pool exists specifically to spread concurrent requests out, and pinning every pooled resource's
+> traffic to one node just recreates a single-node bottleneck server-side. Disabling it lets
+> requests from your pooled/leased clients be distributed across nodes as intended. See
+> [Microsoft's docs](https://learn.microsoft.com/en-us/dotnet/api/microsoft.powerplatform.dataverse.client.serviceclient.enableaffinitycookie)
+> for details.
 
 ## Quickstart: group pool (multiple application users)
 
@@ -225,7 +234,7 @@ single-user pooling, group pooling, and (optionally, if you provide real credent
 live connection smoke test against a Dataverse environment. Run with:
 
 ```bash
-export DATAVERSEPOOL_SAMPLE_CONNECTION_STRING="AuthType=ClientSecret;Url=https://yourorg.crm.dynamics.com;ClientId=...;ClientSecret=...;"
+export DATAVERSEPOOL_SAMPLE_CONNECTION_STRING="AuthType=ClientSecret;Url=https://yourorg.crm.dynamics.com;ClientId=...;ClientSecret=...;EnableAffinityCookie=false;"
 dotnet run --project samples/DataversePool.Sample
 ```
 
