@@ -1,4 +1,4 @@
-# TODO — DvPool (Dataverse Connection Pooling)
+# TODO — DataversePool (Dataverse Connection Pooling)
 
 Last updated: 2026-09-14 (ADR-0015: complexity review — no code duplication/dead knobs found, split ResourcePool.cs into ResourcePool.cs + ResourcePool.Recycling.cs for readability, no behavior change; paused further blanket "fix everything" review rounds)
 
@@ -142,7 +142,7 @@ Key implementation details:
 ## Project structure
 
 ```
-DvPool.sln
+DataversePool.slnx
 src/
   ConnectionPool.Core/                 # generic pool engine, no Dataverse knowledge
   ConnectionPool.Dataverse/            # ServiceClient adapter, single-user + group/round-robin
