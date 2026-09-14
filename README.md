@@ -231,7 +231,7 @@ Every non-obvious choice is written up as an ADR in [`docs/adr/`](docs/adr/):
 
 ## Status / open items
 
-See [`TODO.md`](TODO.md) — in particular, the "Åbne spørgsmål" section lists claims that are
+See [`TODO.md`](TODO.md) — in particular, the "Open questions" section lists claims that are
 believed true (e.g. socket exhaustion on new-per-request usage, `CallerId` cross-thread races) but
 have **not** been directly verified by this project's own tests.
 

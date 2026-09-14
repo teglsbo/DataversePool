@@ -1,27 +1,27 @@
-# ADR-0004: Ingen synkron sundhedstjek ved checkout — signal-baseret i stedet
+# ADR-0004: No synchronous health check at checkout — signal-based instead
 
 ## Status
-Accepteret
+Accepted
 
-## Kontekst
-Klassisk "validate on checkout" (kendt fra visse ADO.NET-providere) kræver en
-netværks-roundtrip pr. `AcquireAsync()`-kald for at bekræfte at ressourcen stadig
-virker. Det tilføjer latency til *hver* leje, selv i det normale (sunde) tilfælde.
+## Context
+Classic "validate on checkout" (known from certain ADO.NET providers) requires a
+network roundtrip per `AcquireAsync()` call to confirm that the resource still
+works. That adds latency to *every* lease, even in the normal (healthy) case.
 
-## Beslutning
-Poolen validerer **ikke** synkront ved hver checkout. I stedet:
-1. Hver slot har en billig in-memory status (`Idle` / `Unhealthy` / `Recycling`),
-   opdateret asynkront/event-drevet — ikke ved et netværkskald.
-2. Brugeren kalder `lease.MarkUnhealthy(exception)` når de selv observerer en fejl
-   på den udleverede klient (fx via Polly-adapteren, se ADR-0005) — poolen evakuerer
-   og genopretter slotten i baggrunden, uden at blokere andre acquires.
-3. En periodisk baggrundstjek (konfigurerbart interval, fx 1–5 min) kan proaktivt
-   opdage token-udløb før brug, uafhængigt af checkout-flowet.
+## Decision
+The pool does **not** validate synchronously on every checkout. Instead:
+1. Each slot has an inexpensive in-memory status (`Idle` / `Unhealthy` / `Recycling`),
+   updated asynchronously/event-driven — not by a network call.
+2. The user calls `lease.MarkUnhealthy(exception)` when they themselves observe a fault
+   on the leased client (for example via the Polly adapter, see ADR-0005) — the pool evacuates
+   and recreates the slot in the background, without blocking other acquires.
+3. A periodic background check (configurable interval, for example 1–5 min) can proactively
+   detect token expiry before use, independently of the checkout flow.
 
-## Konsekvenser
-- Normalt-sti (`AcquireAsync` på en sund slot) har ingen ekstra netværks-latency.
-- Fejldetektion er reaktiv (afhænger af at brugeren kalder `MarkUnhealthy`) frem for
-  proaktivt garanteret ved hver leje — accepteret tradeoff, da Polly-adapteren gør
-  dette til ét linje boilerplate for brugeren (se ADR-0005).
-- Skal testes: efter `MarkUnhealthy`, verificér at ny `AcquireAsync` ikke returnerer
-  samme (nu usunde) ressource, og at genopretning ikke blokerer andre ventende leases.
+## Consequences
+- The normal path (`AcquireAsync` on a healthy slot) has no additional network latency.
+- Fault detection is reactive (depends on the user calling `MarkUnhealthy`) rather than
+  proactively guaranteed on every lease — accepted tradeoff, because the Polly adapter makes
+  this one line of boilerplate for the user (see ADR-0005).
+- Must be tested: after `MarkUnhealthy`, verify that a new `AcquireAsync` does not return
+  the same (now unhealthy) resource, and that recovery does not block other waiting leases.

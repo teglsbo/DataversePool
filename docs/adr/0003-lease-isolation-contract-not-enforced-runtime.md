@@ -1,36 +1,36 @@
-# ADR-0003: Non-shared lease er en dispose-kontrakt, ikke runtime-håndhævet isolation
+# ADR-0003: Non-shared lease is a disposal contract, not runtime-enforced isolation
 
 ## Status
-Accepteret (leak-tracking-adfærden nævnt under "Beslutning" er delvist opdateret af
-[ADR-0012](0012-log-only-leak-detection-and-bounded-acquire.md) — leak-tracking evakuerer/genopretter
-IKKE længere slotten automatisk, se ADR-0012 for hvorfor og den fulde nye adfærd. Resten af denne
-ADR's beslutning — dispose-kontrakt, ikke runtime-håndhævet isolation — står uændret.)
+Accepted (the leak-tracking behavior mentioned under "Decision" is partially updated by
+[ADR-0012](0012-log-only-leak-detection-and-bounded-acquire.md) — leak tracking no longer
+evacuates/recovers the slot automatically; see ADR-0012 for why and for the full new behavior. The rest of this
+ADR's decision — disposal contract, not runtime-enforced isolation — remains unchanged.)
 
-## Kontekst
-`ServiceClient` er ikke thread-safe ved deling på tværs af tråde med forskellig
-`CallerId`. Vi har ikke selv verificeret denne race condition (0 exceptions i test),
-men varierede aldrig `CallerId` samtidigt på tværs af tråde — så risikoen er reel,
-men uverificeret af os.
+## Context
+`ServiceClient` is not thread-safe when shared across threads with different
+`CallerId`. We have not verified this race condition ourselves (0 exceptions in testing),
+but we never varied `CallerId` concurrently across threads — so the risk is real,
+but unverified by us.
 
-En fuldt runtime-håndhævet isolation (fx per-kald lock-check) ville tilføje
-overhead og kompleksitet til hvert kald på den udleverede klient.
+A fully runtime-enforced isolation model (for example a per-call lock check) would add
+overhead and complexity to every call on the leased client.
 
-## Beslutning
-Isolation garanteres **inden for kontrakten**: én lease = eksklusiv ejerskab af
-ressourcen indtil `DisposeAsync()` kaldes. Poolen håndhæver ikke at brugeren rent
-faktisk undlader at dele referencen videre til andre tråde — det er brugerens ansvar.
+## Decision
+Isolation is guaranteed **within the contract**: one lease = exclusive ownership of
+the resource until `DisposeAsync()` is called. The pool does not enforce that the user
+actually refrains from sharing the reference with other threads — that is the user's responsibility.
 
-Til gengæld:
-- Leak-tracking opdager leases der aldrig disposes (via finalizer-warning, jf.
-  `LeakTrackingObjectPool`-mønsteret) og evakuerer/genopretter slotten — billigt,
-  fordi re-clone fra en varm base er ~1ms (se ADR-0002).
-- `MarkUnhealthy(exception)` giver brugeren et billigt "nød-signal" hvis de selv
-  opdager at en leased ressource mistede forbindelsen, uden at skulle vente på en
-  fuld health-check-cyklus.
+In return:
+- Leak tracking detects leases that are never disposed (via a finalizer warning; see
+  the `LeakTrackingObjectPool` pattern) and evacuates/recovers the slot — inexpensive,
+  because re-cloning from a warm base is ~1ms (see ADR-0002).
+- `MarkUnhealthy(exception)` gives the user a cheap "emergency signal" if they themselves
+  discover that a leased resource lost its connection, without having to wait for a
+  full health-check cycle.
 
-## Konsekvenser
-- Ingen runtime-overhead pr. kald på den underliggende `ServiceClient`.
-- Kontrakten skal være tydeligt dokumenteret i XML-docs/README: "del aldrig en
-  lease's Resource mellem tråde, dispose altid, brug MarkUnhealthy ved mistanke om fejl."
-- Åben opfølgning: hvis fremtidig test *bekræfter* faktisk cross-thread korruption
-  (ikke kun teoretisk risiko), skal vi genoverveje en strengere runtime-check.
+## Consequences
+- No runtime overhead per call on the underlying `ServiceClient`.
+- The contract must be clearly documented in XML docs/README: "never share a
+  lease's Resource between threads, always dispose, use MarkUnhealthy when you suspect a fault."
+- Open follow-up: if future testing *confirms* actual cross-thread corruption
+  (not only theoretical risk), we must reconsider a stricter runtime check.

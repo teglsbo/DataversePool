@@ -1,134 +1,133 @@
-# ADR-0011: Outcome-baseret probe-completion + finalizer-tråd-sikkerhed
+# ADR-0011: Outcome-based probe completion + finalizer thread safety
 
 ## Status
-Accepteret (delvist — se "Bevidst ikke løst her" for hvad der forbliver åbent)
+Accepted (partially — see "Deliberately not resolved here" for what remains open)
 
-## Kontekst
-Efter ADR-0009/0010 blev committet, blev endnu en runde af tre parallelle reviews kørt mod hele
-kodebasen: sikkerhed, en DB-connection-pool-designekspert, og en distribueret-systemer-ekspert
-(der specifikt genverificerede ADR-0009/0010-fixene i stedet for at tage dem for pålydende).
+## Context
+After ADR-0009/0010 was committed, another round of three parallel reviews was run against the entire
+codebase: security, a DB connection-pool design expert, and a distributed-systems expert
+(who specifically re-verified the ADR-0009/0010 fixes instead of taking them at face value).
 
-**Sikkerhed**: ingen nye fund. CallerId-scrubbing (ADR-0009) blev bekræftet korrekt og komplet;
-`MemberCircuitBreaker`s lock blev vurderet race-fri på selve datastrukturen.
+**Security**: no new findings. CallerId scrubbing (ADR-0009) was confirmed correct and complete;
+`MemberCircuitBreaker`'s lock was assessed as race-free for the data structure itself.
 
-**Distribueret-systemer-genreview** fandt at ADR-0010's single-probe-fix **ikke var komplet**:
-1. `probeClaimTimeout` er en blind timer, ikke et signal om probens reelle udfald. Hvis den
-   oprindelige prober stadig hænger i `CreateAsync` (ubegrænset uden `PoolOptions.CreateTimeout`)
-   når timeout'en udløber, kan et *nyt* probe tildeles samtidig med det gamle — præcis den
-   thundering-herd-bug ADR-0010 skulle løse.
-2. `MemberCircuitBreaker`s konstruktør validerede ikke at `cooldownPeriod`/`probeClaimTimeout` er
-   positive — `TimeSpan.Zero` ville lade alle samtidige callers vinde probet på én gang.
-3. (Bekræftet fortsat åbent, forventet): circuit måler kun creation-fejl, ikke operationelle fejl.
-4. (Bekræftet fortsat åbent, forventet): ingen bounded acquire-kø/deadline i `ResourcePool`.
-5. (Non-blocking): `EarliestKnownRetryAt` i `DataverseGroupUnavailableException` kunne rapportere
-   et allerede udløbet throttle-tidspunkt, fordi throttle-ticks aldrig ryddes efter udløb.
+**Distributed-systems re-review** found that ADR-0010's single-probe fix **was not complete**:
+1. `probeClaimTimeout` is a blind timer, not a signal of the probe's real outcome. If the
+   original prober is still hanging in `CreateAsync` (unbounded without `PoolOptions.CreateTimeout`)
+   when the timeout expires, a *new* probe can be assigned concurrently with the old one — exactly the
+   thundering-herd bug ADR-0010 was supposed to fix.
+2. `MemberCircuitBreaker`'s constructor did not validate that `cooldownPeriod`/`probeClaimTimeout` are
+   positive — `TimeSpan.Zero` would let all concurrent callers win the probe at once.
+3. (Confirmed still open, expected): the circuit still measures only creation failures, not operational failures.
+4. (Confirmed still open, expected): no bounded acquire queue/deadline in `ResourcePool`.
+5. (Non-blocking): `EarliestKnownRetryAt` in `DataverseGroupUnavailableException` could report
+   an already expired throttle timestamp because throttle ticks were never cleared after expiry.
 
-**DB-pool-designeksperten** fandt tre "blocking"-niveau fund:
-1. **Finalizer-baseret leak-reclaim kan disponere en ressource der reelt stadig er i brug** — hvis
-   en caller kun taber sin reference til selve `PooledLease<T>` (men stadig bruger
-   `lease.Resource` et sted), kan GC finalizere leasen og udløse recycle/dispose, mens ressourcen
-   samtidig bruges. Modsat fx HikariCP, der som udgangspunkt kun *logger* formodede leaks uden at
-   handle på dem.
-2. **Bruger-callbacks (`OnLeakDetected`, `HealthChanges`-observers) kaldes synkront på selve
-   finalizer-tråden.** En ubehandlet exception der er process-fatal, og en langsom/blokerende
-   subscriber ville forsinke finalization af alt andet.
-3. **Den serielle creation-gate (ADR-0002) gælder kun *inden for* én `DataverseUserPool`s egen
-   `ResourcePool`** — under normal belastning (ikke kun warmup) kan `DataverseGroupPool` sagtens
-   udløse samtidige `CreateAsync`-kald på tværs af *forskellige* medlemmer, hvilket potentielt kan
-   ramme den samme SDK-interne lock-contention (1-3.2s) ADR-0002 identificerede — men dette er
-   uverificeret uden empirisk måling af, om SDK'ens interne lock er per-instans eller
-   proces-global.
+**The DB pool design expert** found three "blocking"-level findings:
+1. **Finalizer-based leak reclaim can dispose a resource that is actually still in use** — if
+   a caller only loses its reference to the `PooledLease<T>` itself (while still using
+   `lease.Resource` somewhere), GC can finalize the lease and trigger recycle/dispose while the
+   resource is simultaneously being used. Unlike, for example, HikariCP, which by default only *logs*
+   suspected leaks without acting on them.
+2. **User callbacks (`OnLeakDetected`, `HealthChanges` observers) are invoked synchronously on the
+   finalizer thread itself.** An unhandled exception there is process-fatal, and a slow/blocking
+   subscriber would delay finalization of everything else.
+3. **The serialized creation gate (ADR-0002) applies only *within* one `DataverseUserPool`'s own
+   `ResourcePool`** — under normal load (not just warmup), `DataverseGroupPool` can absolutely trigger
+   concurrent `CreateAsync` calls across *different* members, which could potentially hit the same
+   SDK-internal lock contention (1-3.2s) identified by ADR-0002 — but this is unverified without empirical
+   measurement of whether the SDK's internal lock is per instance or process-global.
 
-## Beslutning
+## Decision
 
-### Fix: `MemberCircuitBreaker.CompleteProbe(member, succeeded)` — eksplicit outcome-rapportering
-I stedet for udelukkende at stole på at `probeClaimTimeout` udløber, kan/skal kaldere nu
-rapportere det faktiske udfald af et acquire-forsøg:
-- **Success** rydder al breaker-bogføring for medlemmet med det samme (lukker kredsløbet uden at
-  vente på næste stats-snapshot eller på at `probeClaimTimeout` udløber).
-- **Failure** genstarter cooldown-vinduet fra nu og frigiver claim'et med det samme, så *næste*
-  cooldowns probe ikke unødigt blokeres af et allerede afgjort forsøg.
+### Fix: `MemberCircuitBreaker.CompleteProbe(member, succeeded)` — explicit outcome reporting
+Instead of relying exclusively on `probeClaimTimeout` expiring, callers can/should now
+report the actual outcome of an acquire attempt:
+- **Success** clears all breaker bookkeeping for the member immediately (closing the circuit without
+  waiting for the next stats snapshot or for `probeClaimTimeout` to expire).
+- **Failure** restarts the cooldown window from now and releases the claim immediately, so the *next*
+  cooldown's probe is not unnecessarily blocked by an already decided attempt.
 
-`DataverseGroupPool.AcquireAsync` kalder nu `_strategy.ReportAcquireOutcome(member, succeeded)`
-efter hvert forsøg (i en try/catch omkring selve `AcquireAsync`-kaldet på det valgte medlem) —
-`OperationCanceledException` fra callerens egen cancellation-token rapporteres bevidst IKKE som et
-outcome (annullering er ikke et sundhedssignal om medlemmet). `ISlotSelectionStrategy` fik en ny
-default-no-op-metode `ReportAcquireOutcome`, så strategier uden circuit-breaking (almindelig
-round-robin) ikke behøver ændres.
+`DataverseGroupPool.AcquireAsync` now calls `_strategy.ReportAcquireOutcome(member, succeeded)`
+after each attempt (in a try/catch around the actual `AcquireAsync` call on the selected member) —
+`OperationCanceledException` from the caller's own cancellation token is deliberately NOT reported as an
+outcome (cancellation is not a health signal about the member). `ISlotSelectionStrategy` got a new
+default no-op method `ReportAcquireOutcome`, so strategies without circuit breaking (ordinary
+round-robin) do not need to change.
 
-**Dette lukker ikke hele hullet, og det påstår vi ikke at det gør:** hvis selve acquire-forsøget
-hænger uendeligt uden `PoolOptions.CreateTimeout` sat, rapporteres intet outcome, og
-`probeClaimTimeout`-fallback'en er stadig det der til sidst tillader et nyt probe — den
-oprindelige race fra reviewen kan stadig i teorien opstå i det tilfælde. Ligeledes: hvis et
-half-open-forsøg tilfældigvis rammer en allerede oprettet idle-ressource (ingen `CreateAsync`
-kaldes overhovedet), beviser et "success" ikke at medlemmet reelt kan oprette forbindelser igen —
-det er stadig en tilnærmelse. Anbefalingen til operatører er derfor eksplicit: **sæt
-`PoolOptions.CreateTimeout`** for at bounded dette residual-tilfælde. Dokumenteret direkte i
-XML-doc på `CompleteProbe`.
+**This does not close the entire hole, and we do not claim that it does:** if the acquire attempt itself
+hangs forever without `PoolOptions.CreateTimeout` set, no outcome is reported, and the
+`probeClaimTimeout` fallback is still what eventually allows a new probe — the
+original race from the review can still theoretically occur in that case. Likewise, if a
+half-open attempt happens to hit an already-created idle resource (no `CreateAsync`
+is called at all), a "success" does not prove that the member can actually create connections again —
+it is still an approximation. The recommendation to operators is therefore explicit: **set
+`PoolOptions.CreateTimeout`** to bound this residual case. Documented directly in the
+XML doc on `CompleteProbe`.
 
-### Fix: input-validering i `MemberCircuitBreaker`-konstruktøren
-`cooldownPeriod <= TimeSpan.Zero` og `probeClaimTimeout <= TimeSpan.Zero` kaster nu
-`ArgumentOutOfRangeException` i stedet for stiltiende at acceptere værdier der ville ødelægge
-single-probe-garantien.
+### Fix: input validation in `MemberCircuitBreaker`'s constructor
+`cooldownPeriod <= TimeSpan.Zero` and `probeClaimTimeout <= TimeSpan.Zero` now throw
+`ArgumentOutOfRangeException` instead of silently accepting values that would destroy the
+single-probe guarantee.
 
-### Fix: finalizer-tråd-sikkerhed i `ResourcePool<T>`
-`ReportLeakedLease` (kaldt direkte fra `PooledLease<T>`s finalizer) er nu begrænset til billige,
-exception-fri felt-opdateringer. Selve callback-kaldet (`OnLeakDetected`) og
-observer-notifikationen (`PublishHealthChanged`/`HealthChanges`) dispatches nu via
-`ThreadPool.QueueUserWorkItem` til en almindelig trådpool-tråd — ikke finalizer-tråden. Både
-`OnLeakDetected`-kaldet og hver enkelt observers `OnNext` er desuden nu wrappet i try/catch: en
-fejlende subscriber kan hverken (a) crashe processen via en ubehandlet exception på
-finalizer-tråden, (b) blokere andre observers fra at blive notificeret, eller (c) forhindre at
-slottet stadig bliver sendt til recycling bagefter.
+### Fix: finalizer thread safety in `ResourcePool<T>`
+`ReportLeakedLease` (called directly from `PooledLease<T>`'s finalizer) is now limited to cheap,
+exception-free field updates. The actual callback invocation (`OnLeakDetected`) and
+observer notification (`PublishHealthChanged`/`HealthChanges`) are now dispatched via
+`ThreadPool.QueueUserWorkItem` to an ordinary thread-pool thread — not the finalizer thread. Both
+`OnLeakDetected` invocation and each individual observer's `OnNext` are also now wrapped in try/catch: a
+failing subscriber can neither (a) crash the process via an unhandled exception on the
+finalizer thread, (b) block other observers from being notified, nor (c) prevent the
+slot from still being sent to recycling afterward.
 
-**Vi ændrede bevidst IKKE den grundlæggende arkitektur-beslutning** (ADR-0003/0004) om at en
-leaked lease udløser recycle/dispose af den underliggende ressource. DB-pool-ekspertens stærkere
-anbefaling — gør leak-detection rent diagnostisk (kun log, aldrig disponer, som HikariCP) — blev
-overvejet, men afvist for nu: det ville reversere en allerede truffet, dokumenteret
-design-beslutning uden brugerens eksplicitte input, og det fjerner en sikkerhedsnet-egenskab
-(en virkelig glemt/lækket ressource bliver aldrig genbrugt af en fremtidig caller i ukendt
-tilstand). Den *reelle* bug her var ikke "at recycle er en dårlig idé", men at
-callback-eksekveringen skete usikkert på finalizer-tråden — det er rettet. Risikoen for at
-disponere en teknisk stadig-i-brug ressource (fordi kun lease-wrapperen, ikke selve ressourcen,
-blev tabt af referencer) er en iboende konsekvens af selve leak-detection-designet og forbliver
-dokumenteret som en kendt afvejning, ikke en bug at "rette" uden at ændre hele modellen.
+**We deliberately did NOT change the fundamental architectural decision** (ADR-0003/0004) that a
+leaked lease triggers recycle/dispose of the underlying resource. The DB pool expert's stronger
+recommendation — make leak detection purely diagnostic (log only, never dispose, like HikariCP) — was
+considered, but rejected for now: it would reverse an already made, documented
+design decision without the user's explicit input, and it removes a safety-net property
+(a truly forgotten/leaked resource is never reused by a future caller in an unknown
+state). The *real* bug here was not "recycling is a bad idea," but that
+callback execution happened unsafely on the finalizer thread — that is fixed. The risk of
+disposing a technically still-in-use resource (because only the lease wrapper, not the resource itself,
+lost all references) is an inherent consequence of the leak-detection design itself and remains
+presented as a known trade-off, not a bug to "fix" without changing the entire model.
 
-### Fix: stale throttle-tick i `DataverseGroupPool.BuildUnavailableException`
-`EarliestKnownRetryAt`-beregningen filtrerer nu `ThrottledUntil`-værdier til kun dem der stadig er
-i fremtiden (`> DateTimeOffset.UtcNow`) før `Min()` beregnes — en allerede udløbet throttle-tick
-(som aldrig ryddes proaktivt) rapporteres ikke længere fejlagtigt som et gyldigt fremtidigt
-retry-tidspunkt.
+### Fix: stale throttle tick in `DataverseGroupPool.BuildUnavailableException`
+`EarliestKnownRetryAt` calculation now filters `ThrottledUntil` values down to only those still
+in the future (`> DateTimeOffset.UtcNow`) before `Min()` is computed — an already expired throttle tick
+(which is never proactively cleared) is no longer incorrectly reported as a valid future
+retry time.
 
-## Bevidst ikke løst her
-Følgende fund fra denne reviewrunde er **bekræftet reelle, men bevidst ikke rettet** i denne ADR —
-enten fordi de kræver et større arkitektur-skifte, empirisk verifikation, eller en eksplicit
-produktbeslutning fra brugeren, som ikke var tilgængelig da dette arbejde blev udført:
+## Deliberately not resolved here
+The following findings from this review round are **confirmed real, but deliberately not fixed** in this ADR —
+either because they require a larger architectural shift, empirical verification, or an explicit
+product decision from the user, which was not available when this work was performed:
 
-- **Bounded acquire-kø/deadline** (`AcquireTimeout`/`MaxWaiters` i `ResourcePool.AcquireAsync`) —
-  vurderet af begge eksperter som højeste tilbageværende prioritet. Ikke bygget her, da det er en
-  ikke-triviel, potentielt breaking API-udvidelse (ny option, ny exception-type for
-  queue-timeout/overflow) der fortjener sin egen dedikerede runde.
-- **Outcome-drevet circuit breaker for operationelle fejl** (ikke kun creation-fejl) — kræver at
-  `PooledLease.MarkUnhealthy` (eller en ny mekanisme) fodrer samme `ConsecutiveCreateFailures`-agtige
-  signal som group-strategierne læser, hvilket er en større ændring af `PoolStats`/`ResourcePool`s
-  ansvarsfordeling.
-- **Cross-member samtidig `CreateAsync` i `DataverseGroupPool`** — DB-pool-eksperten selv
-  anbefalede empirisk verifikation (måle om SDK'ens lock-contention er per-instans eller
-  proces-global) FØR man bygger en global gate på tværs af gruppe-medlemmer, for ikke at
-  introducere unødig serialisering, der ikke løser et reelt problem.
-- **Leak-detection som rent diagnostisk (log-only)** — se begrundelse ovenfor; en bevidst afvigelse
-  fra DB-pool-ekspertens anbefaling, ikke en fejl.
-- **Cross-process budget-koordinering** (ADR-0009/0010's punkt #1) — fortsat eksplicit afvist af
-  brugeren ("ingen delt state mellem processer").
+- **Bounded acquire queue/deadline** (`AcquireTimeout`/`MaxWaiters` in `ResourcePool.AcquireAsync`) —
+  assessed by both experts as the highest remaining priority. Not built here because it is a
+  non-trivial, potentially breaking API extension (new option, new exception type for
+  queue timeout/overflow) that deserves its own dedicated round.
+- **Outcome-driven circuit breaker for operational failures** (not only creation failures) — requires that
+  `PooledLease.MarkUnhealthy` (or a new mechanism) feeds the same `ConsecutiveCreateFailures`-like
+  signal that the group strategies read, which is a larger change to `PoolStats`/`ResourcePool`'s
+  responsibility split.
+- **Cross-member concurrent `CreateAsync` in `DataverseGroupPool`** — the DB pool expert himself
+  recommended empirical verification (measure whether the SDK's lock contention is per instance or
+  process-global) BEFORE building a global gate across group members, so as not to
+  introduce unnecessary serialization that does not solve a real problem.
+- **Leak detection as purely diagnostic (log-only)** — see the rationale above; a deliberate deviation
+  from the DB pool expert's recommendation, not an error.
+- **Cross-process budget coordination** (ADR-0009/0010 point #1) — still explicitly rejected by the
+  user ("no shared state between processes").
 
-## Konsekvenser
-- **Ikke breaking**: `CompleteProbe` og `ReportAcquireOutcome` er additive API'er
-  (`ISlotSelectionStrategy.ReportAcquireOutcome` har default no-op-implementering). Eksisterende
-  brugerdefinerede strategier kompilerer uændret.
-- `MemberCircuitBreaker`-konstruktøren kaster nu for tidligere gyldige (men meningsløse)
-  `TimeSpan.Zero`/negative inputs — teknisk breaking for enhver der (fejlagtigt) brugte disse, men
-  vurderet ønskværdigt: den slags konfiguration var altid en bug.
-- Test-dækning: 61/61 grønne efter denne ændring (Core 17 [+2], Dataverse 41 [+7], Polly 3),
-  inklusiv nye tests for TimeSpan-validering, `CompleteProbe` success/failure-adfærd, stale
-  throttle-tick-filtrering, og GC-triggered leak-reporting med en bevidst fejlende
-  callback/observer (verificerer ingen exception undslipper, og at slottet stadig recycles).
+## Consequences
+- **Not breaking**: `CompleteProbe` and `ReportAcquireOutcome` are additive APIs
+  (`ISlotSelectionStrategy.ReportAcquireOutcome` has a default no-op implementation). Existing
+  custom strategies compile unchanged.
+- `MemberCircuitBreaker`'s constructor now throws for previously accepted (but meaningless)
+  `TimeSpan.Zero`/negative inputs — technically breaking for anyone who (incorrectly) used these, but
+  judged desirable: that kind of configuration was always a bug.
+- Test coverage: 61/61 passing after this change (Core 17 [+2], Dataverse 41 [+7], Polly 3),
+  including new tests for TimeSpan validation, `CompleteProbe` success/failure behavior, stale
+  throttle-tick filtering, and GC-triggered leak reporting with an intentionally failing
+  callback/observer (verifies no exception escapes, and that the slot is still recycled).

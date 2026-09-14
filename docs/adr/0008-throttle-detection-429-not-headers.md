@@ -1,74 +1,74 @@
-# ADR-0008: Throttle-detektion via HTTP 429/exception, ikke proaktive rate-limit-headere
+# ADR-0008: Throttle detection via HTTP 429/exception, not proactive rate-limit headers
 
 ## Status
-Accepteret
+Accepted
 
-## Kontekst
-Spørgsmål: skal gruppe-poolens throttle-awareness (dvs. undgå at sende trafik til et medlem der er
-tæt på sit Dataverse service-protection-loft) baseres på (a) Dataverse's proaktive
-`x-ms-ratelimit-*` response-headere, eller (b) det reaktive HTTP 429-svar (`Retry-After`)?
+## Context
+Question: should the group pool's throttle awareness (i.e., avoiding sending traffic to a member that is
+close to its Dataverse service-protection limit) be based on (a) Dataverse's proactive
+`x-ms-ratelimit-*` response headers, or (b) the reactive HTTP 429 response (`Retry-After`)?
 
-Generelt, for Dataverse's Web API i sig selv, er svaret klart **headers er bedre**: Dataverse sender
-`x-ms-ratelimit-burst-remaining-xrm-requests`, `x-ms-ratelimit-time-remaining-xrm-requests` (og
-tilsvarende for execution-time-budgettet) på **hver eneste** response — succesfuld eller ej. Det er
-et *leading* signal (reager før man bliver throttlet), hvor et 429 er et *lagging* signal (reager
-først efter Dataverse allerede har afvist et kald).
+In general, for Dataverse's Web API itself, the answer is clearly **headers are better**: Dataverse sends
+`x-ms-ratelimit-burst-remaining-xrm-requests`, `x-ms-ratelimit-time-remaining-xrm-requests` (and
+the corresponding headers for the execution-time budget) on **every single** response — successful or not. It is
+a *leading* signal (react before you get throttled), whereas a 429 is a *lagging* signal (react only
+after Dataverse has already rejected a call).
 
-Men denne pool wrapper ikke Dataverse's rå Web API — den wrapper
-`Microsoft.PowerPlatform.Dataverse.Client.ServiceClient`. Vi undersøgte via refleksion om
-`ServiceClient` (og dens `ConnectionOptions`) eksponerer disse headere for et *succesfuldt* kald:
+But this pool does not wrap Dataverse's raw Web API — it wraps
+`Microsoft.PowerPlatform.Dataverse.Client.ServiceClient`. We investigated via reflection whether
+`ServiceClient` (and its `ConnectionOptions`) expose these headers for a *successful* call:
 
-- Ingen public property, event eller hook på `ServiceClient` eller `ConnectionOptions` giver adgang
-  til response-headers for et succesfuldt kald.
-- `ServiceClient` har sin egen interne retry-logik for throttling
-  (`MaxRetryCount`/`RetryPauseTime`/`UseExponentialRetryDelayForConcurrencyThrottle`) — den
-  absorberer 429'ere internt og retryer selv, før noget overhovedet når brugerkoden.
-- **Når** SDK'ens egen retry-budget er opbrugt, kastes en
-  `Microsoft.PowerPlatform.Dataverse.Client.Exceptions.HttpOperationException` hvis
-  `Response`-property *rent faktisk* eksponerer `StatusCode` (verificeret: `429`) og `Headers`
-  (verificeret: `IDictionary<string, IEnumerable<string>>`, inkl. `Retry-After`) — bekræftet ved
-  refleksion på den faktiske SDK-DLL, ikke antaget.
+- No public property, event, or hook on `ServiceClient` or `ConnectionOptions` provides access
+  to response headers for a successful call.
+- `ServiceClient` has its own internal retry logic for throttling
+  (`MaxRetryCount`/`RetryPauseTime`/`UseExponentialRetryDelayForConcurrencyThrottle`) — it
+  absorbs 429s internally and retries on its own before anything even reaches user code.
+- **When** the SDK's own retry budget is exhausted, a
+  `Microsoft.PowerPlatform.Dataverse.Client.Exceptions.HttpOperationException` is thrown whose
+  `Response` property *does in fact* expose `StatusCode` (verified: `429`) and `Headers`
+  (verified: `IDictionary<string, IEnumerable<string>>`, including `Retry-After`) — confirmed via
+  reflection against the actual SDK DLL, not assumed.
 
-Konklusion: for **denne SDK**, er 429/exception-vejen ikke en præference blandt to lige gode
-muligheder — det er den eneste faktisk tilgængelige struktur uden at reflektere ind i
-`ServiceClient`s private HTTP-pipeline (skrøbeligt, ikke understøttet af Microsoft, og et
-vedligeholdelsesmareridt ved SDK-opgraderinger). Det blev derfor bevidst fravalgt.
+Conclusion: for **this SDK**, the 429/exception path is not a preference among two equally good
+options — it is the only actually available structure short of reflecting into
+`ServiceClient`'s private HTTP pipeline (fragile, unsupported by Microsoft, and a
+maintenance nightmare during SDK upgrades). It was therefore deliberately rejected.
 
-## Beslutning
-- `DataverseThrottleDetector.TryGetRetryAfter(Exception?, out TimeSpan)` går exception-kæden
-  igennem, finder en `HttpOperationException` med `Response.StatusCode == 429`, og parser
-  `Retry-After`-headeren (sekunder eller HTTP-dato) til en `TimeSpan`. Hvis 429 findes men
-  `Retry-After` mangler/ikke kan parses, bruges en konservativ default (5s) — stadig bedre end at
-  ignorere signalet.
-- `DataverseUserPool` får `ThrottledUntil`/`IsThrottled`/`ReportThrottled(TimeSpan)` — throttling
-  markerer **ikke** ressourcen unhealthy/til recycling (forbindelsen er fin, brugeren er bare midlertidigt
-  over sit eget budget). Dette er bevidst en separat mekanisme fra `MarkUnhealthy`
-  (ADR-0004/0007), som er til reelt defekte forbindelser.
-- `DataverseGroupPool.AcquireAsync()` returnerer nu `DataverseGroupLease` (ikke en rå
-  `PooledLease<ServiceClient>`) specifikt så en forbruger kan rapportere en 429 tilbage til det
-  **rigtige** medlem — poolen ved selv ikke hvilket medlem der blev valgt til et givent kald uden
-  denne reference. `DataverseGroupLease.ReportIfThrottled(exception)` er bekvemmeligheds-metoden
-  der kombinerer detection + rapportering i ét kald.
-- Begge selection-strategier (`HealthAwareRoundRobinSlotSelectionStrategy`,
-  `LeastConnectionsSlotSelectionStrategy`) springer nu også throttlede medlemmer over, med samme
-  "fail open hvis alle er nede"-garanti som for circuit-open medlemmer (ADR-0007 #6).
+## Decision
+- `DataverseThrottleDetector.TryGetRetryAfter(Exception?, out TimeSpan)` walks the exception chain,
+  finds a `HttpOperationException` with `Response.StatusCode == 429`, and parses the
+  `Retry-After` header (seconds or HTTP date) into a `TimeSpan`. If a 429 is found but
+  `Retry-After` is missing/cannot be parsed, a conservative default (5s) is used — still better than
+  ignoring the signal.
+- `DataverseUserPool` gets `ThrottledUntil`/`IsThrottled`/`ReportThrottled(TimeSpan)` — throttling
+  does **not** mark the resource unhealthy/for recycling (the connection is fine, the user is just temporarily
+  over its own budget). This is deliberately a separate mechanism from `MarkUnhealthy`
+  (ADR-0004/0007), which is for genuinely defective connections.
+- `DataverseGroupPool.AcquireAsync()` now returns `DataverseGroupLease` (not a raw
+  `PooledLease<ServiceClient>`) specifically so a consumer can report a 429 back to the
+  **correct** member — the pool itself otherwise does not know which member was selected for a given
+  call without this reference. `DataverseGroupLease.ReportIfThrottled(exception)` is the convenience method
+  that combines detection + reporting in one call.
+- Both selection strategies (`HealthAwareRoundRobinSlotSelectionStrategy`,
+  `LeastConnectionsSlotSelectionStrategy`) now also skip throttled members, with the same
+  "fail open if all are down" guarantee as for circuit-open members (ADR-0007 #6).
 
-## Konsekvenser
-- **Kræver eksplicit rapportering fra forbrugeren.** Poolen kan ikke selv opdage throttling — den
-  ser ikke hvad man gør med en udleveret `ServiceClient` efter `AcquireAsync()`. Hvis en forbruger
-  ikke kalder `ReportIfThrottled`/`ReportThrottled` i sit fejl-håndteringsflow, er throttle-awareness
-  en no-op. Dette er dokumenteret som en hård grænse, ikke en fremtidig "todo".
-- **Kun 429 der rent faktisk undslipper SDK'ens egen retry, opdages.** De fleste transiente
-  throttle-hændelser absorberes allerede internt af `ServiceClient` (det er meningen med dens egen
-  retry-logik) — vores signal er reelt kun for vedvarende/gentagne throttling der overlever
-  SDK'ens interne retry-budget. Det er stadig værdifuldt (det er præcis situationen hvor gruppens
-  round-robin ellers ville blive ved med at hamre det samme medlem), men det er ikke en generel
-  telemetri-kilde for hvor tæt et medlem er på sit loft under normal drift.
-- **`DataverseGroupPool.AcquireAsync()`s returtype ændret** fra `PooledLease<ServiceClient>` til
-  `DataverseGroupLease` — et bevidst API-brud, acceptabelt fordi biblioteket stadig er
-  pre-1.0/preview. `DataverseGroupLease` beholder samme brugsmønster (`.Resource`,
-  `await using`/`DisposeAsync`), så migration er minimal.
-- Hvis en fremtidig SDK-version eksponerer response-headers for succesfulde kald (eller vi skifter
-  til at kalde Web API'et direkte i stedet for via `ServiceClient`), kan en proaktiv
-  header-baseret strategi tilføjes som et nyt, separat signal uden at ændre den kontrakt der er
-  sat op her.
+## Consequences
+- **Requires explicit reporting from the consumer.** The pool cannot detect throttling on its own — it
+  does not see what you do with a leased `ServiceClient` after `AcquireAsync()`. If a consumer
+  does not call `ReportIfThrottled`/`ReportThrottled` in its error-handling flow, throttle awareness
+  is a no-op. This is documented as a hard boundary, not a future "todo".
+- **Only 429s that actually escape the SDK's own retry are detected.** Most transient
+  throttling events are already absorbed internally by `ServiceClient` (that is the whole point of its own
+  retry logic) — our signal is effectively only for persistent/repeated throttling that survives
+  the SDK's internal retry budget. That is still valuable (it is exactly the situation where the group's
+  round-robin would otherwise keep hammering the same member), but it is not a general
+  telemetry source for how close a member is to its limit during normal operation.
+- **`DataverseGroupPool.AcquireAsync()`'s return type changed** from `PooledLease<ServiceClient>` to
+  `DataverseGroupLease` — an intentional API break, acceptable because the library is still
+  pre-1.0/preview. `DataverseGroupLease` keeps the same usage pattern (`.Resource`,
+  `await using`/`DisposeAsync`), so migration is minimal.
+- If a future SDK version exposes response headers for successful calls (or we switch
+  to calling the Web API directly instead of through `ServiceClient`), a proactive
+  header-based strategy can be added as a new, separate signal without changing the contract established
+  here.

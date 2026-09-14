@@ -1,15 +1,15 @@
-# ADR-0001: Generisk pool-kerne afkoblet fra Dataverse via `IPooledResourcePolicy<T>`
+# ADR-0001: Generic pool core decoupled from Dataverse via `IPooledResourcePolicy<T>`
 
 ## Status
-Accepteret
+Accepted
 
-## Kontekst
-Vi skal bygge connection pooling til Dataverse `ServiceClient`, men ønsker ikke at låse
-hele designet til Dataverse-specifik viden (tokens, discovery, `CallerId`). Andre
-ressourcetyper (fx andre SDK-klienter) kan få gavn af samme pool-motor.
+## Context
+We need to build connection pooling for Dataverse `ServiceClient`, but we do not want to lock
+the entire design to Dataverse-specific knowledge (tokens, discovery, `CallerId`). Other
+resource types (for example other SDK clients) can benefit from the same pool engine.
 
-## Beslutning
-`ConnectionPool.Core` kender kun den generiske type `T` og et policy-interface:
+## Decision
+`ConnectionPool.Core` only knows the generic type `T` and a policy interface:
 
 ```csharp
 public interface IPooledResourcePolicy<T>
@@ -20,14 +20,14 @@ public interface IPooledResourcePolicy<T>
 }
 ```
 
-Navngivningen er bevidst lånt fra `Microsoft.Extensions.ObjectPool.PooledObjectPolicy<T>`
-for genkendelighed. "Policy" fremfor "Factory", fordi kontrakten dækker hele
-ressourcens livscyklus (opret, sundhedsvurdering, bortskaffelse) — ikke kun oprettelse.
+The naming is intentionally borrowed from `Microsoft.Extensions.ObjectPool.PooledObjectPolicy<T>`
+for recognizability. "Policy" rather than "Factory", because the contract covers the entire
+resource lifecycle (creation, health evaluation, disposal) — not only creation.
 
-`ConnectionPool.Dataverse` implementerer `DataverseServiceClientPolicy : IPooledResourcePolicy<ServiceClient>`
-og er det eneste sted i løsningen der kender Dataverse-specifikke typer.
+`ConnectionPool.Dataverse` implements `DataverseServiceClientPolicy : IPooledResourcePolicy<ServiceClient>`
+and is the only place in the solution that knows Dataverse-specific types.
 
-## Konsekvenser
-- Core kan enheds-testes 100% med fakes, uden nogensinde at oprette en `ServiceClient`.
-- Fremtidige ressourcetyper (andre SDK'er) kan genbruge `ConnectionPool.Core` uden ændringer.
-- Al domænelogik (hvornår er en Dataverse-forbindelse "syg") ligger i adapteren, ikke kernen.
+## Consequences
+- Core can be unit tested 100% with fakes, without ever creating a `ServiceClient`.
+- Future resource types (other SDKs) can reuse `ConnectionPool.Core` without changes.
+- All domain logic (when a Dataverse connection is "unhealthy") lives in the adapter, not the core.

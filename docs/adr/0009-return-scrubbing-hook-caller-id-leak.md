@@ -1,79 +1,79 @@
-# ADR-0009: Return-scrubbing hook (CallerId-lækage) + dokumenteret single-process-begrænsning
+# ADR-0009: Return-scrubbing hook (CallerId leak) + documented single-process limitation
 
 ## Status
-Accepteret
+Accepted
 
-## Kontekst
-En sikkerheds-review og en distributed-systems-review blev kørt mod hele kodebasen forud for en
-produktionsklarheds-vurdering. Findings:
+## Context
+A security review and a distributed-systems review were run against the entire codebase ahead of a
+production-readiness assessment. Findings:
 
-### 1. Sikkerhedsfund (rettet i denne ADR): CallerId-lækage mellem leases (HIGH, 8/10)
-`ResourcePool<T>.ReturnAsync` puttede en sund ressource tilbage på idle-stakken **uændret**. For
-Dataverse betyder det: hvis en forbruger sætter `ServiceClient.CallerId` (Dataverse's indbyggede
-"act as another user"-impersonationsfelt, en public settable `Guid` — bekræftet ved refleksion) for
-at udføre et kald på vegne af en slutbruger, og disponerer sin lease uden selv at nulstille
-`CallerId`, ville **den samme `ServiceClient`-instans** — stadig impersonerende den forrige bruger
-— blive udleveret til næste, urelaterede caller via `AcquireAsync`. Det er præcis den type
-cross-caller identitetslækage denne pool (som eksplicit skal understøtte flere service-brugere) må
-undgå.
+### 1. Security finding (fixed in this ADR): CallerId leak between leases (HIGH, 8/10)
+`ResourcePool<T>.ReturnAsync` put a healthy resource back on the idle stack **unchanged**. For
+Dataverse, that means: if a consumer sets `ServiceClient.CallerId` (Dataverse's built-in
+"act as another user" impersonation field, a public settable `Guid` — confirmed via reflection) in
+order to perform a call on behalf of an end user, and disposes its lease without resetting
+`CallerId` itself, then **the same `ServiceClient` instance** — still impersonating the previous user
+— would be handed out to the next, unrelated caller via `AcquireAsync`. This is exactly the kind of
+cross-caller identity leak this pool (which explicitly must support multiple service users) has to
+avoid.
 
-Dette er en distinkt og hidtil ikke-adresseret risiko fra ADR-0003, som kun diskuterer *samtidig*
-deling af én lease på tværs af tråde i dens levetid — ikke *sekventiel* genbrug efter
+This is a distinct and previously unaddressed risk relative to ADR-0003, which only discusses *concurrent*
+sharing of one lease across threads during its lifetime — not *sequential* reuse after
 `DisposeAsync`.
 
-### 2. Distributed-systems-fund (dokumenteret, IKKE løst i denne ADR — se "Konsekvenser")
-En separat gennemgang fokuseret på multi-instans/Kubernetes-scenarier identificerede fem
-blokerende problemer, hvis fælles rod er: **al pool-, throttle- og circuit-state er kun i hukommelse,
-per-proces**. Med N instanser der deler de samme Dataverse service-principals:
+### 2. Distributed-systems finding (documented, NOT resolved in this ADR — see "Consequences")
+A separate review focused on multi-instance/Kubernetes scenarios identified five
+blocking issues, whose shared root cause is: **all pool, throttle, and circuit state exists only in memory,
+per process**. With N instances sharing the same Dataverse service principals:
 
-1. Intet delt budget på tværs af processer — N instanser × MaxSize kan langt overstige det reelle
-   per-app-bruger-loft, og en 429 set af instans A stopper ikke instans B i at bruge samme budget.
-2. "Fail open, hvis alle medlemmer er throttlede/circuit-open" (bevidst valgt i ADR-0007/0008 for at
-   undgå deadlock) kan forstærke en reel tenant-wide-outage i stedet for at give backpressure.
-3. Circuit breaker'en er ikke en reel single-probe half-open — flere samtidige callers kan alle
-   ramme det "recovering" medlem på én gang.
-4. Circuit'en tracker kun *oprettelsesfejl* (clone-fejl), ikke operationelle fejl — en tenant der
-   degraderer (langsomme kald, 5xx) uden at clone fejler vil ikke åbne circuit'en.
-5. Ingen bounded acquire-kø/deadline — under vedvarende overload kan ventende callers vokse
-   ubegrænset.
+1. No shared budget across processes — N instances × MaxSize can far exceed the real
+   per-app-user limit, and a 429 seen by instance A does not stop instance B from using the same budget.
+2. "Fail open if all members are throttled/circuit-open" (deliberately chosen in ADR-0007/0008 to
+   avoid deadlock) can amplify a real tenant-wide outage instead of providing backpressure.
+3. The circuit breaker is not a true single-probe half-open — multiple concurrent callers can all
+   hit the "recovering" member at the same time.
+4. The circuit tracks only *creation failures* (clone failures), not operational failures — a tenant that
+   degrades (slow calls, 5xx) without clone failing will not open the circuit.
+5. No bounded acquire queue/deadline — under sustained overload, waiting callers can grow
+   without limit.
 
-## Beslutning
+## Decision
 
-**Sikkerhedsfund #1 er rettet nu:**
-- `IPooledResourcePolicy<T>` fik en ny, valgfri (default-no-op via C# default interface-metode)
-  metode: `void OnReturned(T resource)`, kaldt af `ResourcePool<T>.ReturnAsync` lige før en sund
-  ressource lægges tilbage på idle-stakken. Dette er domæne-agnostisk i Core (ADR-0001) — Core ved
-  stadig ikke *hvad* der scrubbes, kun at politikken får en chance for det ved retur.
-- `DataverseServiceClientPolicy.OnReturned` implementerer den ved at sætte
+**Security finding #1 is fixed now:**
+- `IPooledResourcePolicy<T>` got a new, optional (default no-op via a C# default interface method)
+  method: `void OnReturned(T resource)`, called by `ResourcePool<T>.ReturnAsync` just before a healthy
+  resource is placed back on the idle stack. This is domain-agnostic in Core (ADR-0001) — Core still
+  does not know *what* is being scrubbed, only that the policy gets a chance to do it on return.
+- `DataverseServiceClientPolicy.OnReturned` implements it by setting
   `resource.CallerId = Guid.Empty`.
-- Testet: `ResourcePoolLifecycleTests.DisposeAsync_InvokesPolicyOnReturned_BeforeResourceIsReIdled`
-  verificerer selve hook-forbindelsen (via `FakePolicy`); `CallerId`-nulstillingen i sig selv er
-  ikke enhedstestet mod en ægte `ServiceClient` (kræver en levende Dataverse-forbindelse — samme
-  begrænsning som resten af `DataverseServiceClientPolicy`), men er verificeret ved refleksion at
-  `CallerId` er en public settable `Guid` på den faktiske SDK-type.
+- Tested: `ResourcePoolLifecycleTests.DisposeAsync_InvokesPolicyOnReturned_BeforeResourceIsReIdled`
+  verifies the hook wiring itself (via `FakePolicy`); the `CallerId` reset itself is
+  not unit-tested against a real `ServiceClient` (requires a live Dataverse connection — the same
+  limitation as the rest of `DataverseServiceClientPolicy`), but it was verified via reflection that
+  `CallerId` is a public settable `Guid` on the actual SDK type.
 
-**Distributed-systems-fund #1-5 er bevidst IKKE løst i denne ADR.** At bygge ægte
-multi-proces-koordinering (delt budget, distribueret half-open circuit, bounded backpressure på
-tværs af instanser) er en stor arkitektonisk beslutning (kræver formentlig en ekstern koordinator —
-Redis/Dataverse selv/anden delt store — og ændrer den nuværende "ingen eksterne
-afhængigheder"-egenskab ved Core). Det besluttes ikke stiltiende som en implementeringsdetalje.
+**Distributed-systems findings #1-5 are deliberately NOT resolved in this ADR.** Building real
+multi-process coordination (shared budget, distributed half-open circuit, bounded backpressure across
+instances) is a major architectural decision (would probably require an external coordinator —
+Redis/Dataverse itself/another shared store — and changes the current Core property of having "no external
+dependencies"). That should not be decided implicitly as an implementation detail.
 
-I stedet dokumenteres det eksplicit som en **produktionsbegrænsning**:
+Instead, it is documented explicitly as a **production limitation**:
 
-> **DataversePool understøtter i dag kun korrekt drift når præcis én proces-instans ejer et givent
-> sæt Dataverse service-principals ad gangen.** Kør IKKE flere instanser/pods af den forbrugende
-> applikation mod det samme `DataverseGroupPool`-medlemssæt, medmindre du selv accepterer at
-> throttle-/circuit-state ikke er koordineret på tværs af dem (dvs. reelt N× det tilsigtede
-> service-protection-budget, og ingen fælles backpressure ved en tenant-wide outage).
+> **DataversePool currently only supports correct operation when exactly one process instance owns a given
+> set of Dataverse service principals at a time.** Do NOT run multiple instances/pods of the consuming
+> application against the same `DataverseGroupPool` member set unless you explicitly accept that
+> throttle/circuit state is not coordinated across them (i.e., effectively N× the intended
+> service-protection budget, and no shared backpressure during a tenant-wide outage).
 
-## Konsekvenser
-- **Sikkerhedsfund #1**: lukket. `OnReturned`-hooket er generisk og kan genbruges til andre
-  fremtidige per-lease-scrub-behov uden endnu en breaking change.
-- **Distributed-systems-fund #1-5**: forbliver åbne, men er nu eksplicit dokumenteret (README +
-  TODO.md) i stedet for et stiltiende hul. Prioriteret backlog for en evt. v2 "coordinated mode":
-  1. Ekstern delt throttle/circuit-state (budget-bulkhead pr. tenant+app-bruger).
-  2. Erstat unconditional fail-open med en konfigurerbar fail-fast/deadline-politik.
-  3. Reelt single-probe half-open (atomisk "probe-in-flight" pr. medlem).
-  4. Skeln oprettelsesfejl fra operationelle fejl i circuit-signalet.
-  5. Bounded acquire-kø/deadline (backpressure) i `ResourcePool<T>.AcquireAsync`.
-- Ingen af disse kræver et brud på den eksisterende single-process API — de er additive.
+## Consequences
+- **Security finding #1**: closed. The `OnReturned` hook is generic and can be reused for other
+  future per-lease scrubbing needs without another breaking change.
+- **Distributed-systems findings #1-5**: remain open, but are now explicitly documented (README +
+  TODO.md) instead of being a silent gap. Prioritized backlog for a possible v2 "coordinated mode":
+  1. External shared throttle/circuit state (budget bulkhead per tenant+app user).
+  2. Replace unconditional fail-open with a configurable fail-fast/deadline policy.
+  3. True single-probe half-open (atomic "probe-in-flight" per member).
+  4. Distinguish creation failures from operational failures in the circuit signal.
+  5. Bounded acquire queue/deadline (backpressure) in `ResourcePool<T>.AcquireAsync`.
+- None of these require breaking the existing single-process API — they are additive.

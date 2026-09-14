@@ -1,22 +1,22 @@
-# ADR-0006: Dobbelt pooling-model — single-user pool og round-robin gruppe-pool
+# ADR-0006: Dual pooling model — single-user pool and round-robin group pool
 
 ## Status
-Accepteret
+Accepted
 
-## Kontekst
-Dataverse håndhæver service protection limits pr. bruger/app (~52 samtidige kald).
-Nogle forbrugere har kun én service-bruger og ønsker simpel pooling af flere
-`ServiceClient`-instanser for den ene bruger. Andre har flere app-brugere og vil
-skalere ud over én brugers loft ved at fordele load på tværs (round-robin), med
-plads til senere at gøre fordelingen throttle-bevidst (baseret på `x-ms-dop-hint`
-og 429/budget-signaler).
+## Context
+Dataverse enforces service protection limits per user/app (~52 concurrent calls).
+Some consumers have only one service user and want simple pooling of multiple
+`ServiceClient` instances for that one user. Others have multiple app users and want
+to scale beyond a single user's ceiling by distributing load across them (round-robin), with
+room to later make the distribution throttle-aware (based on `x-ms-dop-hint`
+and 429/budget signals).
 
-## Beslutning
-To offentlige typer i `ConnectionPool.Dataverse`:
+## Decision
+Two public types in `ConnectionPool.Dataverse`:
 
-- `DataverseUserPool` — pool af `ServiceClient`-instanser for **én** bruger/forbindelsesstreng.
-- `DataverseGroupPool` — sammensætter flere `DataverseUserPool`-instanser og vælger
-  hvilken der bruges via en pluggable strategi:
+- `DataverseUserPool` — pool of `ServiceClient` instances for **one** user/connection string.
+- `DataverseGroupPool` — composes multiple `DataverseUserPool` instances and chooses
+  which one to use via a pluggable strategy:
 
   ```csharp
   public interface ISlotSelectionStrategy
@@ -25,39 +25,39 @@ To offentlige typer i `ConnectionPool.Dataverse`:
   }
   ```
 
-  v1 leverer kun en simpel `RoundRobinSlotSelectionStrategy`. Interfacet er designet
-  til senere at kunne modtage en `ThrottleAwareSlotSelectionStrategy` der undgår
-  medlemmer tæt på deres budget/dop-hint-loft, uden at ændre public API på
+  v1 provides only a simple `RoundRobinSlotSelectionStrategy`. The interface is designed
+  so it can later receive a `ThrottleAwareSlotSelectionStrategy` that avoids
+  members close to their budget/`dop-hint` ceiling, without changing the public API of
   `DataverseGroupPool`.
 
-## Konsekvenser
-- Forbrugere med simpelt behov (én bruger) bruger `DataverseUserPool` direkte, uden
-  overhead fra gruppelaget.
-- Gruppelogik er isoleret i strategien — round-robin i v1 kan udskiftes uden at
-  ændre `DataverseGroupPool`s offentlige kontrakt.
-- Kræver at `PoolStats` (in-use/wait-time/unhealthy-count) er tilgængelig pr.
-  medlems-pool, så en fremtidig throttle-aware strategi har data at vælge ud fra.
+## Consequences
+- Consumers with a simple need (one user) use `DataverseUserPool` directly, without
+  overhead from the group layer.
+- Group logic is isolated in the strategy — round-robin in v1 can be replaced without
+  changing the public contract of `DataverseGroupPool`.
+- Requires that `PoolStats` (in-use/wait-time/unhealthy-count) is available per
+  member pool, so a future throttle-aware strategy has data to choose from.
 
-## Opdatering: måling (load) vs. blind round-robin
+## Update: load-based choice vs. blind round-robin
 
-Efter v1 er standard-strategien blevet `HealthAwareRoundRobinSlotSelectionStrategy` (se ADR-0007
-#6), og der er nu også en `LeastConnectionsSlotSelectionStrategy` tilføjet som alternativ — den
-vælger medlemmet med færrest aktuelt udlånte leases (`PoolStats.LeasedCount`) frem for blind
-tur-baseret rækkefølge, med samme circuit-breaking (dead-member skip/half-open/fail-open) som
-health-aware-varianten.
+After v1, the standard strategy has been changed to `HealthAwareRoundRobinSlotSelectionStrategy` (see ADR-0007
+#6), and a `LeastConnectionsSlotSelectionStrategy` has also been added as an alternative — it
+selects the member with the fewest currently leased-out leases (`PoolStats.LeasedCount`) rather than blind
+turn-based ordering, with the same circuit breaking (dead-member skip/half-open/fail-open) as the
+health-aware variant.
 
-**Hvorfor dette stadig ikke er "throttle-aware":** `LeasedCount` måler kun *hvor mange leases der
-er checked out lige nu* — ikke hvor tæt et medlem reelt er på sit ~52-samtidig-loft, og slet ikke
-om Dataverse allerede sender 429/`Retry-After` på requests udført gennem en udleveret
-`ServiceClient`. Poolen har ingen synlighed i hvad en forbruger gør med en lease efter
-`AcquireAsync()` returnerer den, så ægte throttle-bevidst valg (baseret på `x-ms-dop-hint` eller
-observerede 429'ere) kræver at forbrugeren rapporterer request-niveau-udfald tilbage til poolen —
-en større API-udvidelse end blot en ny `ISlotSelectionStrategy`-implementation. Det er stadig
-fremtidigt scope, ikke gjort i denne omgang.
+**Why this is still not "throttle-aware":** `LeasedCount` measures only *how many leases are
+checked out right now* — not how close a member actually is to its ~52-concurrent ceiling, and certainly not
+whether Dataverse is already sending 429/`Retry-After` on requests executed through a leased
+`ServiceClient`. The pool has no visibility into what a consumer does with a lease after
+`AcquireAsync()` returns it, so truly throttle-aware selection (based on `x-ms-dop-hint` or
+observed 429s) requires the consumer to report request-level outcomes back to the pool —
+a larger API extension than merely a new `ISlotSelectionStrategy` implementation. That remains
+future scope and was not done in this round.
 
-**Hvornår vælge hvilken:**
-- `HealthAwareRoundRobinSlotSelectionStrategy` (default): simplest, ensartet fordeling, foretræk
-  når medlemmerne typisk har ensartet requestlængde/-tid.
-- `LeastConnectionsSlotSelectionStrategy`: foretræk når kald har meget varierende varighed (nogle
-  medlemmer kan sidde fast i langvarige kald), så nye acquires ikke bare fortsætter med at hobe sig
-  op på et allerede presset medlem.
+**When to choose which:**
+- `HealthAwareRoundRobinSlotSelectionStrategy` (default): simplest, even distribution, prefer
+  when members typically have similar request duration/time.
+- `LeastConnectionsSlotSelectionStrategy`: prefer when calls have highly variable duration (some
+  members may be stuck in long-running calls), so new acquires do not just continue piling up
+  on an already stressed member.

@@ -1,114 +1,113 @@
-# ADR-0012: Bounded acquire (timeout), operationel-fejl-bevidst circuit breaker, log-only leak-detection
+# ADR-0012: Bounded acquire (timeout), operational-failure-aware circuit breaker, log-only leak detection
 
 ## Status
-Accepteret
+Accepted
 
-**Opdatering (ADR-0013):** `AcquireTimeout`, som beskrevet her, bandt oprindeligt kun
-`_capacityGate.WaitAsync` — ikke resten af acquire-operationen (recycle/creation efter permit).
-ADR-0013 udvider den til at bounde hele acquire-operationen ende-til-ende. Ligeledes nulstillede
-`ConsecutiveOperationalFailures` (introduceret her) oprindeligt ved enhver vellykket recycle, hvilket
-ADR-0013 retter. Se ADR-0013 for detaljerne; denne ADR's øvrige beslutninger (log-only
-leak-detection, #3/#5 accepteret uændret) forbliver gældende som beskrevet.
+**Update (ADR-0013):** `AcquireTimeout`, as described here, originally bounded only
+`_capacityGate.WaitAsync` — not the rest of the acquire operation (recycle/creation after permit).
+ADR-0013 extends it to bound the entire acquire operation end-to-end. Likewise,
+`ConsecutiveOperationalFailures` (introduced here) was originally reset by every successful recycle, which
+ADR-0013 fixes. See ADR-0013 for details; this ADR's other decisions (log-only
+leak detection, #3/#5 accepted unchanged) remain valid as described.
 
-## Kontekst
-Efter ADR-0011 blev committet, blev brugeren præsenteret for den resterende, bevidst udskudte
-backlog fra anden reviewrunde (DB-pool-designeksperten + distributed-systems-genreview) og traf
-eksplicitte beslutninger om hvert punkt:
+## Context
+After ADR-0011 was committed, the user was presented with the remaining, deliberately deferred
+backlog from the second review round (the DB pool design expert + distributed-systems re-review) and made
+explicit decisions on each item:
 
-1. **Bounded acquire-kø/deadline** — vurderet af begge eksperter som højeste tilbageværende
-   prioritet: `ResourcePool<T>.AcquireAsync` venter i dag uendeligt på kapacitet, uden mulighed for
-   at give reel backpressure. Brugerens svar: "lyder som en god ide at have den bounded" + spurgte
-   hvad typisk DB-pool-praksis er.
-2. **Operationel-fejl-bevidst circuit breaker** — circuit'en i `MemberCircuitBreaker` reagerede kun
-   på creation-fejl (`ConsecutiveCreateFailures`), ikke på operationelle fejl rapporteret via
-   `PooledLease.MarkUnhealthy` på en allerede oprettet ressource. Brugerens svar: "ja - nødvendigt,
-   så man ikke bliver ved med at pushe en dårlig rundt til alle."
-3. **Cross-member samtidig `CreateAsync` i `DataverseGroupPool`** — DB-pool-eksperten flaggede dette
-   som en mulig reintroduktion af ADR-0002's lock-contention-problem, men anbefalede selv empirisk
-   verifikation af om SDK'ens interne lock er per-instans eller proces-global, før man bygger en
-   gate. Brugerens svar: "nok bare per instans, det koster blot lidt ekstra tid at danne, hvis man
-   ikke serialiserer." → accepteret som en kendt, lille, ubetydelig omkostning; INGEN kode ændret.
-4. **Log-only leak-detection** — DB-pool-eksperten anbefalede (som HikariCP) at gøre
-   leak-detection rent diagnostisk i stedet for at recycle/disponere en muligvis-stadig-i-brug
-   ressource. ADR-0011 afviste bevidst dette uden brugerens eksplicitte input. Brugerens svar denne
-   gang: "log only." → implementeret.
-5. **Cross-process koordinering** — fortsat eksplicit afvist ("enig" med at lade det være). Ingen
-   ændring.
+1. **Bounded acquire queue/deadline** — assessed by both experts as the highest remaining
+   priority: `ResourcePool<T>.AcquireAsync` currently waits forever for capacity, with no way to
+   provide real backpressure. The user's response: "sounds like a good idea to have it bounded" + asked
+   what typical DB pool practice is.
+2. **Operational-failure-aware circuit breaker** — the circuit in `MemberCircuitBreaker` reacted only
+   to creation failures (`ConsecutiveCreateFailures`), not to operational failures reported via
+   `PooledLease.MarkUnhealthy` on an already-created resource. The user's response: "yes - necessary,
+   so you do not keep pushing a bad one around to everyone."
+3. **Cross-member concurrent `CreateAsync` in `DataverseGroupPool`** — the DB pool expert flagged this
+   as a possible reintroduction of ADR-0002's lock-contention problem, but also recommended empirical
+   verification of whether the SDK's internal lock is per instance or process-global before building a
+   gate. The user's response: "probably just per instance; it only costs a little extra time to create if
+   you do not serialize." → accepted as a known, small, insignificant cost; NO code changed.
+4. **Log-only leak detection** — the DB pool expert recommended (like HikariCP) making
+   leak detection purely diagnostic instead of recycling/disposing a potentially-still-in-use
+   resource. ADR-0011 deliberately rejected this without the user's explicit input. This time, the user's response
+   was: "log only." → implemented.
+5. **Cross-process coordination** — still explicitly rejected ("agree" with leaving it alone). No
+   change.
 
-Typisk praksis for punkt 1, som brugeren spurgte til: HikariCP's `connectionTimeout` (default 30s,
-kaster `SQLTransientConnectionException` ved udløb), Npgsql's `Timeout`, og SqlClient's
-`Connect Timeout` bruger alle en **timeout på selve ventetiden** på en ledig forbindelse — ikke en
-hård grænse på antal ventende callers. Begrundelsen: en ventende caller er billig (blot en
-suspenderet `Task`/`await`), så risikoen der skal bounded er caller-pileup/manglende backpressure,
-ikke hukommelsesforbrug. Samme mønster er valgt her.
+Typical practice for point 1, which the user asked about: HikariCP's `connectionTimeout` (default 30s,
+throws `SQLTransientConnectionException` on expiry), Npgsql's `Timeout`, and SqlClient's
+`Connect Timeout` all use a **timeout on the waiting time itself** for an available connection — not a
+hard limit on the number of waiting callers. The reasoning is: a waiting caller is cheap (just a
+suspended `Task`/`await`), so the risk that needs bounding is caller pile-up/lack of backpressure,
+not memory usage. The same pattern is chosen here.
 
-## Beslutning
+## Decision
 
 ### Fix for #1: `PoolOptions.AcquireTimeout`
-Ny, valgfri (`null` default, bagudkompatibel) `TimeSpan? AcquireTimeout`. Når sat, bruger
-`ResourcePool<T>.AcquireAsync` `SemaphoreSlim.WaitAsync(timeout, cancellationToken)` på
-capacity-gaten i stedet for et ubegrænset `WaitAsync(cancellationToken)`. Ved udløb kastes en ny,
-offentlig `PoolAcquireTimeoutException` (arver `TimeoutException`, som `CreateTimeout`s eksisterende
-exception, for konsistent fejlhåndtering) med et `PoolStats`-snapshot til diagnosticering (hvor
-mange venter, hvor mange er idle/created, osv.). Ingen ændring i default-adfærd — eksisterende
-kald uden `AcquireTimeout` sat venter stadig uendeligt, som før.
+New, optional (`null` default, backward-compatible) `TimeSpan? AcquireTimeout`. When set,
+`ResourcePool<T>.AcquireAsync` uses `SemaphoreSlim.WaitAsync(timeout, cancellationToken)` on the
+capacity gate instead of an unbounded `WaitAsync(cancellationToken)`. On expiry, it throws a new,
+public `PoolAcquireTimeoutException` (inherits `TimeoutException`, like `CreateTimeout`'s existing
+exception, for consistent error handling) with a `PoolStats` snapshot for diagnostics (how
+many are waiting, how many are idle/created, etc.). No change to default behavior — existing
+calls without `AcquireTimeout` set still wait forever, as before.
 
-### Fix for #2: `PoolStats.ConsecutiveOperationalFailures` + `MemberCircuitBreaker` reagerer på begge signaler
-- Ny tæller i `ResourcePool<T>`: `_consecutiveOperationalFailures`, inkrementeret af en ny intern
-  `ReportOperationalFailure()`-metode, kaldt fra `PooledLease.MarkUnhealthy` (dvs. hver gang en
-  bruger selv rapporterer at en *allerede udleveret* ressource fejlede operationelt — ikke ved
-  oprettelse).
-- Nulstilles ved enhver efterfølgende sund `ReturnAsync` (et vellykket brug er bevis på
-  genopretning) og ved vellykket `RecycleInPlaceAsync` (en frisk ressource antages operationelt
-  sund igen) — samme mønster som `ConsecutiveCreateFailures` allerede brugte.
-- Eksponeret på `PoolStats` som `ConsecutiveOperationalFailures`.
-- `MemberCircuitBreaker.IsEligible` åbner nu kredsløbet hvis **enten** `ConsecutiveCreateFailures`
-  **eller** `ConsecutiveOperationalFailures` når tærsklen — et medlem der opretter fint, men hvis
-  ressourcer konsekvent fejler i faktisk brug, behandles nu lige så alvorligt som et medlem der slet
-  ikke kan oprettes, og roteres væk fra i stedet for at blive ved med at få trafik sendt til sig
-  ("pushe en dårlig rundt til alle", som brugeren formulerede det).
+### Fix for #2: `PoolStats.ConsecutiveOperationalFailures` + `MemberCircuitBreaker` reacts to both signals
+- New counter in `ResourcePool<T>`: `_consecutiveOperationalFailures`, incremented by a new internal
+  `ReportOperationalFailure()` method, called from `PooledLease.MarkUnhealthy` (i.e., every time a
+  user reports that an *already handed-out* resource failed operationally — not during
+  creation).
+- Reset by any subsequent healthy `ReturnAsync` (a successful use is evidence of
+  recovery) and by successful `RecycleInPlaceAsync` (a fresh resource is assumed operationally
+  healthy again) — the same pattern `ConsecutiveCreateFailures` already used.
+- Exposed on `PoolStats` as `ConsecutiveOperationalFailures`.
+- `MemberCircuitBreaker.IsEligible` now opens the circuit if **either** `ConsecutiveCreateFailures`
+  **or** `ConsecutiveOperationalFailures` reaches the threshold — a member that creates fine, but whose
+  resources consistently fail in actual use, is now treated just as seriously as a member that cannot
+  be created at all, and is rotated away from instead of continuing to receive traffic
+  ("pushing a bad one around to everyone," as the user put it).
 
-### Fix for #4: Log-only leak-detection
-`ResourcePool<T>.ReportLeakedLease`/`CompleteLeakReport` er omskrevet til **rent diagnostisk**:
-- Ved en GC-detekteret lækket lease markeres kun incident-metadata (til `OnLeakDetected`/
-  `HealthChanges`) — poolen kalder IKKE længere `RecycleInBackgroundAsync`, disponerer IKKE
-  ressourcen, og frigiver IKKE capacity-permit'en.
-- Ny `SlotHealthState.LeakDetected`-værdi (adskilt fra `MarkedUnhealthy`, som stadig betyder "vil
-  blive recycled") gør det muligt for observability-kode at skelne "vi har mistanke om et leak, rent
-  informativt" fra "denne slot bliver aktivt genoprettet nu."
-- **Konsekvens, eksplicit accepteret af brugeren:** et reelt leak reducerer nu poolens effektive
-  kapacitet permanent med én slot, indtil processen genstartes — nøjagtig samme reelle
-  drift-erfaring som HikariCP's log-only leak-detection giver i praksis. `OnLeakDetected`/
-  `HealthChanges` er derfor ikke længere "nice to have" telemetri, men den eneste måde man kan
-  opdage at dette er sket og handle på det (alarmere, genstarte processen, undersøge kildekoden for
-  det manglende `DisposeAsync`-kald).
-- Finalizer-tråd-sikkerheden fra ADR-0011 (dispatch via `ThreadPool.QueueUserWorkItem`, try/catch om
-  callback og hver observer) er bevaret uændret — kun *hvad* der sker efter rapporteringen er
-  ændret, ikke *hvordan* den rapporteres sikkert.
-- `PooledLease<T>` og `PoolOptions.OnLeakDetected`s XML-docs er opdateret til at beskrive den nye
-  adfærd. ADR-0003 (som oprindeligt beskrev leak-tracking som "evakuerer/genopretter slotten") er
-  annoteret med en henvisning til denne ADR i stedet for at blive omskrevet, jf. `docs/adr/README.md`s
-  konvention om ikke at redigere en accepteret ADR's beslutning.
+### Fix for #4: Log-only leak detection
+`ResourcePool<T>.ReportLeakedLease`/`CompleteLeakReport` have been rewritten to be **purely diagnostic**:
+- On a GC-detected leaked lease, only incident metadata is recorded (for `OnLeakDetected`/
+  `HealthChanges`) — the pool NO LONGER calls `RecycleInBackgroundAsync`, does NOT dispose
+  the resource, and does NOT release the capacity permit.
+- New `SlotHealthState.LeakDetected` value (separate from `MarkedUnhealthy`, which still means "will
+  be recycled") makes it possible for observability code to distinguish "we suspect a leak, purely
+  informational" from "this slot is actively being recovered now."
+- **Consequence, explicitly accepted by the user:** a real leak now reduces the pool's effective
+  capacity permanently by one slot until the process restarts — exactly the same real
+  operational experience HikariCP's log-only leak detection gives in practice. `OnLeakDetected`/
+  `HealthChanges` are therefore no longer "nice to have" telemetry, but the only way you can
+  discover that this happened and act on it (alert, restart the process, inspect the source code for
+  the missing `DisposeAsync` call).
+- The finalizer thread safety from ADR-0011 (dispatch via `ThreadPool.QueueUserWorkItem`, try/catch around
+  the callback and each observer) is preserved unchanged — only *what* happens after reporting has
+  changed, not *how* it is reported safely.
+- `PooledLease<T>` and `PoolOptions.OnLeakDetected`'s XML docs have been updated to describe the new
+  behavior. ADR-0003 (which originally described leak tracking as "evacuates/restores the slot") is
+  annotated with a reference to this ADR instead of being rewritten, in accordance with `docs/adr/README.md`'s
+  convention of not editing an accepted ADR's decision.
 
-### #3 og #5: ingen kodeændring
-- **#3** (cross-member samtidig creation): brugeren accepterede den formodede lille ekstra
-  clone-omkostning ved ikke at serialisere på tværs af gruppemedlemmer, fremfor at bygge en
-  uverificeret gate. Ingen kode ændret; forbliver dokumenteret som en kendt, accepteret afvejning.
-- **#5** (cross-process koordinering): fortsat eksplicit afvist. Ingen ændring.
+### #3 and #5: no code change
+- **#3** (cross-member concurrent creation): the user accepted the presumed small extra
+  clone cost of not serializing across group members instead of building an unverified gate. No code changed; remains documented as a known, accepted trade-off.
+- **#5** (cross-process coordination): still explicitly rejected. No change.
 
-## Konsekvenser
-- **Bagudkompatibelt for #1/#2**: `AcquireTimeout` er `null` som default (ubegrænset ventetid,
-  uændret adfærd); `ConsecutiveOperationalFailures` er en ny, additiv `PoolStats`-property med
+## Consequences
+- **Backward-compatible for #1/#2**: `AcquireTimeout` is `null` by default (unbounded wait,
+  unchanged behavior); `ConsecutiveOperationalFailures` is a new, additive `PoolStats` property with
   default `0`.
-- **Adfærdsændring for #4 (bevidst, ikke bagudkompatibel i praksis)**: enhver eksisterende bruger
-  der implicit har regnet med at et leak bliver "repareret af poolen selv" oplever nu i stedet en
-  permanent reduktion af effektiv kapacitet ved et reelt leak. Dette er en tilsigtet
-  produktbeslutning truffet eksplicit af brugeren, ikke en regression.
-- `PoolAcquireTimeoutException` er en ny offentlig type (arver `TimeoutException`, fanges derfor
-  også af eksisterende `catch (TimeoutException)`-kode der allerede håndterer `CreateTimeout`).
-- Test-dækning: 66/66 grønne efter denne ændring (Core 21 [+4: 3 nye `AcquireTimeoutTests` og net
-  +1 i leak-tests efter omskrivning fra 2 til 3 log-only-tests], Dataverse 42 [+1: operationel-fejl
-  åbner kredsløbet], Polly 3), op fra 61/61. `LeakReportingSafetyTests` fra ADR-0011 er omskrevet
-  til at verificere den nye log-only-adfærd (aldrig disponeret, capacity permanent tabt, stadig
-  ingen crash/strandet kapacitet ved fejlende callback/observer) i stedet for den gamle
-  recycle-adfærd.
+- **Behavior change for #4 (intentional, not backward-compatible in practice)**: any existing user
+  who implicitly assumed that a leak would be "repaired by the pool itself" now instead experiences a
+  permanent reduction in effective capacity upon a real leak. This is an intentional
+  product decision made explicitly by the user, not a regression.
+- `PoolAcquireTimeoutException` is a new public type (inherits `TimeoutException`, and is therefore also caught
+  by existing `catch (TimeoutException)` code that already handles `CreateTimeout`).
+- Test coverage: 66/66 passing after this change (Core 21 [+4: 3 new `AcquireTimeoutTests` and net
+  +1 in leak tests after rewriting from 2 to 3 log-only tests], Dataverse 42 [+1: operational failure
+  opens the circuit], Polly 3), up from 61/61. `LeakReportingSafetyTests` from ADR-0011 were rewritten
+  to verify the new log-only behavior (never disposed, capacity permanently lost, still
+  no crash/stranded capacity with failing callback/observer) instead of the old
+  recycle behavior.

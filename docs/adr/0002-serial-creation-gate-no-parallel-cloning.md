@@ -1,36 +1,36 @@
-# ADR-0002: Seriel oprettelses-gate — ingen parallel cloning af ressourcer
+# ADR-0002: Serial creation gate — no parallel cloning of resources
 
 ## Status
-Accepteret
+Accepted
 
-## Kontekst
-Empirisk måling (denne sessions forudgående arbejde) viste at `ServiceClient`-cloning
-er bimodal:
-- Første clone fra en base-forbindelse: ~500ms (reel auth/netværk).
-- Efterfølgende sekventielle clones: ~1ms (cached token/discovery genbruges).
-- Parallelle clones (flere samtidigt): 1–3.2s pr. clone pga. intern lock-contention
-  i selve SDK'ets oprettelseskode.
+## Context
+Empirical measurement (the earlier work in this session) showed that `ServiceClient` cloning
+is bimodal:
+- First clone from a base connection: ~500ms (real auth/network).
+- Subsequent sequential clones: ~1ms (cached token/discovery is reused).
+- Parallel clones (several at the same time): 1–3.2s per clone due to internal lock contention
+  in the SDK's own creation code.
 
-Dette betyder at "prewarm parallelt for hurtigere opstart" er kontraproduktivt og kan
-gøre opstart markant langsommere end sekventiel oprettelse.
+This means that "prewarm in parallel for faster startup" is counterproductive and can make
+startup significantly slower than sequential creation.
 
-## Beslutning
-`ResourcePool<T>` garanterer at `policy.CreateAsync()` **aldrig kaldes samtidigt fra to
-tråde** for samme underliggende base-forbindelse — håndhævet med en intern
-`SemaphoreSlim(1,1)` ("creation gate") omkring alle kald til `CreateAsync`.
+## Decision
+`ResourcePool<T>` guarantees that `policy.CreateAsync()` is **never called simultaneously from two
+threads** for the same underlying base connection — enforced with an internal
+`SemaphoreSlim(1,1)` ("creation gate") around all calls to `CreateAsync`.
 
-Dette gælder uanset trigger:
-- Eager/sekventiel prewarm ved opstart (via `IHostedService`).
-- Lazy oprettelse ved `AcquireAsync()` når poolen er tom.
-- Genopretning af en slot efter `MarkUnhealthy`.
+This applies regardless of trigger:
+- Eager/sequential prewarm at startup (via `IHostedService`).
+- Lazy creation on `AcquireAsync()` when the pool is empty.
+- Recovery of a slot after `MarkUnhealthy`.
 
-Prewarm-ved-opstart er **ikke** et hårdt krav i v1 (lazy er acceptabelt), men den
-serielle gate er et hårdt krav uanset oprettelsesstrategi.
+Prewarm-at-startup is **not** a hard requirement in v1 (lazy is acceptable), but the
+serial gate is a hard requirement regardless of creation strategy.
 
-## Konsekvenser
-- Simpel implementering: én global (eller pr.-base-connection) semaphore, ingen
-  kompleks scheduling.
-- Mulig ventetid ved cold start under høj samtidig load (flere kaldere venter på
-  samme gate), accepteret som tradeoff mod at undgå 1–3.2s lock-contention-cost pr. clone.
-- Skal verificeres med en concurrency-stresstest (se teststrategi) der tæller
-  samtidige `CreateAsync`-kald via `Interlocked` og assert'er max == 1.
+## Consequences
+- Simple implementation: one global (or per-base-connection) semaphore, no
+  complex scheduling.
+- Possible wait time during cold start under high concurrent load (multiple callers wait on
+  the same gate), accepted as a tradeoff against avoiding a 1–3.2s lock-contention cost per clone.
+- Must be verified with a concurrency stress test (see test strategy) that counts
+  simultaneous `CreateAsync` calls via `Interlocked` and asserts max == 1.

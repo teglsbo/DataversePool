@@ -1,134 +1,134 @@
-# ADR-0013: Ende-til-ende AcquireTimeout, retfærdig operationel-fejl-tælling, idempotent warmup, korrekt probe-outcome-rapportering, holdbar leak-synlighed
+# ADR-0013: End-to-end AcquireTimeout, fair operational-failure counting, idempotent warmup, correct probe-outcome reporting, durable leak visibility
 
 ## Status
-Accepteret. **Delvist superseret af [ADR-0014](0014-probe-claim-generation-and-cancellation-vs-createtimeout-misclassification.md):**
-en femte reviewrunde fandt at fix #1 (ende-til-ende `AcquireTimeout`) og fix #4 (`AbandonProbe`)
-kun var delvist effektive — en ny regression (en `AcquireTimeout`-cancellation, der rammer under en
-igangværende `CreateAsync`, blev fejlagtigt klassificeret som et `CreateTimeout` og dermed et fejlet
-health-probe) omgik begge. ADR-0014 retter denne regression samt tilføjer claim-generation-
-korrelation til `MemberCircuitBreaker`. Fix #2, #3, #5, #6 nedenfor forbliver upåvirkede og gyldige.
+Accepted. **Partially superseded by [ADR-0014](0014-probe-claim-generation-and-cancellation-vs-createtimeout-misclassification.md):**
+a fifth review round found that fix #1 (end-to-end `AcquireTimeout`) and fix #4 (`AbandonProbe`)
+were only partially effective — a new regression (an `AcquireTimeout` cancellation that hits during an
+ongoing `CreateAsync` was incorrectly classified as a `CreateTimeout` and therefore a failed
+health probe) bypassed both. ADR-0014 fixes this regression and also adds claim-generation
+correlation to `MemberCircuitBreaker`. Fixes #2, #3, #5, #6 below remain unaffected and valid.
 
-## Kontekst
-Efter ADR-0012 blev committet (`0c35c39`), bad brugeren om endnu en (fjerde) reviewrunde: sikkerhed
-+ DB-pool-designekspert + distributed-systems-ekspert, alle rettet mod den netop committede kode.
-Sikkerhedsreviewet fandt intet nyt. De to andre fandt, uafhængigt af hinanden, i store træk **samme
-root cause** fra to forskellige vinkler, samt yderligere reelle, veldefinerede fejl:
+## Context
+After ADR-0012 was committed (`0c35c39`), the user asked for yet another (fourth) review round: security
++ DB pool design expert + distributed-systems expert, all aimed at the just-committed code.
+The security review found nothing new. The other two independently found essentially the **same
+root cause** from two different angles, along with additional real, well-defined bugs:
 
-1. **`AcquireTimeout` bounder kun `_capacityGate.WaitAsync`, ikke hele acquire** — begge eksperter
-   fandt dette. DB-pool-eksperten: en gang permit er opnået, kan recycle/creation efter det tage
-   ubegrænset tid, uden nogen `AcquireTimeout`-grænse. Distributed-systems-eksperten: det var
-   *også* årsagen til at probe-claim-race'en fra ADR-0011 stadig var reelt åben — den første
-   half-open prober kan sidde fast i denne ubundne fase, mens `probeClaimTimeout` udløber og en ny
-   prober vinder, selvom den første stadig legitimt venter (ikke er hængt).
-2. **`ConsecutiveOperationalFailures` nulstilles for aggressivt** — enhver vellykket
-   `RecycleInPlaceAsync` (dvs. en frisk klon efter en operationel fejl) nulstillede tælleren. Et
-   medlem hvis operationer konsekvent fejler, men hvis `ServiceClient.Clone` fortsat lykkes, ville
-   derfor aldrig nå tærsklen: fail → recycle lykkes → reset → fail → recycle lykkes → reset...
-   Underminerede hele formålet med ADR-0012's operationelle circuit-signal.
-3. **`WarmupAsync` er ikke idempotent** — hvert kald opretter `min(PrewarmCount, MaxSize)` *flere*
-   ressourcer, uden hensyn til hvor mange der allerede findes. Et gentaget kald (fx en retried
-   startup-hook) kan derfor overskride `MaxSize`.
-4. **En kapacitets-timeout rapporteres fejlagtigt som et fejlet circuit-probe** —
-   `PoolAcquireTimeoutException` fanges af `DataverseGroupPool.AcquireAsync`s generelle `catch` og
-   rapporteres til `MemberCircuitBreaker` som `succeeded: false`. En ren load/kapacitets-timeout er
-   ikke bevis på at *medlemmet* er usundt, men kunne unødigt forlænge et gennemrettende medlems
+1. **`AcquireTimeout` bounds only `_capacityGate.WaitAsync`, not the entire acquire path** — both experts
+   found this. DB pool expert: once a permit is obtained, recycle/creation after that can take
+   unlimited time with no `AcquireTimeout` boundary. Distributed-systems expert: it was
+   *also* the reason the probe-claim race from ADR-0011 was still genuinely open — the first
+   half-open prober can get stuck in this unbounded phase while `probeClaimTimeout` expires and a new
+   prober wins, even though the first is still legitimately waiting (not hung).
+2. **`ConsecutiveOperationalFailures` resets too aggressively** — any successful
+   `RecycleInPlaceAsync` (i.e., a fresh clone after an operational failure) reset the counter. A
+   member whose operations consistently fail, but whose `ServiceClient.Clone` still succeeds, would
+   therefore never reach the threshold: fail → recycle succeeds → reset → fail → recycle succeeds → reset...
+   This undermined the entire purpose of ADR-0012's operational circuit signal.
+3. **`WarmupAsync` is not idempotent** — each call creates `min(PrewarmCount, MaxSize)` *more*
+   resources, regardless of how many already exist. A repeated call (e.g., a retried
+   startup hook) can therefore exceed `MaxSize`.
+4. **A capacity timeout is incorrectly reported as a failed circuit probe** —
+   `PoolAcquireTimeoutException` is caught by `DataverseGroupPool.AcquireAsync`'s general `catch` and
+   reported to `MemberCircuitBreaker` as `succeeded: false`. A pure load/capacity timeout is
+   not evidence that the *member* is unhealthy, but it could unnecessarily extend a recovering member's
    cooldown.
-5. **Log-only leaks er usynlige i `PoolStats`** — den eneste evidens for et permanent tabt slot
-   (ADR-0012's bevidste afvejning) var en flygtig callback/event; en sen eller manglende abonnent
-   kan ikke se det bagefter, og en generisk `PoolAcquireTimeoutException` ser identisk ud uanset om
-   årsagen er reel belastning eller lækket kapacitet.
-6. **`PoolOptions`-varigheder var uvaliderede** i `ResourcePool`s konstruktør (kun `MaxSize` blev
-   tjekket) — en negativ `AcquireTimeout`/`CreateTimeout`/`MaxIdleLifetime` ville fejle sent og
-   forvirrende i stedet for med det samme.
+5. **Log-only leaks are invisible in `PoolStats`** — the only evidence of a permanently lost slot
+   (ADR-0012's deliberate trade-off) was a transient callback/event; a late or missing subscriber
+   cannot see it afterward, and a generic `PoolAcquireTimeoutException` looks identical whether the
+   cause is real load or leaked capacity.
+6. **`PoolOptions` durations were unvalidated** in `ResourcePool`'s constructor (only `MaxSize` was
+   checked) — a negative `AcquireTimeout`/`CreateTimeout`/`MaxIdleLifetime` would fail late and
+   confusingly instead of immediately.
 
-Brugeren var ikke tilgængelig for prioritering af denne runde (autopilot); jeg valgte derfor at
-rette alle seks fund, da de alle er veldefinerede bugs/robusthedsforbedringer uden
-arkitektur-reversering eller ny scope, i tråd med mønsteret fra tidligere runder.
+The user was not available to prioritize this round (autopilot); I therefore chose to
+fix all six findings, because they are all well-defined bugs/robustness improvements without
+architectural reversal or new scope, consistent with the pattern from earlier rounds.
 
-## Beslutning
+## Decision
 
-### Fix for #1: Ende-til-ende `AcquireTimeout`
-`ResourcePool<T>.AcquireAsync` opretter nu, når `PoolOptions.AcquireTimeout` er sat, en
-`CancellationTokenSource` med den varighed, linket med callerens eget token via
-`CancellationTokenSource.CreateLinkedTokenSource`. Dette linkede token (`effectiveToken`) bruges
-til **alt** efterfølgende arbejde: `_capacityGate.WaitAsync`, idle-lifetime-recycle
-(`RecycleInPlaceAsync`), og ny oprettelse (`CreateNewSlotAsync` → `CreateThroughGateAsync`, inkl.
-dens egen `_creationGate.WaitAsync`). Udløber deadline'en (og ikke callerens eget token), fanges
-`OperationCanceledException` og omsættes til `PoolAcquireTimeoutException` — ikke en rå
-cancellation, der ellers ville være umulig at skelne fra caller-initieret annullering.
+### Fix for #1: End-to-end `AcquireTimeout`
+`ResourcePool<T>.AcquireAsync` now creates, when `PoolOptions.AcquireTimeout` is set, a
+`CancellationTokenSource` with that duration, linked with the caller's own token via
+`CancellationTokenSource.CreateLinkedTokenSource`. This linked token (`effectiveToken`) is used
+for **all** subsequent work: `_capacityGate.WaitAsync`, idle-lifetime recycle
+(`RecycleInPlaceAsync`), and new creation (`CreateNewSlotAsync` → `CreateThroughGateAsync`, including
+its own `_creationGate.WaitAsync`). If the deadline expires (and not the caller's own token),
+`OperationCanceledException` is caught and translated into `PoolAcquireTimeoutException` — not a raw
+cancellation that would otherwise be impossible to distinguish from caller-initiated cancellation.
 
-**Vigtig, dokumenteret rest-begrænsning:** dette er *kooperativ* annullering. Hvis den konkrete,
-igangværende `CreateAsync`-opkald hverken selv respekterer `CancellationToken` eller er bundet af
-`PoolOptions.CreateTimeout`, kan netop det opkald ikke afbrydes af `AcquireTimeout` alene — kun
-ventetiden *foran* det opkald (fx bag `_creationGate` mens et andet, serialiseret opkald kører) er
-garanteret bounded. `AcquireTimeout`s XML-doc er opdateret til eksplicit at anbefale at konfigurere
-`CreateTimeout` sammen med `AcquireTimeout` for en reel worst-case-grænse. Dette er samme kategori
-rest-risiko som den allerede dokumenterede "hængende `CreateAsync` uden `CreateTimeout`"-begrænsning
-fra ADR-0011's `probeClaimTimeout`-fallback.
+**Important, documented residual limitation:** this is *cooperative* cancellation. If the specific,
+in-progress `CreateAsync` call neither respects `CancellationToken` itself nor is bounded by
+`PoolOptions.CreateTimeout`, that particular call cannot be interrupted by `AcquireTimeout` alone — only
+the waiting time *in front of* that call (e.g., behind `_creationGate` while another serialized call runs) is
+guaranteed bounded. `AcquireTimeout`'s XML doc has been updated to explicitly recommend configuring
+`CreateTimeout` together with `AcquireTimeout` for a real worst-case bound. This is the same category
+of residual risk as the already documented "hanging `CreateAsync` without `CreateTimeout`" limitation
+from ADR-0011's `probeClaimTimeout` fallback.
 
-Ny regressionstest beviser den konkrete, oprindeligt rapporterede fejl er rettet: med `MaxSize=2`
-kan begge callere straks få en kapacitets-permit, men oprettelse er altid serialiseret
-(`docs/adr/0002`) — den anden caller, der før ville vente ubegrænset bag den førstes langsomme
-oprettelse, timer nu korrekt ud nær `AcquireTimeout`.
+A new regression test proves the concrete, originally reported bug is fixed: with `MaxSize=2`
+both callers can immediately obtain a capacity permit, but creation is always serialized
+(`docs/adr/0002`) — the second caller, which previously would wait forever behind the first caller's slow
+creation, now correctly times out near `AcquireTimeout`.
 
-### Fix for #2: Operationel-fejl-tælleren nulstilles kun ved en reel sund retur
-Fjernet: `Interlocked.Exchange(ref _consecutiveOperationalFailures, 0)` fra
-`RecycleInPlaceAsync`s success-gren. En vellykket kloning af en erstatningsressource er bevis på at
-medlemmet *kan oprettes*, ikke at det kan udføre en reel operation succesfuldt — kun en
-efterfølgende, faktisk sund `ReturnAsync` (dvs. ingen `MarkUnhealthy` blev kaldt på leasen) nulstiller
-nu tælleren. Et medlem hvis operationer konsekvent fejler vil derfor korrekt akkumulere
-`ConsecutiveOperationalFailures` på tværs af gentagne recycles og til sidst nå tærsklen.
+### Fix for #2: The operational-failure counter resets only on a truly healthy return
+Removed: `Interlocked.Exchange(ref _consecutiveOperationalFailures, 0)` from
+`RecycleInPlaceAsync`'s success branch. Successfully cloning a replacement resource is evidence that the
+member *can be created*, not that it can perform a real operation successfully — only a
+subsequent, actually healthy `ReturnAsync` (i.e., no `MarkUnhealthy` was called on the lease) now resets
+ the counter. A member whose operations consistently fail will therefore correctly accumulate
+`ConsecutiveOperationalFailures` across repeated recycles and eventually reach the threshold.
 
-*Kendt, ikke rettet nuance (dokumenteret, ikke et blokerende fund):* en enkelt, langvarig, held
-lease der returneres sundt efter at flere nyere leases allerede har fejlet, kan stadig nulstille
-tælleren "for tidligt" pga. samtidig trafik — en fuldt tidsvindue-/rate-baseret
-outcome-tracker ville løse dette generelt, men er en større arkitekturændring end denne runde
-retter; den nuværende "consecutive"-model er en tilnærmelse, ligesom før.
+*Known, not fixed nuance (documented, not a blocking finding):* a single, long-running, lucky
+lease that returns healthy after several newer leases have already failed can still reset the
+counter "too early" because of concurrent traffic — a fully time-window/rate-based
+outcome tracker would solve this generally, but is a larger architectural change than this round
+addresses; the current "consecutive" model is an approximation, just as before.
 
-### Fix for #3: `WarmupAsync` er nu idempotent
-Omskrevet fra "opret ubetinget `min(PrewarmCount, MaxSize)` *flere*" til "sørg for at
-`_createdCount` når mindst `min(PrewarmCount, MaxSize)`, ved kun at oprette differencen". Tjekker
-`_createdCount` før *og* efter at have taget en kapacitets-permit (for at håndtere race med
-samtidige `WarmupAsync`/lazy `AcquireAsync`-oprettelser), og topper kun op med den reelle
-mangel. Permit-livscyklussen er uændret ift. før (permit tages, ressource oprettes og lægges i
-`_idle`, permit frigives igen — idle-ressourcer holder aldrig selv en permit i denne pools model;
-kun en aktiv lease/oprettelse gør). Gentagne kald med samme `PrewarmCount` er nu no-ops.
+### Fix for #3: `WarmupAsync` is now idempotent
+Rewritten from "unconditionally create `min(PrewarmCount, MaxSize)` *more*" to "ensure that
+`_createdCount` reaches at least `min(PrewarmCount, MaxSize)` by creating only the difference." Checks
+`_createdCount` before *and* after taking a capacity permit (to handle races with
+concurrent `WarmupAsync`/lazy `AcquireAsync` creation), and only tops up by the actual
+shortfall. The permit lifecycle is unchanged from before (permit is taken, resource is created and placed in
+`_idle`, permit is released again — idle resources never hold a permit themselves in this pool's model;
+only an active lease/creation does). Repeated calls with the same `PrewarmCount` are now no-ops.
 
-### Fix for #4: Kapacitets-timeout rapporteres ikke længere som fejlet probe
-Ny `MemberCircuitBreaker.AbandonProbe(member)`: frigiver en klaimet half-open-probe **uden** at
-genstarte cooldown-vinduet (i modsætning til `CompleteProbe(succeeded: false)`). Ny default no-op
-`ISlotSelectionStrategy.ReportAcquireAbandoned(member)`, implementeret af begge
-circuit-breaker-bevidste strategier til at kalde `_breaker.AbandonProbe`.
-`DataverseGroupPool.AcquireAsync` fanger nu `PoolAcquireTimeoutException` specifikt, *før* det
-generelle `catch`, og kalder `ReportAcquireAbandoned` i stedet for `ReportAcquireOutcome(false)`.
+### Fix for #4: Capacity timeout is no longer reported as a failed probe
+New `MemberCircuitBreaker.AbandonProbe(member)`: releases a claimed half-open probe **without**
+restarting the cooldown window (unlike `CompleteProbe(succeeded: false)`). New default no-op
+`ISlotSelectionStrategy.ReportAcquireAbandoned(member)`, implemented by both
+circuit-breaker-aware strategies to call `_breaker.AbandonProbe`.
+`DataverseGroupPool.AcquireAsync` now catches `PoolAcquireTimeoutException` specifically, *before* the
+general `catch`, and calls `ReportAcquireAbandoned` instead of `ReportAcquireOutcome(false)`.
 
-### Fix for #5: `PoolStats.DetectedLeakCount` — holdbar leak-synlighed
-Ny, monotont stigende `PoolStats.DetectedLeakCount`, inkrementeret **synkront** i
-`ReportLeakedLease` (før callback/event-dispatch til `ThreadPool`), så den er pålideligt synlig via
-`GetStats()` selv hvis ingen `OnLeakDetected`/`HealthChanges`-abonnent nogensinde var tilsluttet.
-`PoolAcquireTimeoutException`s besked inkluderer nu `DetectedLeakCount` og, hvis > 0, en eksplicit
-note om at stigende leak-count sammen med timeouts indikerer tabt kapacitet, ikke kun belastning.
+### Fix for #5: `PoolStats.DetectedLeakCount` — durable leak visibility
+New, monotonically increasing `PoolStats.DetectedLeakCount`, incremented **synchronously** in
+`ReportLeakedLease` (before callback/event dispatch to `ThreadPool`), so it is reliably visible via
+`GetStats()` even if no `OnLeakDetected`/`HealthChanges` subscriber was ever attached.
+`PoolAcquireTimeoutException`'s message now includes `DetectedLeakCount` and, if > 0, an explicit
+note that rising leak count together with timeouts indicates lost capacity, not only load.
 
-### Fix for #6: `PoolOptions`-varigheder valideres i konstruktøren
-`ResourcePool<T>`s konstruktør kaster nu `ArgumentOutOfRangeException` hvis `AcquireTimeout`,
-`CreateTimeout`, eller `MaxIdleLifetime` er sat til en ikke-positiv varighed. `null` er fortsat den
-eneste måde at signalere "deaktiveret/ubegrænset" på for alle tre.
+### Fix for #6: `PoolOptions` durations are validated in the constructor
+`ResourcePool<T>`'s constructor now throws `ArgumentOutOfRangeException` if `AcquireTimeout`,
+`CreateTimeout`, or `MaxIdleLifetime` is set to a non-positive duration. `null` remains the
+only way to signal "disabled/unbounded" for all three.
 
-## Konsekvenser
-- **Bagudkompatibelt** for alle seks fixes: ingen offentlig default-adfærd ændrer sig for kode der
-  ikke bruger de berørte features (`AcquireTimeout`/`CreateTimeout`/`MaxIdleLifetime` forbliver
-  `null` som default; `DetectedLeakCount` er en ny, additiv `PoolStats`-property med default `0`;
-  `ReportAcquireAbandoned` er en ny default no-op-interface-metode).
-- **Skarpere fejlklassificering i `DataverseGroupPool`**: en ren kapacitets/load-timeout påvirker nu
-  ikke længere et medlems circuit-cooldown forkert — kun reelle create-/operationelle fejl gør.
-- **`ConsecutiveOperationalFailures` er nu et pålideligt signal** for den oprindeligt tilsigtede
-  brugssag (et medlem hvis operationer konsekvent fejler, men hvis kloning lykkes) — den kendte
-  samtidigheds-nuance (en enkelt sen, held retur kan stadig nulstille under blandet trafik) er
-  dokumenteret som en accepteret tilnærmelse, ikke rettet i denne runde.
-- **`WarmupAsync` kan nu trygt kaldes flere gange** (fx fra en retried hosted-service-hook) uden at
-  risikere at overskride `MaxSize`.
-- Test-dækning: **82/82 grønne** (Core 36 [+15], Dataverse 43 [+1], Polly 3), op fra 66/66. Kørt 3x
-  i træk uden flaky timing-fejl. Nye tests: end-to-end `AcquireTimeout` (bag serialiseret creation +
-  respekt for caller-cancellation), `WarmupAsync`-idempotens (3 tests), operationel-fejl-akkumulering
-  på tværs af recycles + korrekt nulstilling ved reel sund retur (2 tests), `AbandonProbe` (1 test),
-  `DetectedLeakCount`-synlighed (1 test), `PoolOptions`-varighedsvalidering (6 tests).
+## Consequences
+- **Backward-compatible** for all six fixes: no public default behavior changes for code that
+  does not use the affected features (`AcquireTimeout`/`CreateTimeout`/`MaxIdleLifetime` remain
+  `null` by default; `DetectedLeakCount` is a new, additive `PoolStats` property with default `0`;
+  `ReportAcquireAbandoned` is a new default no-op interface method).
+- **Sharper error classification in `DataverseGroupPool`**: a pure capacity/load timeout no longer
+  incorrectly affects a member's circuit cooldown — only real create/operational failures do.
+- **`ConsecutiveOperationalFailures` is now a reliable signal** for the originally intended
+  use case (a member whose operations consistently fail, but whose cloning succeeds) — the known
+  concurrency nuance (a single late, lucky return can still reset under mixed traffic) is
+  documented as an accepted approximation, not fixed in this round.
+- **`WarmupAsync` can now safely be called multiple times** (e.g., from a retried hosted-service hook) without
+  risking exceeding `MaxSize`.
+- Test coverage: **82/82 passing** (Core 36 [+15], Dataverse 43 [+1], Polly 3), up from 66/66. Run 3x
+  in a row without flaky timing failures. New tests: end-to-end `AcquireTimeout` (behind serialized creation +
+  respect for caller cancellation), `WarmupAsync` idempotence (3 tests), operational-failure accumulation
+  across recycles + correct reset on truly healthy return (2 tests), `AbandonProbe` (1 test),
+  `DetectedLeakCount` visibility (1 test), `PoolOptions` duration validation (6 tests).

@@ -1,204 +1,212 @@
 # TODO — DvPool (Dataverse Connection Pooling)
 
-Sidst opdateret: 2026-09-15 (ADR-0014: femte reviewrunde — probe-claim-generation-korrelation, korrekt skelnen mellem AcquireTimeout-annullering og reelt CreateTimeout, samtidigheds-sikker WarmupAsync)
+Last updated: 2026-09-15 (ADR-0014: fifth review round — probe-claim generation correlation, correctly distinguishing AcquireTimeout cancellation from a real CreateTimeout, concurrency-safe WarmupAsync)
 
-## Navn: DataversePool (skiftet fra XrmPool)
+## Name: DataversePool (renamed from XrmPool)
 
-Oprindeligt sammenlignede vi fire ledige NuGet-navne (XrmPool, DvPool, PoolVerse, DataversePool) og
-valgte først **XrmPool**. Efter bruger-feedback ("mere moderne?") skiftede vi til
-**DataversePool**: mere eksplicit/nutidigt, matcher MS's nuværende "Dataverse"-branding fremfor det
-ældre "Xrm"-SDK-navn, stadig ledigt på NuGet, ingen kollision med søster-projektet DataverseDuck.
-`PackageId` er sat til `DataversePool.Core` / `DataversePool.Dataverse` / `DataversePool.Polly` i de
-tre lib-csproj'er. Sample-projekt (`samples/DataversePool.Sample`), solution-fil
-(`DataversePool.slnx`) og env-var-præfiks (`DATAVERSEPOOL_SAMPLE_CONNECTION_STRING`) omdøbt til
-match (interne C#-namespaces/mappenavne er bevidst IKKE omdøbt fra `ConnectionPool.*` — det er en
-stor, lavværdi-refaktorering; NuGet-pakkenavnet er det, offentligheden ser).
+We originally compared four available NuGet names (XrmPool, DvPool, PoolVerse, DataversePool) and
+initially chose **XrmPool**. After user feedback ("more modern?") we switched to
+**DataversePool**: more explicit/current, matches Microsoft's current "Dataverse" branding rather
+than the older "Xrm" SDK name, still available on NuGet, no collision with the sister project
+DataverseDuck. `PackageId` is set to `DataversePool.Core` / `DataversePool.Dataverse` /
+`DataversePool.Polly` in the three lib csproj files. The sample project
+(`samples/DataversePool.Sample`), solution file (`DataversePool.slnx`), and env-var prefix
+(`DATAVERSEPOOL_SAMPLE_CONNECTION_STRING`) were renamed to match (internal C# namespaces/folder
+names were deliberately NOT renamed from `ConnectionPool.*` — that would be a large, low-value
+refactor; the NuGet package name is what the public actually sees).
 
-## Gruppe-pool-valg: måling (load) vs. blind round-robin
+## Group-pool selection: load-aware vs. blind round-robin
 
-Tilføjet `LeastConnectionsSlotSelectionStrategy` som alternativ til default
-`HealthAwareRoundRobinSlotSelectionStrategy`: vælger medlemmet med færrest aktuelt udlånte leases
-(`PoolStats.LeasedCount`) i stedet for blind tur-baseret fordeling, med samme dead-member
-circuit-breaking (skip/half-open/fail-open). Relevant når kaldsvarighed varierer meget mellem
-medlemmer — se [ADR-0006](docs/adr/0006-dual-pooling-model-single-user-and-round-robin-group.md)'s
-opdaterede afsnit for den fulde afvejning, inkl. hvorfor dette **stadig ikke** er
-throttle/429-bevidst (poolen ser ikke hvad man gør med en lease efter `AcquireAsync`). 4 nye tests,
-13/13 grønne i `ConnectionPool.Dataverse.Tests`.
+Added `LeastConnectionsSlotSelectionStrategy` as an alternative to the default
+`HealthAwareRoundRobinSlotSelectionStrategy`: picks the member with the fewest currently-leased
+leases (`PoolStats.LeasedCount`) instead of blind turn-based distribution, with the same
+dead-member circuit-breaking (skip/half-open/fail-open). Relevant when call duration varies a lot
+between members — see [ADR-0006](docs/adr/0006-dual-pooling-model-single-user-and-round-robin-group.md)'s
+updated section for the full trade-off, including why this is **still not** throttle/429-aware
+(the pool doesn't see what you do with a lease after `AcquireAsync`). 4 new tests, 13/13 passing in
+`ConnectionPool.Dataverse.Tests`.
 
-## Status-oversigt
+## Status overview
 
-| # | Opgave | Status | Afhænger af |
+| # | Task | Status | Depends on |
 |---|---|---|---|
-| 1 | Scaffolde solution + projektskelet | ✅ Done | — |
-| 2 | Skrive ADR'er for kerne-beslutninger | ✅ Done | — |
-| 3 | Implementere Core pool-interfaces | ✅ Done | — |
-| 4 | Skrive Core unit-tests | ✅ Done (14/14 passing) | #3 |
-| 5 | Implementere Dataverse-adapter | ✅ Done | #3 |
-| 6 | Skrive Dataverse-adapter tests | ✅ Done (9/9 passing) | #5 |
-| 7 | Hærdning: races/timeouts/dead group member (ADR-0007) | ✅ Done | #3,#5 |
-| 8 | Implementere Polly-adapter | ✅ Done | #5 |
-| 9 | Skrive Polly-adapter tests | ✅ Done (3/3 passing) | #8 |
+| 1 | Scaffold solution + project skeleton | ✅ Done | — |
+| 2 | Write ADRs for core decisions | ✅ Done | — |
+| 3 | Implement Core pool interfaces | ✅ Done | — |
+| 4 | Write Core unit tests | ✅ Done (14/14 passing) | #3 |
+| 5 | Implement Dataverse adapter | ✅ Done | #3 |
+| 6 | Write Dataverse adapter tests | ✅ Done (9/9 passing) | #5 |
+| 7 | Hardening: races/timeouts/dead group member (ADR-0007) | ✅ Done | #3,#5 |
+| 8 | Implement Polly adapter | ✅ Done | #5 |
+| 9 | Write Polly adapter tests | ✅ Done (3/3 passing) | #8 |
 | 10 | README, LICENSE (MIT), CONTRIBUTING, SECURITY, CODE_OF_CONDUCT | ✅ Done | — |
-| 11 | Sample-projekt (`samples/DataversePool.Sample`) | ✅ Done | #5,#8 |
-| 12 | Live Dataverse-forbindelsestest | ✅ **Verificeret mod rigtig org** (se nedenfor) | #11 |
+| 11 | Sample project (`samples/DataversePool.Sample`) | ✅ Done | #5,#8 |
+| 12 | Live Dataverse connection test | ✅ **Verified against a real org** (see below) | #11 |
 
-**MVP + open-source-grundpakke er komplet, og biblioteket er nu bevist at virke end-to-end mod en
-rigtig Dataverse-organisation** (ikke kun mod fakes). Alle 7 projekter (3 lib + 3 test + 1 sample)
-bygger rent, 26/26 tests grønne.
+**The MVP + open-source baseline is complete, and the library is now proven to work end-to-end
+against a real Dataverse organization** (not just against fakes). All 7 projects (3 libs + 3 test
+projects + 1 sample) build cleanly, 26/26 tests passing.
 
-## Live Dataverse-forbindelse: verificeret ✅
+## Live Dataverse connection: verified ✅
 
-Kørte `samples/DataversePool.Sample`'s single-user smoke-test mod en rigtig Dataverse-organisation, ved
-at genbruge connection-oplysningerne fra søsterprojektet dvduck's `.env`
-(`a local .env file outside this repository` — client-secret-baseret app-bruger, aldrig printet/logget
-i klartekst i denne session). Resultat:
+Ran `samples/DataversePool.Sample`'s single-user smoke test against a real Dataverse organization,
+reusing the connection details from the sister project dvduck's `.env`
+(`a local .env file outside this repository` — client-secret-based app user, never printed/logged in
+plaintext during this session). Result:
 
-- `DataverseUserPool.WarmupAsync()` clonede rigtigt (sekventiel warmup, ADR-0002) og oprettede en
-  ægte forbindelse (MSAL client-credential-flow, ~1.4s login).
-- `AcquireAsync()` udleverede en `ServiceClient` med `IsReady=True`.
-- Et rigtigt `WhoAmIRequest` blev eksekveret (~3.3s første kald, inkl. cold-start) og returnerede
-  et ægte `UserId`/`OrganizationId`.
+- `DataverseUserPool.WarmupAsync()` cloned correctly (sequential warmup, ADR-0002) and established
+  a real connection (MSAL client-credential flow, ~1.4s login).
+- `AcquireAsync()` handed out a `ServiceClient` with `IsReady=True`.
+- A real `WhoAmIRequest` was executed (~3.3s for the first call, including cold start) and returned
+  a real `UserId`/`OrganizationId`.
 
-Dette bekræfter at hele kæden — connection-string-parsing, warmup/clone, lease-udlevering,
-`IPooledResourcePolicy<T>`-integrationen — rent faktisk virker mod en levende Dataverse-instans,
-ikke kun mod fakes/mocks. Gruppe-pool (round-robin på tværs af flere app-brugere) er **ikke**
-afprøvet live endnu, da kun én app-brugers credentials var tilgængelige (kræver
-`DATAVERSEPOOL_SAMPLE_CONNECTION_STRING_2`/`_3` for en ekstra service-principal).
+This confirms the entire chain — connection-string parsing, warmup/clone, lease hand-out, the
+`IPooledResourcePolicy<T>` integration — genuinely works against a live Dataverse instance, not
+just against fakes/mocks. The group pool (round-robin across multiple app users) has **not** been
+tried live yet, since only one app user's credentials were available (requires
+`DATAVERSEPOOL_SAMPLE_CONNECTION_STRING_2`/`_3` for an additional service principal).
 
-## Polly-adapter (ConnectionPool.Dataverse.Polly) — færdig
+## Polly adapter (ConnectionPool.Dataverse.Polly) — done
 
-`PollyPoolHealthSignalExtensions` er **generisk** over ressourcetypen (ikke hardcodet til
-`ServiceClient`), så den kan testes end-to-end med en fake pool/ressource uden Dataverse-afhængighed,
-og genbruges for enhver `ConnectionPool.Core`-baseret pool. Projektet refererer derfor kun
-`ConnectionPool.Core` + `Polly.Core`, ikke `ConnectionPool.Dataverse` (undgår at trække hele
-Dataverse-SDK'en ind for rene Polly-brugere).
+`PollyPoolHealthSignalExtensions` is **generic** over the resource type (not hardcoded to
+`ServiceClient`), so it can be tested end-to-end with a fake pool/resource with no Dataverse
+dependency, and reused for any `ConnectionPool.Core`-based pool. The project therefore only
+references `ConnectionPool.Core` + `Polly.Core`, not `ConnectionPool.Dataverse` (avoiding pulling
+in the entire Dataverse SDK for plain Polly users).
 
-- `AddRetryWithPoolHealthSignal<TResult, TResource>(lease, options)` og
+- `AddRetryWithPoolHealthSignal<TResult, TResource>(lease, options)` and
   `AddCircuitBreakerWithPoolHealthSignal<TResult, TResource>(lease, options)` (+ non-generic
-  object-result overloads) wire'r `OnRetry`/`OnOpened` til `lease.MarkUnhealthy(exception)`.
-- Eksisterende bruger-callbacks på `options.OnRetry`/`OnOpened` bevares og kaldes altid først.
-- Tests verificerer end-to-end gennem en rigtig `ResourcePool<T>`: efter en retry/circuit-open og
-  efterfølgende dispose, udleveres en *ny* ressource ved næste acquire, og den gamle er bevisligt
-  disposed (ikke kun et mock-assert på at MarkUnhealthy blev kaldt).
+  object-result overloads) wire `OnRetry`/`OnOpened` to `lease.MarkUnhealthy(exception)`.
+- Existing user callbacks on `options.OnRetry`/`OnOpened` are preserved and always called first.
+- Tests verify end-to-end through a real `ResourcePool<T>`: after a retry/circuit-open and
+  subsequent dispose, the *next* acquire hands out a *new* resource, and the old one is provably
+  disposed (not just a mock assertion that MarkUnhealthy was called).
 
-## Åbne spørgsmål / opfølgning
+## Open questions / follow-up
 
-- [ ] Bekræft eller afkræft socket-depletion-antagelsen ved new-per-request (uverificeret).
-- [ ] Bekræft eller afkræft CallerId cross-thread race condition ved faktisk parallel varierende CallerId-test.
-- [ ] Baggrunds-sweep for MaxIdleLifetime (i dag kun lazy-ved-checkout) — udskudt til v2 hvis behov.
-- [x] ~~Kør den faktiske live Dataverse-smoke-test~~ — kørt og bekræftet mod rigtig org (se ovenfor).
-- [ ] Kør gruppe-pool (round-robin) smoke-testen live med 2+ app-brugere (kræver en ekstra
-      service-principal ud over den ene der blev brugt til single-user-testen).
-- [ ] Overvej integrationstest-projekt (opt-in, mod ægte Dataverse-instans) — ikke oprettet i denne session.
-- [ ] Før faktisk NuGet-publicering: opdater placeholder-URL'er i `Directory.Build.props`
-      (`PackageProjectUrl`/`RepositoryUrl` peger pt. på et fiktivt `github.com/dataversepool/dataversepool`)
-      til det rigtige repo, og afklar rigtigt forfatter/copyright-navn i `LICENSE` (pt.
-      "DataversePool contributors" som placeholder).
+- [ ] Confirm or refute the socket-depletion assumption for new-per-request usage (unverified).
+- [ ] Confirm or refute the CallerId cross-thread race condition with an actual parallel,
+      varying-CallerId test.
+- [ ] Background sweep for MaxIdleLifetime (today only lazy-at-checkout) — deferred to v2 if needed.
+- [x] ~~Run the actual live Dataverse smoke test~~ — run and confirmed against a real org (see above).
+- [ ] Run the group-pool (round-robin) smoke test live with 2+ app users (requires an additional
+      service principal beyond the one used for the single-user test).
+- [ ] Consider an integration-test project (opt-in, against a real Dataverse instance) — not
+      created in this session.
+- [ ] Before actual NuGet publishing: update the placeholder URLs in `Directory.Build.props`
+      (`PackageProjectUrl`/`RepositoryUrl` currently point at a fictional
+      `github.com/dataversepool/dataversepool`) to the real repo, and settle the real
+      author/copyright name in `LICENSE` (currently "DataversePool contributors" as a placeholder).
 
-## Hærdning (ADR-0007) — færdig
+## Hardening (ADR-0007) — done
 
-Efter en systematisk gennemgang af race conditions/timeouts/real-world-scenarier blev følgende rettet:
-- `MarkUnhealthy` no-op'er hvis kaldt efter `DisposeAsync` (use-after-dispose guard).
-- `ResourcePool<T>.DisposeAsync` gør nu et best-effort drain og forhindrer nye `AcquireAsync`
-  (kaster `ObjectDisposedException`); leases der returneres efter shutdown disposes direkte i stedet
-  for at blive lækket i `_idle`.
-- `PoolStats.UnhealthyOrRecyclingCount` tælles nu korrekt (var tidligere hardcodet til 0).
-- `PoolOptions.CreateTimeout`: en hængende `CreateAsync` blokerer ikke længere den serielle
-  creation-gate på ubestemt tid — gaten frigives ved timeout, det forladte kald må selv afslutte og
-  bortskaffes automatisk (bevidst tradeoff: kan sjældent tillade 2 overlappende clones).
-- `PoolOptions.MaxIdleLifetime`: idle ressourcer ældre end grænsen recycles proaktivt ved checkout
-  (svarer til ADO.NET's Connection Lifetime).
-- **"Én bruger i en gruppe er død":** ny `HealthAwareRoundRobinSlotSelectionStrategy` (nu default i
-  `DataverseGroupPool`) sporer `ConsecutiveCreateFailures` pr. medlem, springer permanent fejlende
-  medlemmer over (circuit-open), prøver dem igen efter cooldown (half-open), og fail'er *open*
-  (vælger stadig et medlem) hvis alle er nede samtidig, frem for at låse gruppen helt ude.
+After a systematic review of race conditions/timeouts/real-world scenarios, the following was fixed:
+- `MarkUnhealthy` is a no-op if called after `DisposeAsync` (use-after-dispose guard).
+- `ResourcePool<T>.DisposeAsync` now performs a best-effort drain and prevents new `AcquireAsync`
+  calls (throws `ObjectDisposedException`); leases returned after shutdown are disposed directly
+  instead of being leaked into `_idle`.
+- `PoolStats.UnhealthyOrRecyclingCount` is now counted correctly (was previously hardcoded to 0).
+- `PoolOptions.CreateTimeout`: a hung `CreateAsync` no longer blocks the serial creation gate
+  indefinitely — the gate is released on timeout, and the abandoned call finishes and is disposed
+  automatically on its own (deliberate trade-off: can rarely allow 2 overlapping clones).
+- `PoolOptions.MaxIdleLifetime`: idle resources older than the limit are proactively recycled at
+  checkout (equivalent to ADO.NET's Connection Lifetime).
+- **"One user in a group is dead":** new `HealthAwareRoundRobinSlotSelectionStrategy` (now the
+  default in `DataverseGroupPool`) tracks `ConsecutiveCreateFailures` per member, skips
+  permanently-failing members (circuit-open), retries them after a cooldown (half-open), and fails
+  *open* (still picks a member) if all are down simultaneously, rather than locking the group out
+  entirely.
 
-Se `docs/adr/0007-race-conditions-timeouts-and-failure-scenarios.md` for fuld analyse og alle 6
-identificerede punkter. Nye tests: `CreateTimeoutTests`, `PoolShutdownTests`,
+See `docs/adr/0007-race-conditions-timeouts-and-failure-scenarios.md` for the full analysis and
+all 6 identified points. New tests: `CreateTimeoutTests`, `PoolShutdownTests`,
 `DefensiveBehaviorTests` (Core); `HealthAwareRoundRobinSlotSelectionStrategyTests` (Dataverse).
 
-## Core-implementering (ConnectionPool.Core) — færdig
+## Core implementation (ConnectionPool.Core) — done
 
-Filer: `IPooledResourcePolicy.cs`, `PoolIncidentInfo.cs`, `PoolOptions.cs`, `PoolStats.cs`,
+Files: `IPooledResourcePolicy.cs`, `PoolIncidentInfo.cs`, `PoolOptions.cs`, `PoolStats.cs`,
 `SlotHealthChanged.cs`, `Slot.cs` (internal), `PooledLease.cs`, `ResourcePool.cs`.
 
-Nøgle-implementeringsdetaljer:
-- `SemaphoreSlim`-baseret capacity-gate (1 permit pr. slot) bounder created+leased til `MaxSize`
-  uden separat tælling der kan komme ud af sync.
-- Separat `_creationGate` (1,1) garanterer aldrig parallel `CreateAsync` (ADR-0002) — verificeret af
-  `SerialCreationGateTests` med 20 samtidige acquires på tom pool (`MaxObservedConcurrentCreations == 1`).
-- `MarkUnhealthy` → baggrunds-recycle uden at blokere andre waiters (ADR-0004) — verificeret af
+Key implementation details:
+- `SemaphoreSlim`-based capacity gate (1 permit per slot) bounds created+leased to `MaxSize`
+  without a separate counter that could drift out of sync.
+- A separate `_creationGate` (1,1) guarantees `CreateAsync` is never called in parallel (ADR-0002)
+  — verified by `SerialCreationGateTests` with 20 concurrent acquires on an empty pool
+  (`MaxObservedConcurrentCreations == 1`).
+- `MarkUnhealthy` → background recycle without blocking other waiters (ADR-0004) — verified by
   `HealthSignalTests`.
-- Lease-leak detection via finalizer (ADR-0003) → samme recycle-vej som `MarkUnhealthy`.
-- `HealthChanges` er en håndrullet `IObservable<SlotHealthChanged>` (ingen `System.Reactive`-afhængighed).
-- Tests: 100% fakes (`FakePolicy`/`FakeResource`), ingen Dataverse-afhængighed, jf. teststrategi.
+- Lease-leak detection via finalizer (ADR-0003) → same recycle path as `MarkUnhealthy`.
+- `HealthChanges` is a hand-rolled `IObservable<SlotHealthChanged>` (no `System.Reactive`
+  dependency).
+- Tests: 100% fakes (`FakePolicy`/`FakeResource`), no Dataverse dependency, per the test strategy.
 
-## Projektstruktur
+## Project structure
 
 ```
 DvPool.sln
 src/
-  ConnectionPool.Core/                 # generisk pool-motor, ingen Dataverse-viden
-  ConnectionPool.Dataverse/            # ServiceClient-adapter, single-user + group/round-robin
-  ConnectionPool.Dataverse.Polly/      # valgfri Polly-integration (MarkUnhealthy-wiring)
+  ConnectionPool.Core/                 # generic pool engine, no Dataverse knowledge
+  ConnectionPool.Dataverse/            # ServiceClient adapter, single-user + group/round-robin
+  ConnectionPool.Dataverse.Polly/      # optional Polly integration (MarkUnhealthy wiring)
 tests/
   ConnectionPool.Core.Tests/
   ConnectionPool.Dataverse.Tests/
   ConnectionPool.Dataverse.Polly.Tests/
-docs/adr/                              # arkitektur-beslutninger, se ADR-0001..0006
+docs/adr/                              # architecture decisions, see ADR-0001..0006
 ```
 
-## Nøglebeslutninger (se docs/adr/ for fuld begrundelse)
+## Key decisions (see docs/adr/ for full rationale)
 
-- **ADR-0001**: `IPooledResourcePolicy<T>` afkobler Core fra Dataverse.
-- **ADR-0002**: Seriel oprettelses-gate — aldrig parallel cloning (empirisk begrundet).
-- **ADR-0003**: Lease-isolation er en dispose-kontrakt, ikke runtime-håndhævet.
-- **ADR-0004**: Ingen synkron health-check ved checkout; `MarkUnhealthy`-signal i stedet.
-- **ADR-0005**: Polly er en separat, valgfri adapter-pakke (del af MVP).
-- **ADR-0006**: Dobbelt pooling-model — `DataverseUserPool` + `DataverseGroupPool` (round-robin, pluggable strategi).
-- **ADR-0007**: Hardening af race conditions, timeouts og dead-member-scenarier.
-- **ADR-0008**: Throttle-detektion via HTTP 429/exception (`DataverseThrottleDetector`), ikke proaktive `x-ms-ratelimit-*` headers — SDK'en eksponerer ikke headers på succesfulde kald. `DataverseGroupPool.AcquireAsync()` returnerer nu `DataverseGroupLease` så en 429 kan rapporteres tilbage til det rigtige medlem (`ReportIfThrottled`).
-- **ADR-0009**: Sikkerhedsfund fra security-review rettet — `IPooledResourcePolicy<T>.OnReturned` nulstiller `ServiceClient.CallerId` ved retur til poolen, så impersonation ikke lækker til næste, urelaterede caller. Desuden: distributed-systems-review afdækkede 5 blokerende multi-instans-problemer (delt budget, fail-open-forstærkning, ikke-atomisk half-open, circuit tracker kun creation-fejl, ubegrænset acquire-kø) — bevidst IKKE løst nu, men dokumenteret som eksplicit produktionsbegrænsning i README ("single process per service-principal set").
-- **ADR-0010**: Rettede 2 af de 3 punkter brugeren bad om at få styr på: (a) `MemberCircuitBreaker` — ny delt type, reelt single-probe half-open (kun én samtidig caller vinder probe-slottet pr. cooldown-vindue, per-proces, ingen delt state mellem processer per eksplicit ønske), erstatter den duplikerede og ikke-atomiske `_openedAt`-logik i begge strategier; (b) `GroupAllUnavailableBehavior` (`FailOpen` default/bagudkompatibel, eller `FailFast` → kaster `DataverseGroupUnavailableException` med medlemsnavne + tidligste kendte throttle-udløb i stedet for at sende trafik til et gruppe, man allerede ved er utilgængelig). Delt budget-koordinering på tværs af processer (punkt 1 i den oprindelige liste) forbliver bevidst uløst — brugeren afviste eksplicit delt state mellem processer, så det er kun dokumenteret (ADR-0009), ikke bygget. `ISlotSelectionStrategy.SelectNext` returnerer nu `SlotSelection` (breaking, accepteret jf. pre-1.0). 52/52 tests grønne.
-- **ADR-0011**: Endnu en reviewrunde (sikkerhed: ingen fund; DB-pool-ekspert; distributed-systems-genreview) fandt at ADR-0010's single-probe-fix ikke var komplet + to nye "blocking"-fund i Core. Rettet: (a) `MemberCircuitBreaker.CompleteProbe(member, succeeded)` — eksplicit outcome-rapportering i stedet for udelukkende at stole på `probeClaimTimeout`; `DataverseGroupPool.AcquireAsync` kalder den nu efter hvert forsøg; (b) constructor-validering af `cooldownPeriod`/`probeClaimTimeout` (kaster på ikke-positive værdier); (c) `ReportLeakedLease`/`PublishHealthChanged` dispatcher nu bruger-callbacks og observer-notifikation via `ThreadPool.QueueUserWorkItem` i stedet for direkte på finalizer-tråden, med try/catch omkring hver — en fejlende subscriber kan hverken crashe processen eller strande kapacitet; (d) `BuildUnavailableException` filtrerer nu udløbne `ThrottledUntil`-ticks. Bevidst IKKE løst: bounded acquire-kø/deadline, operationel-fejl-bevidst circuit, cross-member samtidig creation i gruppen (kræver empirisk verifikation), og leak-detection som rent diagnostisk (afvist — ville reversere ADR-0003/0004 uden brugerens input). 61/61 tests grønne.
-- **ADR-0012**: Brugeren traf eksplicit stilling til hele den resterende ADR-0011-backlog. Rettet: (a) `PoolOptions.AcquireTimeout` — bounded ventetid på `AcquireAsync` (samme mønster som HikariCP `connectionTimeout`/ADO.NET `Connect Timeout`: timeout på selve ventetiden, ikke en max-kø-længde), kaster ny `PoolAcquireTimeoutException` (arver `TimeoutException`) med `PoolStats`-snapshot; (b) `PoolStats.ConsecutiveOperationalFailures` — ny tæller inkrementeret af `PooledLease.MarkUnhealthy`, nulstillet ved sund retur/vellykket recycle; `MemberCircuitBreaker.IsEligible` åbner nu kredsløbet på ENTEN create- eller operationelle fejl, så et medlem der opretter fint men fejler i brug ikke længere bliver ved med at få trafik; (c) leak-detection er nu **rent diagnostisk (log-only, som HikariCP)** — en lækket lease bliver hverken disponeret eller recycled, kun rapporteret via `OnLeakDetected`/ny `SlotHealthState.LeakDetected`; et reelt leak reducerer nu permanent poolens kapacitet med én slot indtil genstart (eksplicit accepteret trade-off). IKKE ændret: cross-member samtidig creation i gruppen (bruger accepterede den lille formodede ekstra omkostning ved ikke at serialisere, uden empirisk verifikation) og cross-process koordinering (fortsat afvist). 66/66 tests grønne.
-- **ADR-0013**: Fjerde reviewrunde (sikkerhed: ingen fund; DB-pool-ekspert + distributed-systems-ekspert: overlappende root causes). Rettet (brugeren var utilgængelig, autonome beslutninger — alle veldefinerede bugs, ingen scope-udvidelse): (a) `AcquireTimeout` bounder nu **hele** acquire-operationen ende-til-ende (capacity-wait + idle-recycle + serialiseret creation), ikke kun det indledende semaphore-wait — via et linket `CancellationTokenSource`; rest-begrænsning (en enkelt, ikke-cancellation-bevidst `CreateAsync` uden `CreateTimeout` konfigureret kan stadig ikke afbrydes) er dokumenteret i XML-docs; (b) `ConsecutiveOperationalFailures` nulstilles ikke længere af en vellykket recycle (kun af en reelt sund `ReturnAsync`) — rettede en bug hvor et konsekvent-fejlende-men-klonbart medlem aldrig nåede breaker-tærsklen; (c) `WarmupAsync` er nu idempotent (topper op til `min(PrewarmCount, MaxSize)` i stedet for at oprette det antal *igen* hvert kald); (d) ny `MemberCircuitBreaker.AbandonProbe` + `ISlotSelectionStrategy.ReportAcquireAbandoned` — en ren kapacitets-timeout (`PoolAcquireTimeoutException`) rapporteres ikke længere som et fejlet health-probe, så den ikke unødigt forlænger et gennemrettende medlems cooldown; (e) ny `PoolStats.DetectedLeakCount` — holdbar, synkron tæller for GC-detekterede leaks, synlig via `GetStats()` selv uden nogen `OnLeakDetected`/`HealthChanges`-abonnent, inkluderet i `PoolAcquireTimeoutException`s besked; (f) `ResourcePool<T>`s konstruktør validerer nu `AcquireTimeout`/`CreateTimeout`/`MaxIdleLifetime` (kaster på ikke-positive værdier i stedet for at fejle sent/forvirrende). 82/82 tests grønne (op fra 66/66), kørt 3x uden flaky timing-fejl. **Bemærk:** en femte reviewrunde (ADR-0014) fandt at (a) og (d) kun var delvist effektive — se ADR-0014.
-- **ADR-0014**: Femte reviewrunde (sikkerhed: ingen fund; DB-pool-ekspert + distributed-systems-ekspert: fandt at flere af ADR-0013s fixes kun var delvist effektive, plus en ny regression i selve ADR-0013-arbejdet). Rettet (brugeren utilgængelig, autonome beslutninger — veldefinerede bugs uden scope-udvidelse): (a) **ny regression rettet**: `CreateThroughGateAsync` (og `RecycleInPlaceAsync`s inline recycle-variant) forvekslede en `AcquireTimeout`/caller-cancellation, der ramte midt i en igangværende oprettelse, med et reelt `CreateTimeout`-udløb — inkrementerede fejlagtigt `ConsecutiveCreateFailures` og kastede `TimeoutException` i stedet for `OperationCanceledException`, hvilket omgik hele ADR-0013 (a)+(d)-kæden og rapporterede en ren kapacitets-hændelse som et fejlet health-probe; nu skelnes eksplicit mellem de to årsager; (b) `MemberCircuitBreaker` fik claim-generation-korrelation — `IsEligible` kan nu returnere et opaque claim-nummer, som `CompleteProbe`/`AbandonProbe` kan kræve matcher det aktuelle claim (ignorerer stille et forældet/sent rapport fra et allerede overhalet forsøg i stedet for at korrumpere et nyere claim); ført igennem `SlotSelection`/`ISlotSelectionStrategy`/`DataverseGroupPool`, 100% bagudkompatibelt (alle nye parametre valgfrie); (c) `WarmupAsync` fik en dedikeret `_warmupGate`, der gør hele tjek-target/opret-beslutningen atomisk på tværs af samtidige kald (ADR-0013s fix dækkede kun gentagne *sekventielle* kald). **Bevidst IKKE rettet, kræver brugerens stillingtagen**: den fundamentale, tidsbaserede probe-race er stadig reelt mulig når `AcquireTimeout` er `null` (default) — en fuld fix kræver et arkitektonisk valg mellem streng "vent på kendt udfald"-semantik (risiko: permanent blokeret recovery ved et hængende forsøg) og den nuværende timeout-fallback (risiko: sjældent probe-overlap); se ADR-0014 for detaljer. Også dokumenteret (ikke rettet): en tidligere ikke-rapporteret bug hvor et half-open-medlems ene probe-slot kan blive "brugt op" af eligibility-filtreringen selvom det medlem ikke ender med at blive valgt denne runde — kræver en isoleret redesign-indsats. 90/90 tests grønne (op fra 82/82), kørt 3x uden flaky timing-fejl.
+- **ADR-0001**: `IPooledResourcePolicy<T>` decouples Core from Dataverse.
+- **ADR-0002**: Serial creation gate — never clone in parallel (empirically justified).
+- **ADR-0003**: Lease isolation is a dispose contract, not runtime-enforced.
+- **ADR-0004**: No synchronous health check at checkout; a `MarkUnhealthy` signal instead.
+- **ADR-0005**: Polly is a separate, optional adapter package (part of the MVP).
+- **ADR-0006**: Dual pooling model — `DataverseUserPool` + `DataverseGroupPool` (round-robin, pluggable strategy).
+- **ADR-0007**: Hardening of race conditions, timeouts, and dead-member scenarios.
+- **ADR-0008**: Throttle detection via HTTP 429/exception (`DataverseThrottleDetector`), not proactive `x-ms-ratelimit-*` headers — the SDK doesn't expose headers on successful calls. `DataverseGroupPool.AcquireAsync()` now returns `DataverseGroupLease` so a 429 can be reported back to the correct member (`ReportIfThrottled`).
+- **ADR-0009**: Fixed a security-review finding — `IPooledResourcePolicy<T>.OnReturned` now resets `ServiceClient.CallerId` when a resource is returned to the pool, so impersonation doesn't leak to the next, unrelated caller. Also: a distributed-systems review uncovered 5 blocking multi-instance issues (shared budget, fail-open amplification, non-atomic half-open, circuit tracker only tracking creation failures, unbounded acquire queue) — deliberately NOT solved now, but documented as an explicit production constraint in the README ("single process per service-principal set").
+- **ADR-0010**: Fixed 2 of the 3 points the user asked to have addressed: (a) `MemberCircuitBreaker` — a new shared type, a genuinely single-probe half-open (only one concurrent caller wins the probe slot per cooldown window, per-process, no shared state across processes per explicit request), replacing the duplicated and non-atomic `_openedAt` logic in both strategies; (b) `GroupAllUnavailableBehavior` (`FailOpen` default/backward-compatible, or `FailFast` → throws `DataverseGroupUnavailableException` with member names + earliest known throttle expiry instead of sending traffic to a group already known to be unavailable). Shared budget coordination across processes (point 1 in the original list) remains deliberately unsolved — the user explicitly rejected shared state across processes, so it's only documented (ADR-0009), not built. `ISlotSelectionStrategy.SelectNext` now returns `SlotSelection` (breaking, accepted per pre-1.0). 52/52 tests passing.
+- **ADR-0011**: Yet another review round (security: no findings; DB-pool expert; distributed-systems re-review) found ADR-0010's single-probe fix was not complete, plus two new "blocking" findings in Core. Fixed: (a) `MemberCircuitBreaker.CompleteProbe(member, succeeded)` — explicit outcome reporting instead of relying solely on `probeClaimTimeout`; `DataverseGroupPool.AcquireAsync` now calls it after every attempt; (b) constructor validation of `cooldownPeriod`/`probeClaimTimeout` (throws on non-positive values); (c) `ReportLeakedLease`/`PublishHealthChanged` now dispatch user callbacks and observer notification via `ThreadPool.QueueUserWorkItem` instead of directly on the finalizer thread, with try/catch around each — a failing subscriber can neither crash the process nor strand capacity; (d) `BuildUnavailableException` now filters out expired `ThrottledUntil` ticks. Deliberately NOT solved: bounded acquire queue/deadline, operational-failure-aware circuit, concurrent cross-member creation in the group (requires empirical verification), and leak detection as purely diagnostic (rejected — would reverse ADR-0003/0004 without the user's input). 61/61 tests passing.
+- **ADR-0012**: The user made an explicit decision on the entire remaining ADR-0011 backlog. Fixed: (a) `PoolOptions.AcquireTimeout` — bounded wait on `AcquireAsync` (same pattern as HikariCP's `connectionTimeout`/ADO.NET's `Connect Timeout`: a timeout on the wait itself, not a max queue length), throwing a new `PoolAcquireTimeoutException` (inherits `TimeoutException`) with a `PoolStats` snapshot; (b) `PoolStats.ConsecutiveOperationalFailures` — new counter incremented by `PooledLease.MarkUnhealthy`, reset on a healthy return/successful recycle; `MemberCircuitBreaker.IsEligible` now opens the circuit on EITHER creation or operational failures, so a member that creates fine but fails in use no longer keeps receiving traffic; (c) leak detection is now **purely diagnostic (log-only, like HikariCP)** — a leaked lease is neither disposed nor recycled, only reported via `OnLeakDetected`/the new `SlotHealthState.LeakDetected`; a genuine leak now permanently reduces the pool's capacity by one slot until restart (explicitly accepted trade-off). NOT changed: concurrent cross-member creation in the group (the user accepted the small assumed extra cost of not serializing it, without empirical verification) and cross-process coordination (still rejected). 66/66 tests passing.
+- **ADR-0013**: Fourth review round (security: no findings; DB-pool expert + distributed-systems expert: overlapping root causes). Fixed (the user was unavailable, autonomous decisions — all well-defined bugs, no scope expansion): (a) `AcquireTimeout` now bounds the **entire** acquire operation end-to-end (capacity wait + idle-recycle + serialized creation), not just the initial semaphore wait — via a linked `CancellationTokenSource`; the residual limitation (a single, non-cancellation-aware `CreateAsync` with no `CreateTimeout` configured still can't be interrupted) is documented in the XML docs; (b) `ConsecutiveOperationalFailures` is no longer reset by a successful recycle (only by a genuinely healthy `ReturnAsync`) — fixed a bug where a consistently-failing-but-clonable member never reached the breaker threshold; (c) `WarmupAsync` is now idempotent (tops up to `min(PrewarmCount, MaxSize)` instead of creating that many *more* every call); (d) new `MemberCircuitBreaker.AbandonProbe` + `ISlotSelectionStrategy.ReportAcquireAbandoned` — a pure capacity timeout (`PoolAcquireTimeoutException`) is no longer reported as a failed health probe, so it doesn't unnecessarily extend a recovering member's cooldown; (e) new `PoolStats.DetectedLeakCount` — a durable, synchronous counter for GC-detected leaks, visible via `GetStats()` even without any `OnLeakDetected`/`HealthChanges` subscriber, included in `PoolAcquireTimeoutException`'s message; (f) `ResourcePool<T>`'s constructor now validates `AcquireTimeout`/`CreateTimeout`/`MaxIdleLifetime` (throws on non-positive values instead of failing late/confusingly). 82/82 tests passing (up from 66/66), run 3x with no flaky timing failures. **Note:** a fifth review round (ADR-0014) found that (a) and (d) were only partially effective — see ADR-0014.
+- **ADR-0014**: Fifth review round (security: no findings; DB-pool expert + distributed-systems expert: found that several of ADR-0013's fixes were only partially effective, plus a new regression in ADR-0013's own work). Fixed (the user was unavailable, autonomous decisions — well-defined bugs with no scope expansion): (a) **new regression fixed**: `CreateThroughGateAsync` (and `RecycleInPlaceAsync`'s inline recycle variant) confused an `AcquireTimeout`/caller cancellation hitting mid-creation with a genuine `CreateTimeout` expiry — incorrectly incrementing `ConsecutiveCreateFailures` and throwing `TimeoutException` instead of `OperationCanceledException`, which bypassed the entire ADR-0013 (a)+(d) chain and reported a pure capacity event as a failed health probe; the two causes are now explicitly distinguished; (b) `MemberCircuitBreaker` gained claim-generation correlation — `IsEligible` can now return an opaque claim number, which `CompleteProbe`/`AbandonProbe` can require to match the current claim (silently ignoring a stale/late report from an already-superseded attempt instead of corrupting a newer claim); threaded through `SlotSelection`/`ISlotSelectionStrategy`/`DataverseGroupPool`, 100% backward-compatible (all new parameters optional); (c) `WarmupAsync` got a dedicated `_warmupGate` that makes the whole check-target/create decision atomic across concurrent calls (ADR-0013's fix only covered repeated *sequential* calls). **Deliberately NOT fixed, requires the user's decision**: the fundamental, time-based probe race is still genuinely possible when `AcquireTimeout` is `null` (default) — a full fix requires an architectural choice between strict "wait for known outcome" semantics (risk: permanently blocked recovery from a hung attempt) and the current timeout fallback (risk: rare probe overlap); see ADR-0014 for details. Also documented (not fixed): a previously unreported bug where a half-open member's single probe slot can be "used up" by the eligibility filtering even when that member isn't the one ultimately selected this round — requires an isolated redesign effort. 90/90 tests passing (up from 82/82), run 3x with no flaky timing failures.
 
-## Åbne spørgsmål / opfølgning
+## Open questions / follow-up
 
-- [ ] Bekræft eller afkræft socket-depletion-antagelsen ved new-per-request (uverificeret, se research).
-- [ ] Bekræft eller afkræft CallerId cross-thread race condition ved faktisk parallel varierende CallerId-test (bemærk: dette er en *anden* risiko end den nu-rettede cross-*lease*-lækage, se ADR-0009).
-- [x] Throttle-aware `ISlotSelectionStrategy` — implementeret via `DataverseUserPool.ReportThrottled`/`IsThrottled` + `DataverseGroupLease.ReportIfThrottled`, se ADR-0008. Begge selection-strategier springer nu throttlede medlemmer over (fail-open hvis alle er throttlet).
-- [ ] Overvej om SOAP-fault (`OrganizationServiceFault`)-baseret throttle-detektion også er nødvendig (bevidst udeladt indtil videre, se ADR-0008 — kræver ekstra `System.ServiceModel.Primitives`-reference og er uverificeret om denne SDK-version overhovedet kaster SOAP-faults for throttling).
-- [ ] Overvej om single-user (ikke-gruppe) `DataverseUserPool` også bør eksponere throttle-state udadtil til monitorering (i dag kun brugt internt af gruppens selection-strategi).
-- [x] Navn valgt: **DataversePool** (NuGet-id'er: `DataversePool.Core`/`.Dataverse`/`.Polly`).
-- [x] Sikkerhedsfund: `CallerId` lækkede mellem leases ved pool-genbrug — rettet via nyt `IPooledResourcePolicy<T>.OnReturned`-hook, se ADR-0009.
-- [x] Reelt single-probe half-open circuit breaker — implementeret via `MemberCircuitBreaker`, se ADR-0010. Per-proces, ingen delt state mellem processer (bevidst valg).
-- [x] Konfigurerbar fail-fast (ikke kun fail-open) når alle gruppemedlemmer er utilgængelige — implementeret via `GroupAllUnavailableBehavior` + `DataverseGroupUnavailableException`, se ADR-0010.
-- [x] Probe-claim-timeout race i `MemberCircuitBreaker` (single-probe var ikke helt atomisk endnu) — rettet via eksplicit `CompleteProbe`-outcome-rapportering, se ADR-0011. Residual-risiko ved uendeligt hængende `CreateAsync` uden `PoolOptions.CreateTimeout` er dokumenteret, ikke fuldt elimineret.
-- [x] Manglende validering af `cooldownPeriod`/`probeClaimTimeout` i `MemberCircuitBreaker` — rettet, se ADR-0011.
-- [x] Finalizer-tråd-sikkerhed: brugerkode (`OnLeakDetected`, `HealthChanges`-observers) kørte synkront på finalizer-tråden (process-fatal risiko ved ubehandlet exception) — rettet via `ThreadPool.QueueUserWorkItem`-dispatch + try/catch, se ADR-0011.
-- [x] Stale `EarliestKnownRetryAt` ved udløbne throttle-ticks — rettet, se ADR-0011.
-- [x] Bounded acquire-kø/deadline i `ResourcePool<T>.AcquireAsync` — implementeret via `PoolOptions.AcquireTimeout` + `PoolAcquireTimeoutException`, se ADR-0012; udvidet til at bounde hele acquire-operationen ende-til-ende (ikke kun det indledende semaphore-wait), se ADR-0013.
-- [x] Skeln oprettelsesfejl fra operationelle fejl i circuit-signalet — implementeret via `PoolStats.ConsecutiveOperationalFailures`, se ADR-0012; rettede en efterfølgende bug hvor en vellykket recycle nulstillede tælleren for tidligt, se ADR-0013.
-- [x] Leak-detection som rent diagnostisk (log-only) — implementeret, se ADR-0012. Bemærk: et reelt leak reducerer nu poolens kapacitet permanent indtil genstart (bevidst, brugergodkendt trade-off). Nu synligt via ny, holdbar `PoolStats.DetectedLeakCount`, se ADR-0013.
-- [x] Cross-member samtidig `CreateAsync` i `DataverseGroupPool` — **accepteret som er** af brugeren uden empirisk verifikation ("nok bare per instans, koster blot lidt ekstra tid"). Ingen kode ændret.
-- [x] `WarmupAsync` er nu idempotent (topper op til `min(PrewarmCount, MaxSize)` i stedet for at oprette det antal *igen* hvert kald) — rettet, se ADR-0013.
-- [x] En kapacitets-timeout (`PoolAcquireTimeoutException`) rapporteredes fejlagtigt som et fejlet circuit-probe — rettet via `MemberCircuitBreaker.AbandonProbe`/`ISlotSelectionStrategy.ReportAcquireAbandoned`, se ADR-0013.
-- [x] `PoolOptions`-varigheder (`AcquireTimeout`/`CreateTimeout`/`MaxIdleLifetime`) var uvaliderede i `ResourcePool`s konstruktør — rettet, se ADR-0013.
-- [ ] **Distributed-systems backlog (v2, "coordinated mode")** — kun punkt 1 tilbage, se ADR-0009/0010/0011/0012:
-  1. ~~Delt throttle/circuit-state på tværs af processer~~ — **bevidst afvist af brugeren** ("ingen delt state mellem processer"). Forbliver en dokumenteret produktionsbegrænsning, ikke en todo.
-- [ ] **DB-pool-design backlog fra fjerde reviewrunde**, resterende (ikke prioriteret af brugeren endnu):
-  - `PoolStats`/observability mangler histogrammer/percentiler, wait-latency, creation/recycle-varighed, leak-alder — nødvendigt for reel produktionsdiagnose.
-  - Ingen `MinIdle`/Little's Law-vejledning til pool-sizing.
-  - `CreateTimeout` fejlklassificerer caller-side cancellation som creation-timeout (åbner circuit forkert).
-  - `ConsecutiveOperationalFailures`s "consecutive"-model kan stadig nulstilles for tidligt af en enkelt, sen, held retur under blandet samtidig trafik (dokumenteret nuance i ADR-0013, ikke rettet — kræver en tidsvindue-/rate-baseret model for en fuld rettelse).
-- [ ] Ingen CI/CD-pipeline endnu — bør etableres før 1.0. (Git-repo er nu etableret, se commits.)
+- [ ] Confirm or refute the socket-depletion assumption for new-per-request usage (unverified, see research).
+- [ ] Confirm or refute the CallerId cross-thread race condition with an actual parallel,
+      varying-CallerId test (note: this is a *different* risk than the now-fixed cross-*lease*
+      leakage, see ADR-0009).
+- [x] Throttle-aware `ISlotSelectionStrategy` — implemented via `DataverseUserPool.ReportThrottled`/`IsThrottled` + `DataverseGroupLease.ReportIfThrottled`, see ADR-0008. Both selection strategies now skip throttled members (fail-open if all are throttled).
+- [ ] Consider whether SOAP-fault (`OrganizationServiceFault`)-based throttle detection is also needed (deliberately omitted for now, see ADR-0008 — would require an extra `System.ServiceModel.Primitives` reference and it's unverified whether this SDK version even throws SOAP faults for throttling).
+- [ ] Consider whether single-user (non-group) `DataverseUserPool` should also expose throttle state externally for monitoring (today only used internally by the group's selection strategy).
+- [x] Name chosen: **DataversePool** (NuGet IDs: `DataversePool.Core`/`.Dataverse`/`.Polly`).
+- [x] Security finding: `CallerId` leaked between leases on pool reuse — fixed via a new `IPooledResourcePolicy<T>.OnReturned` hook, see ADR-0009.
+- [x] Genuinely single-probe half-open circuit breaker — implemented via `MemberCircuitBreaker`, see ADR-0010. Per-process, no shared state across processes (deliberate choice).
+- [x] Configurable fail-fast (not just fail-open) when all group members are unavailable — implemented via `GroupAllUnavailableBehavior` + `DataverseGroupUnavailableException`, see ADR-0010.
+- [x] Probe-claim-timeout race in `MemberCircuitBreaker` (single-probe wasn't fully atomic yet) — fixed via explicit `CompleteProbe` outcome reporting, see ADR-0011. Residual risk from an indefinitely hung `CreateAsync` with no `PoolOptions.CreateTimeout` is documented, not fully eliminated.
+- [x] Missing validation of `cooldownPeriod`/`probeClaimTimeout` in `MemberCircuitBreaker` — fixed, see ADR-0011.
+- [x] Finalizer-thread safety: user code (`OnLeakDetected`, `HealthChanges` observers) ran synchronously on the finalizer thread (process-fatal risk on an unhandled exception) — fixed via `ThreadPool.QueueUserWorkItem` dispatch + try/catch, see ADR-0011.
+- [x] Stale `EarliestKnownRetryAt` from expired throttle ticks — fixed, see ADR-0011.
+- [x] Bounded acquire queue/deadline in `ResourcePool<T>.AcquireAsync` — implemented via `PoolOptions.AcquireTimeout` + `PoolAcquireTimeoutException`, see ADR-0012; extended to bound the entire acquire operation end-to-end (not just the initial semaphore wait), see ADR-0013.
+- [x] Distinguish creation failures from operational failures in the circuit signal — implemented via `PoolStats.ConsecutiveOperationalFailures`, see ADR-0012; fixed a subsequent bug where a successful recycle reset the counter too early, see ADR-0013.
+- [x] Leak detection as purely diagnostic (log-only) — implemented, see ADR-0012. Note: a genuine leak now permanently reduces the pool's capacity until restart (deliberate, user-approved trade-off). Now visible via the new, durable `PoolStats.DetectedLeakCount`, see ADR-0013.
+- [x] Concurrent cross-member `CreateAsync` in `DataverseGroupPool` — **accepted as-is** by the user without empirical verification ("probably fine per instance, just costs a bit of extra time"). No code changed.
+- [x] `WarmupAsync` is now idempotent (tops up to `min(PrewarmCount, MaxSize)` instead of creating that many *more* every call) — fixed, see ADR-0013.
+- [x] A capacity timeout (`PoolAcquireTimeoutException`) was incorrectly reported as a failed circuit probe — fixed via `MemberCircuitBreaker.AbandonProbe`/`ISlotSelectionStrategy.ReportAcquireAbandoned`, see ADR-0013.
+- [x] `PoolOptions` durations (`AcquireTimeout`/`CreateTimeout`/`MaxIdleLifetime`) were unvalidated in `ResourcePool`'s constructor — fixed, see ADR-0013.
+- [ ] **Distributed-systems backlog (v2, "coordinated mode")** — only point 1 remains, see ADR-0009/0010/0011/0012:
+  1. ~~Shared throttle/circuit state across processes~~ — **deliberately rejected by the user** ("no shared state across processes"). Remains a documented production constraint, not a todo.
+- [ ] **DB-pool-design backlog from the fourth review round**, remaining (not yet prioritized by the user):
+  - `PoolStats`/observability lacks histograms/percentiles, wait latency, creation/recycle duration, leak age — needed for real production diagnostics.
+  - No `MinIdle`/Little's Law guidance for pool sizing.
+  - `CreateTimeout` misclassifies caller-side cancellation as a creation timeout (opens the circuit incorrectly).
+  - `ConsecutiveOperationalFailures`'s "consecutive" model can still be reset too early by a single, late, healthy return under mixed concurrent traffic (documented nuance in ADR-0013, not fixed — a full fix would require a time-window-/rate-based model).
+- [ ] No CI/CD pipeline yet — should be set up before 1.0. (Git repo is now established, see commits.)
 
-## Teststrategi (kort, se fulde designdiskussion i sessionen)
+## Test strategy (brief, see the full design discussion in the session)
 
-- Core: 100% fakes, ingen netværk, concurrency-stresstest for seriel gate.
-- Dataverse-adapter: fake `IPooledResourcePolicy<ServiceClient>`, test kun orkestrering.
-- Polly-adapter: verificér `MarkUnhealthy` kaldes korrekt ved retry/circuit-open.
-- Integrationstest mod ægte Dataverse: opt-in, `[Trait("Category","Integration")]`, ikke i normal CI.
+- Core: 100% fakes, no network, concurrency stress test for the serial gate.
+- Dataverse adapter: fake `IPooledResourcePolicy<ServiceClient>`, tests orchestration only.
+- Polly adapter: verify `MarkUnhealthy` is called correctly on retry/circuit-open.
+- Integration test against real Dataverse: opt-in, `[Trait("Category","Integration")]`, not in normal CI.

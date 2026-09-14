@@ -1,35 +1,35 @@
-# ADR-0005: Polly som separat, valgfri adapter-pakke — ikke en kerneafhængighed
+# ADR-0005: Polly as a separate, optional adapter package — not a core dependency
 
 ## Status
-Accepteret (del af MVP-scope)
+Accepted (part of MVP scope)
 
-## Kontekst
-Vi har behov for retry/circuit-breaker omkring operationer på leasede klienter, og et
-signal til poolen når forbindelser er "syge". Polly er det oplagte valg for
-resilience-logik i moderne .NET, men bør ikke tvinges på alle forbrugere af
+## Context
+We need retry/circuit-breaker behavior around operations on leased clients, and a
+signal to the pool when connections are "unhealthy". Polly is the obvious choice for
+resilience logic in modern .NET, but it should not be forced on all consumers of
 `ConnectionPool.Core`/`ConnectionPool.Dataverse`.
 
-## Beslutning
-- `ConnectionPool.Core` og `ConnectionPool.Dataverse` har **ingen** Polly-afhængighed.
-  De eksponerer kun de generelle hooks: `lease.MarkUnhealthy(Exception)` og
+## Decision
+- `ConnectionPool.Core` and `ConnectionPool.Dataverse` have **no** Polly dependency.
+  They expose only the general hooks: `lease.MarkUnhealthy(Exception)` and
   `pool.HealthChanges` (`IObservable<SlotHealthChanged>`).
-- Et separat projekt, `ConnectionPool.Dataverse.Polly`, tilbyder en extension-metode
-  der wire'r Polly's `OnRetry`/`OnOpened`-callbacks til `lease.MarkUnhealthy(...)`:
+- A separate project, `ConnectionPool.Dataverse.Polly`, offers an extension method
+  that wires Polly's `OnRetry`/`OnOpened` callbacks to `lease.MarkUnhealthy(...)`:
 
   ```csharp
   pipeline = new ResiliencePipelineBuilder()
       .AddRetry(...)
-      .WithPoolHealthSignal(lease)   // <- vores extension
+      .WithPoolHealthSignal(lease)   // <- our extension
       .Build();
   ```
 
-- Inkluderet i MVP (ikke udskudt til v2), da det dækker 90% af det forventede
-  brugsmønster med minimal kode og holder kernen ren.
+- Included in MVP (not postponed to v2), because it covers 90% of the expected
+  usage pattern with minimal code and keeps the core clean.
 
-## Konsekvenser
-- Forbrugere der ikke bruger Polly pådrager sig ingen ekstra NuGet-afhængighed.
-- Forbrugere der bruger Polly får en ét-linje integration frem for at skulle
-  selv opdage og implementere `MarkUnhealthy`-kaldet korrekt.
-- Fremtidig udvidelse (pool → Polly retning, dvs. proaktiv circuit-opening baseret på
-  `pool.HealthChanges` ved systemisk fejl) er en additiv ændring i samme projekt,
-  ikke et brud på kontrakten.
+## Consequences
+- Consumers who do not use Polly incur no additional NuGet dependency.
+- Consumers who do use Polly get a one-line integration instead of having to
+  detect and implement the `MarkUnhealthy` call correctly themselves.
+- Future extension (pool → Polly direction, i.e. proactive circuit opening based on
+  `pool.HealthChanges` during systemic failure) is an additive change in the same project,
+  not a breaking change to the contract.
