@@ -95,8 +95,8 @@ in the entire Dataverse SDK for plain Polly users).
       created in this session.
 - [x] Before actual NuGet publishing: update the placeholder URLs in `Directory.Build.props`
       (`PackageProjectUrl`/`RepositoryUrl`) — updated to `github.com/teglsbo/dataversepool`.
-- [ ] Settle the real author/copyright name in `LICENSE` (currently "DataversePool contributors"
-      as a placeholder) before publishing.
+- [x] Settle the real author/copyright name in `LICENSE` — updated to Niels Teglsbo, along with
+      `Directory.Build.props`'s `<Authors>` for consistency.
 
 ## Hardening (ADR-0007) — done
 

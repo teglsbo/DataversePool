@@ -11,7 +11,7 @@
        via <IsPackable>false</IsPackable> (already the xUnit template default). -->
   <PropertyGroup>
     <Product>DataversePool</Product>
-    <Authors>DataversePool contributors</Authors>
+    <Authors>Niels Teglsbo</Authors>
     <Company>DataversePool</Company>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/teglsbo/dataversepool</PackageProjectUrl>
