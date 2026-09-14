@@ -73,4 +73,7 @@ public sealed class HealthAwareRoundRobinSlotSelectionStrategy : ISlotSelectionS
         var index = candidates[(int)((uint)next % (uint)candidates.Count)];
         return new SlotSelection(members[index], allUnavailable);
     }
+
+    /// <inheritdoc />
+    public void ReportAcquireOutcome(DataverseUserPool member, bool succeeded) => _breaker.CompleteProbe(member, succeeded);
 }

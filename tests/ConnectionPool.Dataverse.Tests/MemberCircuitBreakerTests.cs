@@ -90,4 +90,70 @@ public class MemberCircuitBreakerTests
         // without waiting out the cooldown - the breaker should reflect that immediately.
         Assert.True(breaker.IsEligible(member, StatsWithFailures(0), DateTimeOffset.UtcNow));
     }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public void Constructor_Throws_WhenCooldownPeriodNotPositive(int seconds)
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new MemberCircuitBreaker(failureThreshold: 3, cooldownPeriod: TimeSpan.FromSeconds(seconds)));
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public void Constructor_Throws_WhenProbeClaimTimeoutNotPositive(int seconds)
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new MemberCircuitBreaker(failureThreshold: 3, cooldownPeriod: TimeSpan.FromSeconds(30),
+                probeClaimTimeout: TimeSpan.FromSeconds(seconds)));
+    }
+
+    [Fact]
+    public void CompleteProbe_Success_ClosesCircuitImmediately_WithoutWaitingForProbeClaimTimeout()
+    {
+        // docs/adr/0011: a real outcome should close the circuit right away, not rely on the next
+        // stats snapshot or on the probe-claim timeout ever elapsing.
+        var breaker = new MemberCircuitBreaker(failureThreshold: 2, cooldownPeriod: TimeSpan.FromMilliseconds(10),
+            probeClaimTimeout: TimeSpan.FromMinutes(5));
+        var member = new DataverseUserPool("a", "dummy-a");
+        var stats = StatsWithFailures(5);
+
+        breaker.IsEligible(member, stats, DateTimeOffset.UtcNow); // opens
+        Thread.Sleep(20);
+        Assert.True(breaker.IsEligible(member, stats, DateTimeOffset.UtcNow)); // wins the probe
+
+        breaker.CompleteProbe(member, succeeded: true);
+
+        // Even though memberStats still reports failures (a stale snapshot) and the long
+        // probeClaimTimeout hasn't elapsed, the explicit success outcome should already have
+        // cleared the breaker's bookkeeping so a fresh evaluation of the (now recovered) real stats
+        // is trusted immediately.
+        Assert.True(breaker.IsEligible(member, StatsWithFailures(0), DateTimeOffset.UtcNow));
+    }
+
+    [Fact]
+    public void CompleteProbe_Failure_RestartsCooldownAndReleasesClaim_WithoutWaitingForProbeClaimTimeout()
+    {
+        // docs/adr/0011: a failed real attempt should re-arm a fresh cooldown/claim immediately,
+        // closing the window where a stale claim would otherwise block a new probe until
+        // probeClaimTimeout elapses.
+        var cooldown = TimeSpan.FromMilliseconds(20);
+        var breaker = new MemberCircuitBreaker(failureThreshold: 2, cooldownPeriod: cooldown,
+            probeClaimTimeout: TimeSpan.FromMinutes(5));
+        var member = new DataverseUserPool("a", "dummy-a");
+        var stats = StatsWithFailures(5);
+
+        breaker.IsEligible(member, stats, DateTimeOffset.UtcNow); // opens
+        Thread.Sleep(30);
+        Assert.True(breaker.IsEligible(member, stats, DateTimeOffset.UtcNow)); // wins the probe
+
+        breaker.CompleteProbe(member, succeeded: false);
+
+        Assert.False(breaker.IsEligible(member, stats, DateTimeOffset.UtcNow)); // fresh cooldown just started
+
+        Thread.Sleep(30); // exceed the fresh cooldown
+        Assert.True(breaker.IsEligible(member, stats, DateTimeOffset.UtcNow)); // new probe allowed promptly
+    }
 }

@@ -160,6 +160,7 @@ docs/adr/                              # arkitektur-beslutninger, se ADR-0001..0
 - **ADR-0008**: Throttle-detektion via HTTP 429/exception (`DataverseThrottleDetector`), ikke proaktive `x-ms-ratelimit-*` headers — SDK'en eksponerer ikke headers på succesfulde kald. `DataverseGroupPool.AcquireAsync()` returnerer nu `DataverseGroupLease` så en 429 kan rapporteres tilbage til det rigtige medlem (`ReportIfThrottled`).
 - **ADR-0009**: Sikkerhedsfund fra security-review rettet — `IPooledResourcePolicy<T>.OnReturned` nulstiller `ServiceClient.CallerId` ved retur til poolen, så impersonation ikke lækker til næste, urelaterede caller. Desuden: distributed-systems-review afdækkede 5 blokerende multi-instans-problemer (delt budget, fail-open-forstærkning, ikke-atomisk half-open, circuit tracker kun creation-fejl, ubegrænset acquire-kø) — bevidst IKKE løst nu, men dokumenteret som eksplicit produktionsbegrænsning i README ("single process per service-principal set").
 - **ADR-0010**: Rettede 2 af de 3 punkter brugeren bad om at få styr på: (a) `MemberCircuitBreaker` — ny delt type, reelt single-probe half-open (kun én samtidig caller vinder probe-slottet pr. cooldown-vindue, per-proces, ingen delt state mellem processer per eksplicit ønske), erstatter den duplikerede og ikke-atomiske `_openedAt`-logik i begge strategier; (b) `GroupAllUnavailableBehavior` (`FailOpen` default/bagudkompatibel, eller `FailFast` → kaster `DataverseGroupUnavailableException` med medlemsnavne + tidligste kendte throttle-udløb i stedet for at sende trafik til et gruppe, man allerede ved er utilgængelig). Delt budget-koordinering på tværs af processer (punkt 1 i den oprindelige liste) forbliver bevidst uløst — brugeren afviste eksplicit delt state mellem processer, så det er kun dokumenteret (ADR-0009), ikke bygget. `ISlotSelectionStrategy.SelectNext` returnerer nu `SlotSelection` (breaking, accepteret jf. pre-1.0). 52/52 tests grønne.
+- **ADR-0011**: Endnu en reviewrunde (sikkerhed: ingen fund; DB-pool-ekspert; distributed-systems-genreview) fandt at ADR-0010's single-probe-fix ikke var komplet + to nye "blocking"-fund i Core. Rettet: (a) `MemberCircuitBreaker.CompleteProbe(member, succeeded)` — eksplicit outcome-rapportering i stedet for udelukkende at stole på `probeClaimTimeout`; `DataverseGroupPool.AcquireAsync` kalder den nu efter hvert forsøg; (b) constructor-validering af `cooldownPeriod`/`probeClaimTimeout` (kaster på ikke-positive værdier); (c) `ReportLeakedLease`/`PublishHealthChanged` dispatcher nu bruger-callbacks og observer-notifikation via `ThreadPool.QueueUserWorkItem` i stedet for direkte på finalizer-tråden, med try/catch omkring hver — en fejlende subscriber kan hverken crashe processen eller strande kapacitet; (d) `BuildUnavailableException` filtrerer nu udløbne `ThrottledUntil`-ticks. Bevidst IKKE løst: bounded acquire-kø/deadline, operationel-fejl-bevidst circuit, cross-member samtidig creation i gruppen (kræver empirisk verifikation), og leak-detection som rent diagnostisk (afvist — ville reversere ADR-0003/0004 uden brugerens input). 61/61 tests grønne.
 
 ## Åbne spørgsmål / opfølgning
 
@@ -172,13 +173,23 @@ docs/adr/                              # arkitektur-beslutninger, se ADR-0001..0
 - [x] Sikkerhedsfund: `CallerId` lækkede mellem leases ved pool-genbrug — rettet via nyt `IPooledResourcePolicy<T>.OnReturned`-hook, se ADR-0009.
 - [x] Reelt single-probe half-open circuit breaker — implementeret via `MemberCircuitBreaker`, se ADR-0010. Per-proces, ingen delt state mellem processer (bevidst valg).
 - [x] Konfigurerbar fail-fast (ikke kun fail-open) når alle gruppemedlemmer er utilgængelige — implementeret via `GroupAllUnavailableBehavior` + `DataverseGroupUnavailableException`, se ADR-0010.
-- [ ] **Distributed-systems backlog (v2, "coordinated mode"), prioriteret rækkefølge, se ADR-0009/0010:**
+- [x] Probe-claim-timeout race i `MemberCircuitBreaker` (single-probe var ikke helt atomisk endnu) — rettet via eksplicit `CompleteProbe`-outcome-rapportering, se ADR-0011. Residual-risiko ved uendeligt hængende `CreateAsync` uden `PoolOptions.CreateTimeout` er dokumenteret, ikke fuldt elimineret.
+- [x] Manglende validering af `cooldownPeriod`/`probeClaimTimeout` i `MemberCircuitBreaker` — rettet, se ADR-0011.
+- [x] Finalizer-tråd-sikkerhed: brugerkode (`OnLeakDetected`, `HealthChanges`-observers) kørte synkront på finalizer-tråden (process-fatal risiko ved ubehandlet exception) — rettet via `ThreadPool.QueueUserWorkItem`-dispatch + try/catch, se ADR-0011.
+- [x] Stale `EarliestKnownRetryAt` ved udløbne throttle-ticks — rettet, se ADR-0011.
+- [ ] **Distributed-systems backlog (v2, "coordinated mode"), prioriteret rækkefølge, se ADR-0009/0010/0011:**
   1. ~~Delt throttle/circuit-state på tværs af processer~~ — **bevidst afvist af brugeren** ("ingen delt state mellem processer"). Forbliver en dokumenteret produktionsbegrænsning, ikke en todo.
   2. ~~Erstat unconditional fail-open med konfigurerbar fail-fast/deadline-politik~~ — **done, se ADR-0010.**
-  3. ~~Reelt single-probe half-open circuit breaker~~ — **done, se ADR-0010.**
-  4. Skeln oprettelsesfejl (clone-fejl) fra operationelle fejl (5xx/timeout) i circuit-signalet.
-  5. Bounded acquire-kø/deadline i `ResourcePool<T>.AcquireAsync` (reel backpressure).
-- [ ] Ingen git-repo, ingen CI/CD-pipeline endnu — bør etableres før 1.0.
+  3. ~~Reelt single-probe half-open circuit breaker~~ — **done (outcome-baseret), se ADR-0010/0011.** Residual-risiko ved uendeligt hængende create uden `CreateTimeout` er dokumenteret.
+  4. **Højeste tilbageværende prioritet**: bounded acquire-kø/deadline i `ResourcePool<T>.AcquireAsync` (reel backpressure) — ikke bygget endnu, kræver ny option + exception-type.
+  5. Skeln oprettelsesfejl (clone-fejl) fra operationelle fejl (5xx/timeout) i circuit-signalet.
+- [ ] **DB-pool-design backlog fra ADR-0011's review**, ikke bygget endnu:
+  - Cross-member samtidig `CreateAsync` i `DataverseGroupPool` under normal (ikke kun warmup) belastning — kræver empirisk måling af om SDK'ens lock-contention er per-instans eller proces-global, før en gate bygges.
+  - `PoolStats`/observability mangler histogrammer/percentiler, wait-latency, creation/recycle-varighed, leak-alder, throttle/circuit-state — nødvendigt for reel produktionsdiagnose.
+  - `WarmupAsync` er ikke idempotent (gentagne kald kan over-provisionere ud over `PrewarmCount`).
+  - Ingen `MinIdle`/Little's Law-vejledning til pool-sizing.
+  - `CreateTimeout` fejlklassificerer caller-side cancellation som creation-timeout (åbner circuit forkert).
+- [ ] Ingen CI/CD-pipeline endnu — bør etableres før 1.0. (Git-repo er nu etableret, se commits.)
 
 ## Teststrategi (kort, se fulde designdiskussion i sessionen)
 

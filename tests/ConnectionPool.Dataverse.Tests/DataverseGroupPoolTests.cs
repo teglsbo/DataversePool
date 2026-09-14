@@ -70,4 +70,25 @@ public class DataverseGroupPoolTests
         Assert.NotNull(ex.EarliestKnownRetryAt);
         Assert.Equal(b.ThrottledUntil, ex.EarliestKnownRetryAt);
     }
+
+    [Fact]
+    public async Task AcquireAsync_FailFast_IgnoresExpiredThrottleTicks_WhenComputingEarliestRetry()
+    {
+        // docs/adr/0011: ThrottledUntil ticks are never cleared after expiry, so a stale tick from a
+        // long-past throttle must not be reported as if it were still a valid future retry hint.
+        var a = new DataverseUserPool("user-a", "dummy-a");
+        var b = new DataverseUserPool("user-b", "dummy-b");
+        a.ReportThrottled(TimeSpan.FromMilliseconds(10)); // will have expired by the time we assert
+        b.ReportThrottled(TimeSpan.FromSeconds(30)); // still in the future
+
+        await Task.Delay(30); // let a's throttle window elapse
+
+        await using var group = new DataverseGroupPool(
+            new[] { a, b }, new FakeAllUnavailableStrategy(), GroupAllUnavailableBehavior.FailFast);
+
+        var ex = await Assert.ThrowsAsync<DataverseGroupUnavailableException>(() => group.AcquireAsync());
+
+        Assert.NotNull(ex.EarliestKnownRetryAt);
+        Assert.Equal(b.ThrottledUntil, ex.EarliestKnownRetryAt); // a's stale/expired tick is ignored
+    }
 }

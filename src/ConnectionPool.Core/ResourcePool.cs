@@ -181,13 +181,36 @@ public sealed class ResourcePool<T> : IAsyncDisposable where T : notnull
 
     internal void ReportLeakedLease(Slot<T> slot)
     {
+        // Called directly from PooledLease<T>'s finalizer thread. Keep this method itself limited
+        // to cheap, exception-free field writes; user callbacks and recycling are dispatched to the
+        // thread pool below so an unhandled exception from a subscriber can never terminate the
+        // process (an unhandled exception on the finalizer thread is process-fatal) and so a slow
+        // subscriber never stalls finalization of other objects. See docs/adr/0011.
         slot.LastIncidentException = null;
         slot.LastIncidentAt = DateTimeOffset.UtcNow;
         slot.LastIncidentWasLeak = true;
         slot.State = SlotState.Unhealthy;
 
         var incident = slot.LastIncident;
-        _options.OnLeakDetected?.Invoke(incident!);
+        ThreadPool.QueueUserWorkItem(
+            static state => state.pool.CompleteLeakReport(state.slot, state.incident),
+            (pool: this, slot, incident),
+            preferLocal: false);
+    }
+
+    private void CompleteLeakReport(Slot<T> slot, PoolIncidentInfo? incident)
+    {
+        try
+        {
+            _options.OnLeakDetected?.Invoke(incident!);
+        }
+        catch
+        {
+            // A faulty leak-detection callback must never prevent the slot from being recycled -
+            // there is no reasonable caller left to observe this failure (the original lease's
+            // owner is long gone). See docs/adr/0011.
+        }
+
         PublishHealthChanged(SlotHealthState.MarkedUnhealthy, incident);
 
         if (Volatile.Read(ref _poolDisposed) == 1)
@@ -215,7 +238,16 @@ public sealed class ResourcePool<T> : IAsyncDisposable where T : notnull
 
         foreach (var observer in observersSnapshot)
         {
-            observer.OnNext(change);
+            try
+            {
+                observer.OnNext(change);
+            }
+            catch
+            {
+                // A faulty observer must not prevent other observers from being notified, or (when
+                // this is reached from the leak-reporting path) prevent slot recycling from being
+                // scheduled afterwards. See docs/adr/0011.
+            }
         }
     }
 

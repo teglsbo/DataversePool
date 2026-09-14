@@ -224,6 +224,7 @@ Every non-obvious choice is written up as an ADR in [`docs/adr/`](docs/adr/):
 8. [Throttle detection: 429/exception, not proactive headers](docs/adr/0008-throttle-detection-429-not-headers.md)
 9. [Return-scrubbing hook (CallerId leak fix) + documented single-process constraint](docs/adr/0009-return-scrubbing-hook-caller-id-leak.md)
 10. [Configurable fail-fast (not just fail-open) + real single-probe half-open circuit breaker](docs/adr/0010-configurable-fail-fast-and-single-probe-half-open.md)
+11. [Outcome-based probe completion + finalizer-thread safety](docs/adr/0011-outcome-reporting-and-finalizer-thread-safety.md)
 
 ## Status / open items
 

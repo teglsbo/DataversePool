@@ -20,6 +20,18 @@ public interface ISlotSelectionStrategy
     /// report <c>false</c>.
     /// </summary>
     SlotSelection SelectNext(IReadOnlyList<DataverseUserPool> members, IReadOnlyList<PoolStats> memberStats);
+
+    /// <summary>
+    /// Reports the real outcome of the acquire attempt made against a previously selected member,
+    /// called by <see cref="DataverseGroupPool"/> right after every attempt (success or failure) -
+    /// not only when the selection was a half-open probe. Default no-op: strategies without
+    /// circuit-breaking (e.g. plain round-robin) never need to override this. Circuit-breaker-aware
+    /// strategies use this to close/reopen based on the real result instead of relying purely on a
+    /// probe-claim timeout - see docs/adr/0011-outcome-reporting-and-finalizer-thread-safety.md.
+    /// </summary>
+    void ReportAcquireOutcome(DataverseUserPool member, bool succeeded)
+    {
+    }
 }
 
 /// <summary>

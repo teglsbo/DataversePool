@@ -50,16 +50,35 @@ public sealed class DataverseGroupPool : IAsyncDisposable
             throw BuildUnavailableException();
         }
 
-        var lease = await selection.Member.AcquireAsync(cancellationToken).ConfigureAwait(false);
-        return new DataverseGroupLease(selection.Member, lease);
+        try
+        {
+            var lease = await selection.Member.AcquireAsync(cancellationToken).ConfigureAwait(false);
+            // Report the real outcome so circuit-breaker-aware strategies can close/reopen based on
+            // what actually happened, instead of relying solely on the half-open probe-claim timeout
+            // expiring. See docs/adr/0011.
+            _strategy.ReportAcquireOutcome(selection.Member, succeeded: true);
+            return new DataverseGroupLease(selection.Member, lease);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Caller-initiated cancellation is not a signal about the member's health - don't let it
+            // flip/extend the circuit's open state.
+            throw;
+        }
+        catch
+        {
+            _strategy.ReportAcquireOutcome(selection.Member, succeeded: false);
+            throw;
+        }
     }
 
     private DataverseGroupUnavailableException BuildUnavailableException()
     {
         var names = _members.Select(m => m.Name).ToArray();
+        var now = DateTimeOffset.UtcNow;
         var earliestRetryAt = _members
             .Select(m => m.ThrottledUntil)
-            .Where(t => t is not null)
+            .Where(t => t is not null && t.Value > now) // ignore stale ticks that already expired - see docs/adr/0011
             .Select(t => t!.Value)
             .DefaultIfEmpty()
             .Min();

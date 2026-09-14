@@ -79,4 +79,7 @@ public sealed class LeastConnectionsSlotSelectionStrategy : ISlotSelectionStrate
         var index = tied[(int)((uint)next % (uint)tied.Count)];
         return new SlotSelection(members[index], allUnavailable);
     }
+
+    /// <inheritdoc />
+    public void ReportAcquireOutcome(DataverseUserPool member, bool succeeded) => _breaker.CompleteProbe(member, succeeded);
 }
