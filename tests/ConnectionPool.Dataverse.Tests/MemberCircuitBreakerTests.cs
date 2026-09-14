@@ -198,4 +198,114 @@ public class MemberCircuitBreakerTests
         // because AbandonProbe does not touch OpenedAt.
         Assert.True(breaker.IsEligible(member, stats, firstProbeAt));
     }
+
+    [Fact]
+    public void IsEligible_OutOverload_ReturnsNonNullGeneration_OnlyWhenAProbeWasActuallyClaimed()
+    {
+        var breaker = new MemberCircuitBreaker(failureThreshold: 2, cooldownPeriod: TimeSpan.FromMilliseconds(20));
+        var member = new DataverseUserPool("a", "dummy-a");
+
+        // Circuit closed: eligible, but no probe claim exists, so no generation.
+        Assert.True(breaker.IsEligible(member, StatsWithFailures(0), DateTimeOffset.UtcNow, out var closedGen));
+        Assert.Null(closedGen);
+
+        // Circuit just opened: not eligible, no generation.
+        Assert.False(breaker.IsEligible(member, StatsWithFailures(5), DateTimeOffset.UtcNow, out var openedGen));
+        Assert.Null(openedGen);
+
+        Thread.Sleep(30); // exceed cooldown - half-open
+
+        // Wins the probe: must get a non-null generation.
+        Assert.True(breaker.IsEligible(member, StatsWithFailures(5), DateTimeOffset.UtcNow, out var wonGen));
+        Assert.NotNull(wonGen);
+
+        // A second concurrent caller is denied - no generation (nothing claimed for it).
+        Assert.False(breaker.IsEligible(member, StatsWithFailures(5), DateTimeOffset.UtcNow, out var deniedGen));
+        Assert.Null(deniedGen);
+    }
+
+    [Fact]
+    public void CompleteProbe_WithStaleGeneration_IsIgnored_AndDoesNotCorruptNewerClaim()
+    {
+        // Regression test for a round-5 review finding: CompleteProbe/AbandonProbe had no per-attempt
+        // identity, so a late/stale report from an already-superseded probe attempt could corrupt a
+        // genuinely newer, still-active claim on the same member. See docs/adr/0014.
+        //
+        // Scenario: probe A is won, then abandoned (its claim released) - simulating a caller whose
+        // acquire hit a pool-wide capacity timeout before ever attempting the member. Probe B then
+        // wins a fresh claim. A's stale CompleteProbe (arriving late, e.g. a background task that
+        // outlived the caller) must be ignored rather than tearing down B's active claim.
+        var breaker = new MemberCircuitBreaker(
+            failureThreshold: 2, cooldownPeriod: TimeSpan.FromMilliseconds(20), probeClaimTimeout: TimeSpan.FromMinutes(5));
+        var member = new DataverseUserPool("a", "dummy-a");
+        var stats = StatsWithFailures(5);
+
+        breaker.IsEligible(member, stats, DateTimeOffset.UtcNow); // opens
+        Thread.Sleep(30);
+
+        Assert.True(breaker.IsEligible(member, stats, DateTimeOffset.UtcNow, out var claimA));
+        Assert.NotNull(claimA);
+
+        breaker.AbandonProbe(member, claimA); // A's attempt is abandoned - claim released
+
+        Assert.True(breaker.IsEligible(member, stats, DateTimeOffset.UtcNow, out var claimB));
+        Assert.NotNull(claimB);
+        Assert.NotEqual(claimA, claimB);
+
+        // A's stale success report arrives late - must be ignored, not close B's still-active claim.
+        breaker.CompleteProbe(member, succeeded: true, claimA);
+
+        // B's claim must still be intact: a third caller must NOT be able to win a probe right now.
+        Assert.False(breaker.IsEligible(member, stats, DateTimeOffset.UtcNow, out var deniedForC));
+        Assert.Null(deniedForC);
+
+        // B's own (correctly-generationed) completion still works.
+        breaker.CompleteProbe(member, succeeded: true, claimB);
+        Assert.True(breaker.IsEligible(member, StatsWithFailures(0), DateTimeOffset.UtcNow));
+    }
+
+    [Fact]
+    public void AbandonProbe_WithStaleGeneration_IsIgnored_AndDoesNotClearNewerClaim()
+    {
+        var breaker = new MemberCircuitBreaker(
+            failureThreshold: 2, cooldownPeriod: TimeSpan.FromMilliseconds(20), probeClaimTimeout: TimeSpan.FromMinutes(5));
+        var member = new DataverseUserPool("a", "dummy-a");
+        var stats = StatsWithFailures(5);
+
+        breaker.IsEligible(member, stats, DateTimeOffset.UtcNow); // opens
+        Thread.Sleep(30);
+
+        Assert.True(breaker.IsEligible(member, stats, DateTimeOffset.UtcNow, out var claimA));
+        breaker.CompleteProbe(member, succeeded: false, claimA); // A fails, restarts cooldown, releases claim
+
+        Thread.Sleep(30); // exceed the fresh cooldown A's failure started
+
+        Assert.True(breaker.IsEligible(member, stats, DateTimeOffset.UtcNow, out var claimB));
+        Assert.NotNull(claimB);
+        Assert.NotEqual(claimA, claimB);
+
+        // A's stale abandon report arrives late - must be ignored, not release B's active claim.
+        breaker.AbandonProbe(member, claimA);
+
+        // B's claim must still be held: no fresh probe available for a third caller.
+        Assert.False(breaker.IsEligible(member, stats, DateTimeOffset.UtcNow));
+    }
+
+    [Fact]
+    public void CompleteProbe_And_AbandonProbe_WithNullGeneration_PreserveOldUnscopedBehavior()
+    {
+        // Backward-compat: the 2-arg overloads (used by callers that never captured a generation)
+        // must keep behaving exactly as before generation-tracking was added.
+        var breaker = new MemberCircuitBreaker(failureThreshold: 2, cooldownPeriod: TimeSpan.FromMilliseconds(20));
+        var member = new DataverseUserPool("a", "dummy-a");
+        var stats = StatsWithFailures(5);
+
+        breaker.IsEligible(member, stats, DateTimeOffset.UtcNow); // opens
+        Thread.Sleep(30);
+        Assert.True(breaker.IsEligible(member, stats, DateTimeOffset.UtcNow)); // wins probe
+
+        breaker.CompleteProbe(member, succeeded: true); // 2-arg overload, no generation captured
+
+        Assert.True(breaker.IsEligible(member, StatsWithFailures(0), DateTimeOffset.UtcNow));
+    }
 }

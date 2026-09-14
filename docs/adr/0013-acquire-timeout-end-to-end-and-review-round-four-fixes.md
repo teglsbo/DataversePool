@@ -1,7 +1,12 @@
 # ADR-0013: Ende-til-ende AcquireTimeout, retfærdig operationel-fejl-tælling, idempotent warmup, korrekt probe-outcome-rapportering, holdbar leak-synlighed
 
 ## Status
-Accepteret
+Accepteret. **Delvist superseret af [ADR-0014](0014-probe-claim-generation-and-cancellation-vs-createtimeout-misclassification.md):**
+en femte reviewrunde fandt at fix #1 (ende-til-ende `AcquireTimeout`) og fix #4 (`AbandonProbe`)
+kun var delvist effektive — en ny regression (en `AcquireTimeout`-cancellation, der rammer under en
+igangværende `CreateAsync`, blev fejlagtigt klassificeret som et `CreateTimeout` og dermed et fejlet
+health-probe) omgik begge. ADR-0014 retter denne regression samt tilføjer claim-generation-
+korrelation til `MemberCircuitBreaker`. Fix #2, #3, #5, #6 nedenfor forbliver upåvirkede og gyldige.
 
 ## Kontekst
 Efter ADR-0012 blev committet (`0c35c39`), bad brugeren om endnu en (fjerde) reviewrunde: sikkerhed

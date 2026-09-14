@@ -24,6 +24,13 @@ public sealed class ResourcePool<T> : IAsyncDisposable where T : notnull
     // docs/adr/0007 (#4).
     private readonly SemaphoreSlim _creationGate = new(1, 1);
 
+    // Serializes the "check current count against target, then create the shortfall" decision
+    // across concurrent WarmupAsync callers. Without this, two overlapping WarmupAsync calls can
+    // both observe CreatedCount below target (idle resources don't hold a capacity permit, so the
+    // capacity gate alone doesn't prevent this), both proceed to create, and jointly overshoot
+    // MaxSize - see docs/adr/0014.
+    private readonly SemaphoreSlim _warmupGate = new(1, 1);
+
     private readonly ConcurrentStack<Slot<T>> _idle = new();
     private int _createdCount;
     private int _waitingCount;
@@ -81,35 +88,49 @@ public sealed class ResourcePool<T> : IAsyncDisposable where T : notnull
         ThrowIfDisposed();
         var target = Math.Min(_options.PrewarmCount, _options.MaxSize);
 
-        while (true)
+        // _warmupGate makes the whole "check current count against target, then create the
+        // shortfall" decision a single atomic step across concurrent WarmupAsync callers - see
+        // docs/adr/0014. It intentionally does NOT serialize against lazy AcquireAsync-triggered
+        // creation (that's fine: those aren't trying to hit `target`, so at worst this call creates
+        // one fewer resource than it otherwise would, never more than MaxSize thanks to the capacity
+        // gate below).
+        await _warmupGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
         {
-            if (Volatile.Read(ref _createdCount) >= target)
+            while (true)
             {
-                return; // already at (or above) target - idempotent no-op, no permit taken
-            }
-
-            await _capacityGate.WaitAsync(cancellationToken).ConfigureAwait(false);
-            try
-            {
-                // Re-check now that we hold a permit: a concurrent WarmupAsync/lazy AcquireAsync
-                // create may have already reached the target while this call was waiting.
                 if (Volatile.Read(ref _createdCount) >= target)
                 {
-                    return;
+                    return; // already at (or above) target - idempotent no-op, no permit taken
                 }
 
-                var slot = await CreateNewSlotAsync(cancellationToken).ConfigureAwait(false);
-                _idle.Push(slot);
+                await _capacityGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+                try
+                {
+                    // Re-check now that we hold a permit: a concurrent lazy AcquireAsync create may
+                    // have already reached the target while this call was waiting.
+                    if (Volatile.Read(ref _createdCount) >= target)
+                    {
+                        return;
+                    }
+
+                    var slot = await CreateNewSlotAsync(cancellationToken).ConfigureAwait(false);
+                    _idle.Push(slot);
+                }
+                finally
+                {
+                    // Matches the same permit lifecycle as every other idle resource in this pool: the
+                    // permit represents "an acquire is actively in progress against this unit of
+                    // capacity," not "a resource physically exists" - idle resources sit in _idle with
+                    // their permit already released, to be re-consumed by whichever AcquireAsync next
+                    // claims them. See docs/adr/0013.
+                    _capacityGate.Release();
+                }
             }
-            finally
-            {
-                // Matches the same permit lifecycle as every other idle resource in this pool: the
-                // permit represents "an acquire is actively in progress against this unit of
-                // capacity," not "a resource physically exists" - idle resources sit in _idle with
-                // their permit already released, to be re-consumed by whichever AcquireAsync next
-                // claims them. See docs/adr/0013.
-                _capacityGate.Release();
-            }
+        }
+        finally
+        {
+            _warmupGate.Release();
         }
     }
 
@@ -364,6 +385,18 @@ public sealed class ResourcePool<T> : IAsyncDisposable where T : notnull
             PublishHealthChanged(SlotHealthState.Recovered, null);
             return true;
         }
+        catch (OperationCanceledException)
+        {
+            // Cancellation (caller-initiated, or an AcquireTimeout deadline) must propagate so the
+            // caller (AcquireAsync) can translate it correctly - it is not evidence this member is
+            // unhealthy, so it must NOT be counted as a create failure (that would incorrectly help
+            // trip the circuit breaker for what was really just a caller giving up waiting). The old
+            // resource was already disposed above and no replacement was created, so the slot's
+            // capacity genuinely is gone; reflect that in _createdCount without touching the
+            // create-failure counter or publishing a health incident. See docs/adr/0014.
+            Interlocked.Decrement(ref _createdCount);
+            throw;
+        }
         catch (Exception ex)
         {
             Interlocked.Increment(ref _consecutiveCreateFailures);
@@ -430,11 +463,24 @@ public sealed class ResourcePool<T> : IAsyncDisposable where T : notnull
 
             if (completed != createTask)
             {
-                // Timed out. Release the gate now (see tradeoff in ADR-0007 #4) and let the
-                // abandoned task finish on its own; dispose whatever it eventually produces.
+                // The delay "won" the race - but that can happen for two different reasons that
+                // must not be conflated: either CreateTimeout genuinely elapsed (a signal about
+                // *this member's* health), or cancellationToken itself fired first (caller
+                // cancellation, or - via AcquireAsync's linked token - PoolOptions.AcquireTimeout
+                // expiring while creation was still in flight) and Task.Delay observed that instead.
+                // A cancellation is not evidence of a create failure and must propagate as
+                // OperationCanceledException so AcquireAsync can translate it correctly (e.g. into
+                // PoolAcquireTimeoutException) rather than being misreported as a timed-out create -
+                // see docs/adr/0014.
                 _creationGate.Release();
                 gateReleased = true;
                 _ = AbandonCreationAsync(createTask);
+
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    throw new OperationCanceledException(cancellationToken);
+                }
+
                 Interlocked.Increment(ref _consecutiveCreateFailures);
                 throw new TimeoutException(
                     $"Creating a pooled resource did not complete within {_options.CreateTimeout}.");
@@ -447,6 +493,13 @@ public sealed class ResourcePool<T> : IAsyncDisposable where T : notnull
         }
         catch (TimeoutException)
         {
+            throw;
+        }
+        catch (OperationCanceledException)
+        {
+            // Cancellation (caller-initiated, or an AcquireTimeout deadline flowing through the
+            // linked token) is not evidence of a create failure - don't let it trip/extend the
+            // circuit. See docs/adr/0014.
             throw;
         }
         catch

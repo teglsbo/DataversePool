@@ -119,4 +119,50 @@ public class ResourcePoolLifecycleTests
         await pool.WarmupAsync(); // CreatedCount is already 3 (== target) - must not create more
         Assert.Equal(3, policy.CreateCallCount);
     }
+
+    [Fact]
+    public async Task WarmupAsync_IsIdempotent_WhenCalledConcurrently()
+    {
+        // Regression test for round-5 review finding: the before/after capacity-permit checks in
+        // WarmupAsync were not atomic, so two overlapping WarmupAsync calls could both observe
+        // CreatedCount below target and both create - since idle resources don't hold a capacity
+        // permit, MaxSize alone didn't prevent this. See docs/adr/0014.
+        var policy = new FakePolicy();
+        await using var pool = new ResourcePool<FakeResource>(policy, new PoolOptions { MaxSize = 2, PrewarmCount = 1 });
+
+        var barrier = new Barrier(2);
+        Task RunWarmup() => Task.Run(async () =>
+        {
+            barrier.SignalAndWait();
+            await pool.WarmupAsync();
+        });
+
+        await Task.WhenAll(RunWarmup(), RunWarmup());
+
+        Assert.Equal(1, policy.CreateCallCount);
+        var stats = pool.GetStats();
+        Assert.Equal(1, stats.CreatedCount);
+        Assert.Equal(1, stats.IdleCount);
+    }
+
+    [Fact]
+    public async Task WarmupAsync_NeverExceedsMaxSize_WhenManyConcurrentCallsRace()
+    {
+        // Same race as above, but with more concurrent callers and PrewarmCount == MaxSize, to
+        // prove CreatedCount can never overshoot MaxSize under contention. See docs/adr/0014.
+        var policy = new FakePolicy();
+        await using var pool = new ResourcePool<FakeResource>(policy, new PoolOptions { MaxSize = 3, PrewarmCount = 3 });
+
+        var barrier = new Barrier(8);
+        Task RunWarmup() => Task.Run(async () =>
+        {
+            barrier.SignalAndWait();
+            await pool.WarmupAsync();
+        });
+
+        await Task.WhenAll(Enumerable.Range(0, 8).Select(_ => RunWarmup()));
+
+        Assert.Equal(3, policy.CreateCallCount);
+        Assert.Equal(3, pool.GetStats().CreatedCount);
+    }
 }

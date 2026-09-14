@@ -112,4 +112,78 @@ public class AcquireTimeoutTests
         await using var lease2 = await acquireTask.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.NotNull(lease2.Resource);
     }
+
+    [Fact]
+    public async Task AcquireAsync_ThrowsPoolAcquireTimeoutException_NotCreateTimeoutException_WhenAcquireDeadlineFiresDuringCreate()
+    {
+        // Regression test for a round-5 review finding: when both AcquireTimeout and CreateTimeout
+        // are configured, Task.WhenAny(createTask, Task.Delay(createTimeout, cancellationToken)) was
+        // "won" by the delay task whenever *either* CreateTimeout genuinely elapsed OR
+        // cancellationToken itself fired first (e.g. AcquireTimeout expiring while creation was
+        // still in flight) - both were misclassified as a create timeout, incrementing
+        // ConsecutiveCreateFailures and throwing a raw TimeoutException instead of letting
+        // AcquireAsync translate the cancellation into PoolAcquireTimeoutException. See docs/adr/0014.
+        var neverReleased = new SemaphoreSlim(0);
+        var policy = new FakePolicy
+        {
+            BeforeCreateDelay = () => neverReleased.WaitAsync(TimeSpan.FromSeconds(30)),
+        };
+        await using var pool = new ResourcePool<FakeResource>(
+            policy,
+            new PoolOptions
+            {
+                MaxSize = 1,
+                AcquireTimeout = TimeSpan.FromMilliseconds(100),
+                CreateTimeout = TimeSpan.FromSeconds(30), // much longer than AcquireTimeout
+            });
+
+        var ex = await Assert.ThrowsAsync<PoolAcquireTimeoutException>(() => pool.AcquireAsync());
+
+        Assert.Equal(TimeSpan.FromMilliseconds(100), ex.Timeout);
+        Assert.Equal(0, pool.GetStats().ConsecutiveCreateFailures);
+
+        neverReleased.Release(); // let the abandoned create finish so pool teardown doesn't hang
+    }
+
+    [Fact]
+    public async Task AcquireAsync_ThrowsPoolAcquireTimeoutException_WhenAcquireDeadlineFiresDuringInlineRecycle()
+    {
+        // Same misclassification, but via the idle-lifetime-triggered inline recycle path
+        // (RecycleInPlaceAsync -> CreateThroughGateAsync). Before the fix, cancellation here was
+        // swallowed by a blanket `catch (Exception)` that reported it as a failed recycle -
+        // incrementing ConsecutiveCreateFailures for what was really just a caller giving up
+        // waiting. See docs/adr/0014.
+        var hangForever = new SemaphoreSlim(0);
+        var hangNextCreate = false;
+        var policy = new FakePolicy
+        {
+            BeforeCreateDelay = async () =>
+            {
+                if (hangNextCreate)
+                {
+                    await hangForever.WaitAsync(TimeSpan.FromSeconds(30));
+                }
+            },
+        };
+        await using var pool = new ResourcePool<FakeResource>(
+            policy,
+            new PoolOptions
+            {
+                MaxSize = 1,
+                MaxIdleLifetime = TimeSpan.FromMilliseconds(1),
+                AcquireTimeout = TimeSpan.FromMilliseconds(100),
+                CreateTimeout = TimeSpan.FromSeconds(30),
+            });
+
+        var lease = await pool.AcquireAsync();
+        await lease.DisposeAsync(); // becomes idle
+        await Task.Delay(20); // exceed MaxIdleLifetime
+
+        hangNextCreate = true;
+        await Assert.ThrowsAsync<PoolAcquireTimeoutException>(() => pool.AcquireAsync());
+
+        Assert.Equal(0, pool.GetStats().ConsecutiveCreateFailures);
+
+        hangForever.Release(); // let the abandoned recycle-create finish so teardown doesn't hang
+    }
 }

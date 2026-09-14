@@ -55,8 +55,10 @@ public sealed class DataverseGroupPool : IAsyncDisposable
             var lease = await selection.Member.AcquireAsync(cancellationToken).ConfigureAwait(false);
             // Report the real outcome so circuit-breaker-aware strategies can close/reopen based on
             // what actually happened, instead of relying solely on the half-open probe-claim timeout
-            // expiring. See docs/adr/0011.
-            _strategy.ReportAcquireOutcome(selection.Member, succeeded: true);
+            // expiring. See docs/adr/0011. Pass the claim generation (if any) through so a
+            // circuit-breaker-aware strategy can reject a stale report against a since-superseded
+            // claim - see docs/adr/0014.
+            _strategy.ReportAcquireOutcome(selection.Member, succeeded: true, selection.ProbeClaimGeneration);
             return new DataverseGroupLease(selection.Member, lease);
         }
         catch (PoolAcquireTimeoutException)
@@ -66,7 +68,7 @@ public sealed class DataverseGroupPool : IAsyncDisposable
             // as a failed health probe would unnecessarily extend a recovering member's circuit
             // cooldown. Release the probe claim (if one was won) without asserting failure. See
             // docs/adr/0013.
-            _strategy.ReportAcquireAbandoned(selection.Member);
+            _strategy.ReportAcquireAbandoned(selection.Member, selection.ProbeClaimGeneration);
             throw;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -77,7 +79,7 @@ public sealed class DataverseGroupPool : IAsyncDisposable
         }
         catch
         {
-            _strategy.ReportAcquireOutcome(selection.Member, succeeded: false);
+            _strategy.ReportAcquireOutcome(selection.Member, succeeded: false, selection.ProbeClaimGeneration);
             throw;
         }
     }

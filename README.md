@@ -227,6 +227,7 @@ Every non-obvious choice is written up as an ADR in [`docs/adr/`](docs/adr/):
 11. [Outcome-based probe completion + finalizer-thread safety](docs/adr/0011-outcome-reporting-and-finalizer-thread-safety.md)
 12. [Bounded acquire (timeout), operational-failure-aware circuit breaker, log-only leak-detection](docs/adr/0012-log-only-leak-detection-and-bounded-acquire.md)
 13. [End-to-end AcquireTimeout, fair operational-failure counting, idempotent warmup, correct probe-outcome reporting, durable leak visibility](docs/adr/0013-acquire-timeout-end-to-end-and-review-round-four-fixes.md)
+14. [Probe-claim generation correlation, and correctly distinguishing AcquireTimeout cancellation from a real CreateTimeout](docs/adr/0014-probe-claim-generation-and-cancellation-vs-createtimeout-misclassification.md)
 
 ## Status / open items
 

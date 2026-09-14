@@ -27,6 +27,12 @@ public sealed class MemberCircuitBreaker
     {
         public DateTimeOffset OpenedAt;
         public DateTimeOffset? ProbeClaimedAt;
+
+        // Incremented every time a new half-open probe claim is granted. Lets CompleteProbe/
+        // AbandonProbe callers that captured the generation at claim time (see the IsEligible
+        // overload below) detect and ignore a stale report belonging to an already-superseded
+        // claim, instead of accidentally mutating a newer caller's in-flight probe - see docs/adr/0014.
+        public long ClaimGeneration;
     }
 
     private readonly int _failureThreshold;
@@ -72,8 +78,21 @@ public sealed class MemberCircuitBreaker
     /// probe slot is a one-shot claim, so calling this twice for the same half-open member in the
     /// same round would incorrectly make it look ineligible the second time.
     /// </summary>
-    public bool IsEligible(DataverseUserPool member, PoolStats stats, DateTimeOffset now)
+    public bool IsEligible(DataverseUserPool member, PoolStats stats, DateTimeOffset now) =>
+        IsEligible(member, stats, now, out _);
+
+    /// <summary>
+    /// Overload that also hands back an opaque claim generation whenever this call actually wins a
+    /// half-open probe slot (null in every other case - circuit closed, still fully open, or denied
+    /// because someone else currently owns the claim). Callers that plan to later report the outcome
+    /// via <see cref="CompleteProbe"/>/<see cref="AbandonProbe"/> should capture and pass this value
+    /// back so a stale/late report from a since-superseded attempt cannot corrupt a newer claim - see
+    /// docs/adr/0014.
+    /// </summary>
+    public bool IsEligible(DataverseUserPool member, PoolStats stats, DateTimeOffset now, out long? claimGeneration)
     {
+        claimGeneration = null;
+
         // Open on either signal: a member that can't be created, OR one that gets created fine but
         // keeps failing operationally (PooledLease.MarkUnhealthy), should both trip the circuit -
         // see docs/adr/0012.
@@ -105,6 +124,8 @@ public sealed class MemberCircuitBreaker
             }
 
             state.ProbeClaimedAt = now;
+            state.ClaimGeneration++;
+            claimGeneration = state.ClaimGeneration;
             return true; // this caller wins the single half-open probe
         }
     }
@@ -124,23 +145,39 @@ public sealed class MemberCircuitBreaker
     /// probe. Configure <see cref="PoolOptions.CreateTimeout"/> to bound that residual case. See
     /// docs/adr/0011.
     /// </summary>
-    public void CompleteProbe(DataverseUserPool member, bool succeeded)
+    public void CompleteProbe(DataverseUserPool member, bool succeeded) => CompleteProbe(member, succeeded, claimGeneration: null);
+
+    /// <summary>
+    /// Overload accepting the claim generation captured from <see cref="IsEligible(DataverseUserPool, PoolStats, DateTimeOffset, out long?)"/>.
+    /// If a non-null generation is passed and it no longer matches the member's current claim (a
+    /// newer probe has since been won), this report is silently ignored instead of mutating that
+    /// newer claim's state - see docs/adr/0014. Pass <c>null</c> to preserve the old,
+    /// generation-unaware behavior (e.g. when the caller never captured one).
+    /// </summary>
+    public void CompleteProbe(DataverseUserPool member, bool succeeded, long? claimGeneration)
     {
         lock (_lock)
         {
+            if (!_state.TryGetValue(member, out var state))
+            {
+                return; // already closed/removed - nothing to reconcile
+            }
+
+            if (claimGeneration is { } gen && gen != state.ClaimGeneration)
+            {
+                return; // stale report for a since-superseded probe claim - ignore, see docs/adr/0014
+            }
+
             if (succeeded)
             {
                 _state.Remove(member); // close the circuit immediately rather than waiting for the next stats snapshot
                 return;
             }
 
-            if (_state.TryGetValue(member, out var state))
-            {
-                // Failed attempt: restart the cooldown window from now and release the claim so the
-                // *next* cooldown's probe isn't blocked by this attempt's now-resolved claim.
-                state.OpenedAt = DateTimeOffset.UtcNow;
-                state.ProbeClaimedAt = null;
-            }
+            // Failed attempt: restart the cooldown window from now and release the claim so the
+            // *next* cooldown's probe isn't blocked by this attempt's now-resolved claim.
+            state.OpenedAt = DateTimeOffset.UtcNow;
+            state.ProbeClaimedAt = null;
         }
     }
 
@@ -154,14 +191,28 @@ public sealed class MemberCircuitBreaker
     /// unhealthy, so extending its open-circuit cooldown on that basis would be wrong. It just frees
     /// the claim so a fresh probe can be attempted. See docs/adr/0013.
     /// </summary>
-    public void AbandonProbe(DataverseUserPool member)
+    public void AbandonProbe(DataverseUserPool member) => AbandonProbe(member, claimGeneration: null);
+
+    /// <summary>
+    /// Overload accepting the claim generation captured at claim time (see
+    /// <see cref="CompleteProbe(DataverseUserPool, bool, long?)"/> for the same rationale) so a
+    /// stale/late abandon cannot clear a newer, still-active claim.
+    /// </summary>
+    public void AbandonProbe(DataverseUserPool member, long? claimGeneration)
     {
         lock (_lock)
         {
-            if (_state.TryGetValue(member, out var state))
+            if (!_state.TryGetValue(member, out var state))
             {
-                state.ProbeClaimedAt = null;
+                return;
             }
+
+            if (claimGeneration is { } gen && gen != state.ClaimGeneration)
+            {
+                return; // stale - a newer probe already superseded this one, see docs/adr/0014
+            }
+
+            state.ProbeClaimedAt = null;
         }
     }
 }

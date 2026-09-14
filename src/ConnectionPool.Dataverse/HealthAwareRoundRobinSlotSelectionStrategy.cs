@@ -42,7 +42,11 @@ public sealed class HealthAwareRoundRobinSlotSelectionStrategy : ISlotSelectionS
         }
 
         var now = DateTimeOffset.UtcNow;
+        // Parallel to `eligible`'s indices: the claim generation (if any) that IsEligible handed
+        // back for that candidate, so it can be threaded through SlotSelection for whichever
+        // candidate ultimately gets chosen below - see docs/adr/0014.
         var eligible = new List<int>(members.Count);
+        var claimGenerations = new List<long?>(members.Count);
 
         for (var i = 0; i < members.Count; i++)
         {
@@ -55,9 +59,10 @@ public sealed class HealthAwareRoundRobinSlotSelectionStrategy : ISlotSelectionS
                 continue;
             }
 
-            if (_breaker.IsEligible(member, memberStats[i], now))
+            if (_breaker.IsEligible(member, memberStats[i], now, out var claimGeneration))
             {
                 eligible.Add(i);
+                claimGenerations.Add(claimGeneration);
             }
         }
 
@@ -66,16 +71,28 @@ public sealed class HealthAwareRoundRobinSlotSelectionStrategy : ISlotSelectionS
         // Fail open: if every member currently looks unhealthy/throttled, still pick one rather
         // than making the whole group unavailable (default behavior, see docs/adr/0007 #6). The
         // caller (DataverseGroupPool) decides whether to honor this pick or fail fast instead -
-        // see docs/adr/0010.
-        var candidates = allUnavailable ? Enumerable.Range(0, members.Count).ToList() : eligible;
+        // see docs/adr/0010. None of these candidates won a probe claim (IsEligible only returns a
+        // generation when it returns true), so there's no generation to carry for this branch.
+        if (allUnavailable)
+        {
+            var fallbackNext = Interlocked.Increment(ref _cursor);
+            var fallbackIndex = (int)((uint)fallbackNext % (uint)members.Count);
+            return new SlotSelection(members[fallbackIndex], AllMembersUnavailable: true);
+        }
 
         var next = Interlocked.Increment(ref _cursor);
-        var index = candidates[(int)((uint)next % (uint)candidates.Count)];
-        return new SlotSelection(members[index], allUnavailable);
+        var pick = (int)((uint)next % (uint)eligible.Count);
+        return new SlotSelection(members[eligible[pick]], AllMembersUnavailable: false, claimGenerations[pick]);
     }
 
     /// <inheritdoc />
     public void ReportAcquireOutcome(DataverseUserPool member, bool succeeded) => _breaker.CompleteProbe(member, succeeded);
 
+    public void ReportAcquireOutcome(DataverseUserPool member, bool succeeded, long? claimGeneration) =>
+        _breaker.CompleteProbe(member, succeeded, claimGeneration);
+
     public void ReportAcquireAbandoned(DataverseUserPool member) => _breaker.AbandonProbe(member);
+
+    public void ReportAcquireAbandoned(DataverseUserPool member, long? claimGeneration) =>
+        _breaker.AbandonProbe(member, claimGeneration);
 }

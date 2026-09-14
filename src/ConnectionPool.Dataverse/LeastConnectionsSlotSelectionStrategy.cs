@@ -49,7 +49,10 @@ public sealed class LeastConnectionsSlotSelectionStrategy : ISlotSelectionStrate
         }
 
         var now = DateTimeOffset.UtcNow;
+        // Parallel to `eligible`'s indices: the claim generation (if any) IsEligible handed back for
+        // that candidate - see docs/adr/0014.
         var eligible = new List<int>(members.Count);
+        var claimGenerations = new List<long?>(members.Count);
 
         for (var i = 0; i < members.Count; i++)
         {
@@ -60,28 +63,47 @@ public sealed class LeastConnectionsSlotSelectionStrategy : ISlotSelectionStrate
                 continue;
             }
 
-            if (_breaker.IsEligible(member, memberStats[i], now))
+            if (_breaker.IsEligible(member, memberStats[i], now, out var claimGeneration))
             {
                 eligible.Add(i);
+                claimGenerations.Add(claimGeneration);
             }
         }
 
         var allUnavailable = eligible.Count == 0;
 
         // Fail open: if every member currently looks unhealthy/throttled, still pick one (default
-        // behavior, see docs/adr/0007 #6; caller may override via GroupAllUnavailableBehavior).
-        var candidates = allUnavailable ? Enumerable.Range(0, members.Count).ToList() : eligible;
+        // behavior, see docs/adr/0007 #6; caller may override via GroupAllUnavailableBehavior). None
+        // of these candidates won a probe claim, so there's no generation to carry here.
+        if (allUnavailable)
+        {
+            var fallbackCandidates = Enumerable.Range(0, members.Count).ToList();
+            var minLeasedFallback = fallbackCandidates.Min(i => memberStats[i].LeasedCount);
+            var tiedFallback = fallbackCandidates.Where(i => memberStats[i].LeasedCount == minLeasedFallback).ToList();
+            var fallbackNext = Interlocked.Increment(ref _cursor);
+            var fallbackIndex = tiedFallback[(int)((uint)fallbackNext % (uint)tiedFallback.Count)];
+            return new SlotSelection(members[fallbackIndex], AllMembersUnavailable: true);
+        }
 
-        var minLeased = candidates.Min(i => memberStats[i].LeasedCount);
-        var tied = candidates.Where(i => memberStats[i].LeasedCount == minLeased).ToList();
+        var minLeased = eligible.Min(i => memberStats[i].LeasedCount);
+        var tied = eligible
+            .Select((memberIndex, pos) => (memberIndex, pos))
+            .Where(t => memberStats[t.memberIndex].LeasedCount == minLeased)
+            .ToList();
 
         var next = Interlocked.Increment(ref _cursor);
-        var index = tied[(int)((uint)next % (uint)tied.Count)];
-        return new SlotSelection(members[index], allUnavailable);
+        var (index, tiedPos) = tied[(int)((uint)next % (uint)tied.Count)];
+        return new SlotSelection(members[index], AllMembersUnavailable: false, claimGenerations[tiedPos]);
     }
 
     /// <inheritdoc />
     public void ReportAcquireOutcome(DataverseUserPool member, bool succeeded) => _breaker.CompleteProbe(member, succeeded);
 
+    public void ReportAcquireOutcome(DataverseUserPool member, bool succeeded, long? claimGeneration) =>
+        _breaker.CompleteProbe(member, succeeded, claimGeneration);
+
     public void ReportAcquireAbandoned(DataverseUserPool member) => _breaker.AbandonProbe(member);
+
+    public void ReportAcquireAbandoned(DataverseUserPool member, long? claimGeneration) =>
+        _breaker.AbandonProbe(member, claimGeneration);
 }
