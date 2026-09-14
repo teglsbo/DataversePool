@@ -18,10 +18,10 @@ public sealed class DataverseUserPool : IAsyncDisposable
 
     public string Name { get; }
 
-    public DataverseUserPool(string name, string connectionString, PoolOptions? options = null, ILogger? logger = null)
+    public DataverseUserPool(string name, string connectionString, PoolOptions? options = null, ILogger? logger = null, DataverseClientOptions? clientOptions = null)
     {
         Name = name;
-        _policy = new DataverseServiceClientPolicy(connectionString, logger);
+        _policy = new DataverseServiceClientPolicy(connectionString, logger, clientOptions);
         _pool = new ResourcePool<ServiceClient>(_policy, options);
     }
 

@@ -21,23 +21,34 @@ namespace ConnectionPool.Dataverse;
 /// forgotten or silently overridden by a connection string that includes
 /// <c>EnableAffinityCookie=true</c>.
 /// </para>
+///
+/// <para>
+/// Optionally, <see cref="DataverseClientOptions"/> passed to the constructor overrides
+/// <see cref="ServiceClient.MaxRetryCount"/>/<see cref="ServiceClient.RetryPauseTime"/> on both the
+/// base client and every clone - see that type's docs for why this (unlike affinity cookies) is
+/// left to the caller rather than forced to a fixed value.
+/// </para>
 /// </summary>
 public sealed class DataverseServiceClientPolicy : IPooledResourcePolicy<ServiceClient>, IAsyncDisposable
 {
     private readonly string _connectionString;
     private readonly ILogger? _logger;
+    private readonly DataverseClientOptions? _clientOptions;
     private readonly SemaphoreSlim _baseInitGate = new(1, 1);
     private ServiceClient? _baseClient;
 
-    public DataverseServiceClientPolicy(string connectionString, ILogger? logger = null)
+    public DataverseServiceClientPolicy(string connectionString, ILogger? logger = null, DataverseClientOptions? clientOptions = null)
     {
         if (string.IsNullOrWhiteSpace(connectionString))
         {
             throw new ArgumentException("Connection string must not be empty.", nameof(connectionString));
         }
 
+        clientOptions?.Validate();
+
         _connectionString = connectionString;
         _logger = logger;
+        _clientOptions = clientOptions;
     }
 
     public async Task<ServiceClient> CreateAsync(CancellationToken cancellationToken)
@@ -45,6 +56,7 @@ public sealed class DataverseServiceClientPolicy : IPooledResourcePolicy<Service
         var baseClient = await GetOrCreateBaseClientAsync(cancellationToken).ConfigureAwait(false);
         var clone = baseClient.Clone(_logger);
         clone.EnableAffinityCookie = false;
+        ApplyRetryOverrides(clone);
         if (!clone.IsReady)
         {
             var error = clone.LastError;
@@ -116,12 +128,34 @@ public sealed class DataverseServiceClientPolicy : IPooledResourcePolicy<Service
             // See docs/adr/0002 - this base client is never leased out directly, only cloned, but
             // Clone() may copy session-level settings from it, so keep it consistent with clones.
             _baseClient.EnableAffinityCookie = false;
+            ApplyRetryOverrides(_baseClient);
 
             return _baseClient;
         }
         finally
         {
             _baseInitGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Applies any configured <see cref="DataverseClientOptions.MaxRetryCount"/>/
+    /// <see cref="DataverseClientOptions.RetryPauseTime"/> overrides to <paramref name="client"/>.
+    /// Applied to both the base client and every clone (same defensive redundancy as
+    /// <see cref="ServiceClient.EnableAffinityCookie"/> above) since it is not guaranteed that
+    /// <see cref="ServiceClient.Clone(ILogger)"/> copies these settings from its source.
+    /// No-op (SDK defaults apply) when <see cref="_clientOptions"/> is null or a given value is unset.
+    /// </summary>
+    private void ApplyRetryOverrides(ServiceClient client)
+    {
+        if (_clientOptions?.MaxRetryCount is { } maxRetryCount)
+        {
+            client.MaxRetryCount = maxRetryCount;
+        }
+
+        if (_clientOptions?.RetryPauseTime is { } retryPauseTime)
+        {
+            client.RetryPauseTime = retryPauseTime;
         }
     }
 }
