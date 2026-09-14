@@ -1,0 +1,15 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/ConnectionPool.Core/ConnectionPool.Core.csproj" />
+    <Project Path="src/ConnectionPool.Dataverse.Polly/ConnectionPool.Dataverse.Polly.csproj" />
+    <Project Path="src/ConnectionPool.Dataverse/ConnectionPool.Dataverse.csproj" />
+  </Folder>
+  <Folder Name="/samples/">
+    <Project Path="samples/DataversePool.Sample/DataversePool.Sample.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/ConnectionPool.Core.Tests/ConnectionPool.Core.Tests.csproj" />
+    <Project Path="tests/ConnectionPool.Dataverse.Polly.Tests/ConnectionPool.Dataverse.Polly.Tests.csproj" />
+    <Project Path="tests/ConnectionPool.Dataverse.Tests/ConnectionPool.Dataverse.Tests.csproj" />
+  </Folder>
+</Solution>

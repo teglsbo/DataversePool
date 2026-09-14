@@ -1,0 +1,23 @@
+<Project>
+  <PropertyGroup>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <NoWarn>CS1591</NoWarn>
+  </PropertyGroup>
+
+  <!-- Shared NuGet packaging metadata for the src/ libraries. Sample and test projects opt out
+       via <IsPackable>false</IsPackable> (already the xUnit template default). -->
+  <PropertyGroup>
+    <Product>DataversePool</Product>
+    <Authors>DataversePool contributors</Authors>
+    <Company>DataversePool</Company>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/dataversepool/dataversepool</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/dataversepool/dataversepool</RepositoryUrl>
+    <PackageTags>dataverse;dynamics365;power-platform;connection-pooling;serviceclient</PackageTags>
+    <Version>0.1.0-preview</Version>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+</Project>
