@@ -59,6 +59,16 @@ public sealed class DataverseGroupPool : IAsyncDisposable
             _strategy.ReportAcquireOutcome(selection.Member, succeeded: true);
             return new DataverseGroupLease(selection.Member, lease);
         }
+        catch (PoolAcquireTimeoutException)
+        {
+            // A pool-wide capacity/load timeout is not evidence about *this member's* health - it
+            // just means every slot was busy for longer than PoolOptions.AcquireTimeout. Treating it
+            // as a failed health probe would unnecessarily extend a recovering member's circuit
+            // cooldown. Release the probe claim (if one was won) without asserting failure. See
+            // docs/adr/0013.
+            _strategy.ReportAcquireAbandoned(selection.Member);
+            throw;
+        }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             // Caller-initiated cancellation is not a signal about the member's health - don't let it

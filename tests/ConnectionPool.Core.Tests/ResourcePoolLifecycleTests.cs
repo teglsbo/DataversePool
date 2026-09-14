@@ -82,4 +82,41 @@ public class ResourcePoolLifecycleTests
         Assert.Equal(3, stats.IdleCount);
         Assert.Equal(3, stats.CreatedCount);
     }
+
+    [Fact]
+    public async Task WarmupAsync_IsIdempotent_WhenCalledMultipleTimes()
+    {
+        // Regression test for docs/adr/0013: a repeated WarmupAsync call (e.g. a retried startup
+        // hook) must top up existing supply, not unconditionally create PrewarmCount *more*
+        // resources every call - which would silently exceed MaxSize.
+        var policy = new FakePolicy();
+        await using var pool = new ResourcePool<FakeResource>(policy, new PoolOptions { MaxSize = 2, PrewarmCount = 2 });
+
+        await pool.WarmupAsync();
+        await pool.WarmupAsync();
+        await pool.WarmupAsync();
+
+        Assert.Equal(2, policy.CreateCallCount);
+        var stats = pool.GetStats();
+        Assert.Equal(2, stats.IdleCount);
+        Assert.Equal(2, stats.CreatedCount);
+    }
+
+    [Fact]
+    public async Task WarmupAsync_ToppedUp_AfterALeaseIsAcquired()
+    {
+        // A partial warmup followed by an acquire (consuming one idle slot) then a second warmup
+        // call should only create the remaining shortfall, not the full PrewarmCount again.
+        var policy = new FakePolicy();
+        await using var pool = new ResourcePool<FakeResource>(policy, new PoolOptions { MaxSize = 3, PrewarmCount = 3 });
+
+        await pool.WarmupAsync();
+        Assert.Equal(3, policy.CreateCallCount);
+
+        await using var lease = await pool.AcquireAsync(); // pops one idle slot, no new create
+        Assert.Equal(3, policy.CreateCallCount);
+
+        await pool.WarmupAsync(); // CreatedCount is already 3 (== target) - must not create more
+        Assert.Equal(3, policy.CreateCallCount);
+    }
 }

@@ -143,4 +143,25 @@ public sealed class MemberCircuitBreaker
             }
         }
     }
+
+    /// <summary>
+    /// Releases a claimed half-open probe without asserting anything about the member's health -
+    /// use when an attempt was abandoned for a reason unrelated to the member itself, e.g. the
+    /// pool-wide capacity wait timed out (<see cref="PoolOptions.AcquireTimeout"/>/
+    /// <see cref="PoolAcquireTimeoutException"/>) before the member's <c>AcquireAsync</c> even got a
+    /// chance to attempt creation. Unlike <see cref="CompleteProbe"/>'s failure branch, this does
+    /// NOT restart the cooldown window - a capacity/load timeout is not evidence the member is
+    /// unhealthy, so extending its open-circuit cooldown on that basis would be wrong. It just frees
+    /// the claim so a fresh probe can be attempted. See docs/adr/0013.
+    /// </summary>
+    public void AbandonProbe(DataverseUserPool member)
+    {
+        lock (_lock)
+        {
+            if (_state.TryGetValue(member, out var state))
+            {
+                state.ProbeClaimedAt = null;
+            }
+        }
+    }
 }

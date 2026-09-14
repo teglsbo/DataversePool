@@ -82,4 +82,6 @@ public sealed class LeastConnectionsSlotSelectionStrategy : ISlotSelectionStrate
 
     /// <inheritdoc />
     public void ReportAcquireOutcome(DataverseUserPool member, bool succeeded) => _breaker.CompleteProbe(member, succeeded);
+
+    public void ReportAcquireAbandoned(DataverseUserPool member) => _breaker.AbandonProbe(member);
 }

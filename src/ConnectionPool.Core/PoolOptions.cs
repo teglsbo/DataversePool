@@ -47,14 +47,20 @@ public sealed class PoolOptions
     public TimeSpan? MaxIdleLifetime { get; init; }
 
     /// <summary>
-    /// Maximum time <see cref="ResourcePool{T}.AcquireAsync"/> will wait for capacity to become
-    /// available before giving up and throwing <see cref="PoolAcquireTimeoutException"/>. Null
-    /// (default, backward-compatible) means wait indefinitely - the pre-ADR-0012 behavior. Mirrors
-    /// the same bounded-wait pattern most database connection pools use (e.g. HikariCP's
+    /// Maximum time <see cref="ResourcePool{T}.AcquireAsync"/> will wait for a usable resource
+    /// before giving up and throwing <see cref="PoolAcquireTimeoutException"/>. Null (default,
+    /// backward-compatible) means wait indefinitely - the pre-ADR-0012 behavior. Mirrors the same
+    /// bounded-wait pattern most database connection pools use (e.g. HikariCP's
     /// <c>connectionTimeout</c>, ADO.NET's <c>Connect Timeout</c>): a timeout on the wait itself,
     /// not a hard cap on how many callers may be waiting - a waiting caller is cheap (just a
     /// suspended <see cref="Task"/>), so the risk being bounded is caller pile-up/backpressure, not
-    /// memory. See docs/adr/0012.
+    /// memory. This bounds the *entire* acquire - the initial capacity-gate wait AND any inline
+    /// idle-lifetime recycle / serialized creation that follows getting a permit (docs/adr/0013) -
+    /// not merely the first semaphore wait. The one residual gap: if the single in-flight
+    /// <see cref="IPooledResourcePolicy{T}.CreateAsync"/> call your caller ends up waiting behind is
+    /// itself neither cancellation-aware nor bounded by <see cref="CreateTimeout"/>, that specific
+    /// call cannot be interrupted - configure <see cref="CreateTimeout"/> alongside this setting for
+    /// a true worst-case bound. See docs/adr/0012, docs/adr/0013.
     /// </summary>
     public TimeSpan? AcquireTimeout { get; init; }
 }

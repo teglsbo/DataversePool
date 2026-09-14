@@ -3,6 +3,13 @@
 ## Status
 Accepteret
 
+**Opdatering (ADR-0013):** `AcquireTimeout`, som beskrevet her, bandt oprindeligt kun
+`_capacityGate.WaitAsync` — ikke resten af acquire-operationen (recycle/creation efter permit).
+ADR-0013 udvider den til at bounde hele acquire-operationen ende-til-ende. Ligeledes nulstillede
+`ConsecutiveOperationalFailures` (introduceret her) oprindeligt ved enhver vellykket recycle, hvilket
+ADR-0013 retter. Se ADR-0013 for detaljerne; denne ADR's øvrige beslutninger (log-only
+leak-detection, #3/#5 accepteret uændret) forbliver gældende som beskrevet.
+
 ## Kontekst
 Efter ADR-0011 blev committet, blev brugeren præsenteret for den resterende, bevidst udskudte
 backlog fra anden reviewrunde (DB-pool-designeksperten + distributed-systems-genreview) og traf

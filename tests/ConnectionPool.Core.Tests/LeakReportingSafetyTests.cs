@@ -82,6 +82,36 @@ public class LeakReportingSafetyTests
         Assert.NotNull(lease.Resource);
     }
 
+    [Fact]
+    public async Task LeakedLease_IncrementsDetectedLeakCount_SynchronouslyVisibleInStats()
+    {
+        // docs/adr/0013: DetectedLeakCount must be durably visible via GetStats() even if nobody
+        // subscribed to OnLeakDetected/HealthChanges at the time - it is incremented synchronously,
+        // not only as part of the (best-effort) thread-pool dispatched callback/event.
+        var policy = new FakePolicy();
+        await using var pool = new ResourcePool<FakeResource>(policy, new PoolOptions { MaxSize = 2 });
+
+        Assert.Equal(0, pool.GetStats().DetectedLeakCount);
+
+        await LeakALeaseAsync(pool);
+        ForceFinalization();
+
+        // The increment itself is synchronous (happens in ReportLeakedLease, before the callback is
+        // dispatched), so no delay/poll should be needed - but allow a brief window since
+        // finalization scheduling itself is not instantaneous.
+        int leakCount = 0;
+        for (var i = 0; i < 50 && leakCount == 0; i++)
+        {
+            leakCount = pool.GetStats().DetectedLeakCount;
+            if (leakCount == 0)
+            {
+                await Task.Delay(20);
+            }
+        }
+
+        Assert.Equal(1, leakCount);
+    }
+
     // Isolated in its own method so the JIT doesn't keep the lease rooted for the rest of the
     // caller's stack frame - required for deterministic GC-triggered finalization in a test.
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]

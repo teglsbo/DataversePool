@@ -32,6 +32,20 @@ public interface ISlotSelectionStrategy
     void ReportAcquireOutcome(DataverseUserPool member, bool succeeded)
     {
     }
+
+    /// <summary>
+    /// Reports that an acquire attempt against a previously selected member was abandoned for a
+    /// reason unrelated to the member's own health - currently, only a pool-wide
+    /// <see cref="ConnectionPool.Core.PoolAcquireTimeoutException"/> (capacity/load saturation, not
+    /// evidence the member is unhealthy). Called by <see cref="DataverseGroupPool"/> instead of
+    /// <see cref="ReportAcquireOutcome"/> in that case, so a half-open probe claim is released
+    /// without treating a mere capacity timeout as a failed health probe (which would otherwise
+    /// unnecessarily extend a recovering member's cooldown). Default no-op: strategies without
+    /// circuit-breaking never need to override this. See docs/adr/0013.
+    /// </summary>
+    void ReportAcquireAbandoned(DataverseUserPool member)
+    {
+    }
 }
 
 /// <summary>

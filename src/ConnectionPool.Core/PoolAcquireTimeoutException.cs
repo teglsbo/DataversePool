@@ -10,7 +10,12 @@ public sealed class PoolAcquireTimeoutException : TimeoutException
         : base(
             $"Waiting for a pooled resource did not complete within {timeout}. " +
             $"Waiting={stats.WaitingCount}, Idle={stats.IdleCount}, Created={stats.CreatedCount}/{stats.MaxSize}, " +
-            $"UnhealthyOrRecycling={stats.UnhealthyOrRecyclingCount}.")
+            $"UnhealthyOrRecycling={stats.UnhealthyOrRecyclingCount}, DetectedLeakCount={stats.DetectedLeakCount}. " +
+            (stats.DetectedLeakCount > 0
+                ? "Note: this pool has recorded GC-detected leaked leases, which permanently reduce " +
+                  "effective capacity (docs/adr/0012) - a rising DetectedLeakCount alongside these " +
+                  "timeouts suggests lost capacity, not just load."
+                : string.Empty))
     {
         Timeout = timeout;
         Stats = stats;

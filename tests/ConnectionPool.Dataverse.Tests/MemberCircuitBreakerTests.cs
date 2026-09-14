@@ -172,4 +172,30 @@ public class MemberCircuitBreakerTests
         Thread.Sleep(30); // exceed the fresh cooldown
         Assert.True(breaker.IsEligible(member, stats, DateTimeOffset.UtcNow)); // new probe allowed promptly
     }
+
+    [Fact]
+    public void AbandonProbe_ReleasesClaim_WithoutRestartingCooldown()
+    {
+        // docs/adr/0013: unlike CompleteProbe(succeeded: false), abandoning a probe (e.g. because the
+        // acquire hit a pool-wide capacity timeout unrelated to this member's health) must free the
+        // claim so a fresh probe can be won immediately, WITHOUT restarting/extending the cooldown -
+        // a capacity timeout is not evidence the member is unhealthy.
+        var cooldown = TimeSpan.FromMilliseconds(20);
+        var breaker = new MemberCircuitBreaker(failureThreshold: 2, cooldownPeriod: cooldown,
+            probeClaimTimeout: TimeSpan.FromMinutes(5));
+        var member = new DataverseUserPool("a", "dummy-a");
+        var stats = StatsWithFailures(5);
+
+        breaker.IsEligible(member, stats, DateTimeOffset.UtcNow); // opens
+        Thread.Sleep(30);
+        var firstProbeAt = DateTimeOffset.UtcNow;
+        Assert.True(breaker.IsEligible(member, stats, firstProbeAt)); // wins the probe
+        Assert.False(breaker.IsEligible(member, stats, firstProbeAt)); // second caller denied
+
+        breaker.AbandonProbe(member);
+
+        // A fresh probe can be won right away - no need to wait out another full cooldown window,
+        // because AbandonProbe does not touch OpenedAt.
+        Assert.True(breaker.IsEligible(member, stats, firstProbeAt));
+    }
 }

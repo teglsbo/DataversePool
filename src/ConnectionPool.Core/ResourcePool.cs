@@ -30,6 +30,7 @@ public sealed class ResourcePool<T> : IAsyncDisposable where T : notnull
     private int _unhealthyOrRecyclingCount;
     private int _consecutiveCreateFailures;
     private int _consecutiveOperationalFailures;
+    private int _detectedLeakCount;
     private int _poolDisposed;
 
     private readonly object _observersLock = new();
@@ -44,28 +45,69 @@ public sealed class ResourcePool<T> : IAsyncDisposable where T : notnull
             throw new ArgumentOutOfRangeException(nameof(options), "MaxSize must be positive.");
         }
 
+        // Fail fast at construction rather than surfacing a confusing failure later (e.g. Task.Delay
+        // throwing on a negative TimeSpan, or a negative AcquireTimeout making every acquire time out
+        // immediately). null continues to mean "disabled/unbounded" for all three. See docs/adr/0013.
+        if (_options.AcquireTimeout is { } acquireTimeout && acquireTimeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(options), "AcquireTimeout must be a positive duration when set.");
+        }
+
+        if (_options.CreateTimeout is { } createTimeout && createTimeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(options), "CreateTimeout must be a positive duration when set.");
+        }
+
+        if (_options.MaxIdleLifetime is { } maxIdleLifetime && maxIdleLifetime <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(options), "MaxIdleLifetime must be a positive duration when set.");
+        }
+
         _capacityGate = new SemaphoreSlim(_options.MaxSize, _options.MaxSize);
     }
 
     /// <summary>
-    /// Sequentially creates up to <see cref="PoolOptions.PrewarmCount"/> resources ahead of time.
-    /// Intended to be called once at startup (e.g. from an <c>IHostedService</c>). Creation is
-    /// serialized regardless (docs/adr/0002); calling this simply moves that cost earlier.
+    /// Ensures at least <c>min(</c><see cref="PoolOptions.PrewarmCount"/><c>, </c>
+    /// <see cref="PoolOptions.MaxSize"/><c>)</c> resources exist, creating sequentially only the
+    /// shortfall. Intended to be called once at startup (e.g. from an <c>IHostedService</c>), but is
+    /// idempotent and safe to call repeatedly (e.g. a retried startup hook) - it tops up existing
+    /// supply based on <see cref="PoolStats.CreatedCount"/> rather than unconditionally creating
+    /// <see cref="PoolOptions.PrewarmCount"/> *more* resources every call, which would silently
+    /// create more slots than <see cref="PoolOptions.MaxSize"/> allows. Creation is serialized
+    /// regardless (docs/adr/0002); calling this simply moves that cost earlier. See docs/adr/0013.
     /// </summary>
     public async Task WarmupAsync(CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        var count = Math.Min(_options.PrewarmCount, _options.MaxSize);
-        for (var i = 0; i < count; i++)
+        var target = Math.Min(_options.PrewarmCount, _options.MaxSize);
+
+        while (true)
         {
+            if (Volatile.Read(ref _createdCount) >= target)
+            {
+                return; // already at (or above) target - idempotent no-op, no permit taken
+            }
+
             await _capacityGate.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
             {
+                // Re-check now that we hold a permit: a concurrent WarmupAsync/lazy AcquireAsync
+                // create may have already reached the target while this call was waiting.
+                if (Volatile.Read(ref _createdCount) >= target)
+                {
+                    return;
+                }
+
                 var slot = await CreateNewSlotAsync(cancellationToken).ConfigureAwait(false);
                 _idle.Push(slot);
             }
             finally
             {
+                // Matches the same permit lifecycle as every other idle resource in this pool: the
+                // permit represents "an acquire is actively in progress against this unit of
+                // capacity," not "a resource physically exists" - idle resources sit in _idle with
+                // their permit already released, to be re-consumed by whichever AcquireAsync next
+                // claims them. See docs/adr/0013.
                 _capacityGate.Release();
             }
         }
@@ -75,79 +117,88 @@ public sealed class ResourcePool<T> : IAsyncDisposable where T : notnull
     {
         ThrowIfDisposed();
 
-        Interlocked.Increment(ref _waitingCount);
-        try
-        {
-            if (_options.AcquireTimeout is { } acquireTimeout)
-            {
-                var acquired = await _capacityGate.WaitAsync(acquireTimeout, cancellationToken).ConfigureAwait(false);
-                if (!acquired)
-                {
-                    // Snapshot stats before decrementing _waitingCount (the finally block below) so
-                    // the exception reflects the state that actually caused the timeout.
-                    throw new PoolAcquireTimeoutException(acquireTimeout, GetStats());
-                }
-            }
-            else
-            {
-                await _capacityGate.WaitAsync(cancellationToken).ConfigureAwait(false);
-            }
-        }
-        finally
-        {
-            Interlocked.Decrement(ref _waitingCount);
-        }
+        // AcquireTimeout bounds the *entire* acquire operation (capacity wait + any inline
+        // recycle/create that follows getting a permit), not just the initial semaphore wait -
+        // otherwise a caller could still block well past the configured timeout behind serialized
+        // creation/recycle work. A linked CancellationTokenSource ticking down from `now` gives us
+        // "remaining time" for every subsequent await for free. See docs/adr/0013.
+        var acquireTimeout = _options.AcquireTimeout;
+        using var timeoutCts = acquireTimeout is { } timeout ? new CancellationTokenSource(timeout) : null;
+        using var linkedCts = timeoutCts is not null
+            ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token)
+            : null;
+        var effectiveToken = linkedCts?.Token ?? cancellationToken;
 
         try
         {
-            Slot<T> slot;
-            while (true)
+            Interlocked.Increment(ref _waitingCount);
+            try
             {
-                if (_idle.TryPop(out var candidate))
+                await _capacityGate.WaitAsync(effectiveToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _waitingCount);
+            }
+
+            try
+            {
+                Slot<T> slot;
+                while (true)
                 {
-                    if (IsExpiredByIdleLifetime(candidate))
+                    if (_idle.TryPop(out var candidate))
                     {
-                        var recycledForAge = await RecycleInPlaceAsync(candidate, cancellationToken).ConfigureAwait(false);
-                        if (recycledForAge)
+                        if (IsExpiredByIdleLifetime(candidate))
+                        {
+                            var recycledForAge = await RecycleInPlaceAsync(candidate, effectiveToken).ConfigureAwait(false);
+                            if (recycledForAge)
+                            {
+                                slot = candidate;
+                                break;
+                            }
+
+                            continue;
+                        }
+
+                        if (_policy.IsHealthy(candidate.Resource!, candidate.LastIncident))
                         {
                             slot = candidate;
                             break;
                         }
 
+                        // Needs recycling right now - the caller is already waiting for a resource, so this
+                        // is done inline (unlike the background recycle path used on Return()).
+                        var recycled = await RecycleInPlaceAsync(candidate, effectiveToken).ConfigureAwait(false);
+                        if (recycled)
+                        {
+                            slot = candidate;
+                            break;
+                        }
+
+                        // Recycle failed: this slot's capacity permit is considered consumed/lost; loop
+                        // around to either find another idle slot or create a fresh one below.
                         continue;
                     }
 
-                    if (_policy.IsHealthy(candidate.Resource!, candidate.LastIncident))
-                    {
-                        slot = candidate;
-                        break;
-                    }
-
-                    // Needs recycling right now - the caller is already waiting for a resource, so this
-                    // is done inline (unlike the background recycle path used on Return()).
-                    var recycled = await RecycleInPlaceAsync(candidate, cancellationToken).ConfigureAwait(false);
-                    if (recycled)
-                    {
-                        slot = candidate;
-                        break;
-                    }
-
-                    // Recycle failed: this slot's capacity permit is considered consumed/lost; loop
-                    // around to either find another idle slot or create a fresh one below.
-                    continue;
+                    slot = await CreateNewSlotAsync(effectiveToken).ConfigureAwait(false);
+                    break;
                 }
 
-                slot = await CreateNewSlotAsync(cancellationToken).ConfigureAwait(false);
-                break;
+                slot.State = SlotState.Leased;
+                return new PooledLease<T>(this, slot);
             }
-
-            slot.State = SlotState.Leased;
-            return new PooledLease<T>(this, slot);
+            catch
+            {
+                _capacityGate.Release();
+                throw;
+            }
         }
-        catch
+        catch (OperationCanceledException) when (timeoutCts is not null && timeoutCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
         {
-            _capacityGate.Release();
-            throw;
+            // The deadline (not the caller's own token) is what fired - report it as a bounded
+            // acquire timeout rather than letting an OperationCanceledException leak out, which
+            // would be indistinguishable from caller-initiated cancellation.
+            throw new PoolAcquireTimeoutException(acquireTimeout!.Value, GetStats());
         }
     }
 
@@ -163,7 +214,8 @@ public sealed class ResourcePool<T> : IAsyncDisposable where T : notnull
             UnhealthyOrRecyclingCount: Volatile.Read(ref _unhealthyOrRecyclingCount),
             WaitingCount: Volatile.Read(ref _waitingCount),
             ConsecutiveCreateFailures: Volatile.Read(ref _consecutiveCreateFailures),
-            ConsecutiveOperationalFailures: Volatile.Read(ref _consecutiveOperationalFailures));
+            ConsecutiveOperationalFailures: Volatile.Read(ref _consecutiveOperationalFailures),
+            DetectedLeakCount: Volatile.Read(ref _detectedLeakCount));
     }
 
     public IObservable<SlotHealthChanged> HealthChanges => new HealthChangesObservable(this);
@@ -223,6 +275,10 @@ public sealed class ResourcePool<T> : IAsyncDisposable where T : notnull
         slot.LastIncidentException = null;
         slot.LastIncidentAt = DateTimeOffset.UtcNow;
         slot.LastIncidentWasLeak = true;
+        // Incremented synchronously (not from the thread-pool dispatch below) so it is durably
+        // visible via GetStats()/PoolAcquireTimeoutException even if no OnLeakDetected callback or
+        // HealthChanges subscriber was ever attached - see docs/adr/0013.
+        Interlocked.Increment(ref _detectedLeakCount);
 
         var incident = slot.LastIncident;
         ThreadPool.QueueUserWorkItem(
@@ -299,7 +355,12 @@ public sealed class ResourcePool<T> : IAsyncDisposable where T : notnull
             slot.State = SlotState.Idle;
             slot.BecameIdleAt = DateTimeOffset.UtcNow;
             Interlocked.Exchange(ref _consecutiveCreateFailures, 0);
-            Interlocked.Exchange(ref _consecutiveOperationalFailures, 0); // a fresh resource is presumed operationally healthy again
+            // Deliberately do NOT reset _consecutiveOperationalFailures here: successfully cloning a
+            // replacement resource is evidence the member can be *created*, not that it can serve a
+            // real operation successfully. Resetting on recycle-success let a member whose every
+            // operation fails (but whose ServiceClient.Clone keeps succeeding) cycle
+            // fail -> recycle -> reset forever without ever reaching the breaker's threshold - see
+            // docs/adr/0013. Only a genuinely healthy lease return (ReturnAsync) resets this counter.
             PublishHealthChanged(SlotHealthState.Recovered, null);
             return true;
         }
