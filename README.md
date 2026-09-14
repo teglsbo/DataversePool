@@ -14,7 +14,7 @@ construction/cloning/health yourself.
 > Status: **pre-1.0 / preview**. Core design is implemented and tested (see [`TODO.md`](TODO.md)
 > for exact scope and open items). API may still shift before a 1.0 release.
 >
-> Sister project: [DataverseDuck](https://github.com/) (`dvduck`) — a separate tool, not a
+> Sister project: DataverseDuck (`dvduck`) — a separate tool, not a
 > dependency of this library.
 
 ## Why not just `new ServiceClient(...)` per request?
@@ -270,6 +270,10 @@ have **not** been directly verified by this project's own tests.
 > [ADR-0009](docs/adr/0009-return-scrubbing-hook-caller-id-leak.md) for the full analysis and the
 > prioritized backlog for a future coordinated/distributed mode. Until that exists, either run one
 > instance per service-principal set, or accept and plan around this limitation explicitly.
+
+## Author
+
+Niels Teglsbo ([niels@teglsbo.dk](mailto:niels@teglsbo.dk))
 
 ## Contributing
 
