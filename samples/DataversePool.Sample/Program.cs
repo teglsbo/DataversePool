@@ -27,7 +27,7 @@ if (string.IsNullOrWhiteSpace(connectionString))
     Console.WriteLine();
     Console.WriteLine("DATAVERSEPOOL_SAMPLE_CONNECTION_STRING is not set — skipping the live Dataverse smoke test.");
     Console.WriteLine("To run it for real:");
-    Console.WriteLine("  export DATAVERSEPOOL_SAMPLE_CONNECTION_STRING=\"AuthType=ClientSecret;Url=https://yourorg.crm.dynamics.com;ClientId=...;ClientSecret=...;EnableAffinityCookie=false;\"");
+    Console.WriteLine("  export DATAVERSEPOOL_SAMPLE_CONNECTION_STRING=\"AuthType=ClientSecret;Url=https://yourorg.crm.dynamics.com;ClientId=...;ClientSecret=...;\"");
     Console.WriteLine("  dotnet run --project samples/DataversePool.Sample");
     Console.WriteLine("Optionally also set _2 / _3 suffixed variants to additionally exercise the group pool.");
     return;
@@ -119,7 +119,7 @@ static async Task RunLiveSingleUserSmokeTestAsync(string connectionString)
     await pool.WarmupAsync();
 
     await using var lease = await pool.AcquireAsync();
-    Console.WriteLine($"Acquired a ServiceClient. IsReady={lease.Resource.IsReady}");
+    Console.WriteLine($"Acquired a ServiceClient. IsReady={lease.Resource.IsReady}, EnableAffinityCookie={lease.Resource.EnableAffinityCookie}");
 
     var response = (WhoAmIResponse)lease.Resource.Execute(new WhoAmIRequest());
     Console.WriteLine($"WhoAmI succeeded: UserId={response.UserId}, OrganizationId={response.OrganizationId}");

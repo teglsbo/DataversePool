@@ -11,6 +11,16 @@ namespace ConnectionPool.Dataverse;
 /// token/discovery info of the base connection (~1ms per sequential clone, per empirical
 /// measurement). See docs/adr/0002-serial-creation-gate-no-parallel-cloning.md - the pool above this
 /// policy guarantees CreateAsync is never invoked concurrently.
+///
+/// <para>
+/// Every client this policy produces (base and clones) has <see cref="ServiceClient.EnableAffinityCookie"/>
+/// forced to <c>false</c> in code, regardless of what the connection string says - Dataverse's server
+/// affinity cookie pins all requests from one client to a single backend node, which is
+/// counter-productive for a pool that exists specifically to spread concurrent requests out. Setting
+/// this in code (not just documenting it as a connection-string recommendation) means it can't be
+/// forgotten or silently overridden by a connection string that includes
+/// <c>EnableAffinityCookie=true</c>.
+/// </para>
 /// </summary>
 public sealed class DataverseServiceClientPolicy : IPooledResourcePolicy<ServiceClient>, IAsyncDisposable
 {
@@ -34,6 +44,7 @@ public sealed class DataverseServiceClientPolicy : IPooledResourcePolicy<Service
     {
         var baseClient = await GetOrCreateBaseClientAsync(cancellationToken).ConfigureAwait(false);
         var clone = baseClient.Clone(_logger);
+        clone.EnableAffinityCookie = false;
         if (!clone.IsReady)
         {
             var error = clone.LastError;
@@ -101,6 +112,10 @@ public sealed class DataverseServiceClientPolicy : IPooledResourcePolicy<Service
                 var error = _baseClient.LastError;
                 throw new InvalidOperationException($"Failed to establish base Dataverse connection: {error}");
             }
+
+            // See docs/adr/0002 - this base client is never leased out directly, only cloned, but
+            // Clone() may copy session-level settings from it, so keep it consistent with clones.
+            _baseClient.EnableAffinityCookie = false;
 
             return _baseClient;
         }
