@@ -93,10 +93,10 @@ in the entire Dataverse SDK for plain Polly users).
       service principal beyond the one used for the single-user test).
 - [ ] Consider an integration-test project (opt-in, against a real Dataverse instance) — not
       created in this session.
-- [ ] Before actual NuGet publishing: update the placeholder URLs in `Directory.Build.props`
-      (`PackageProjectUrl`/`RepositoryUrl` currently point at a fictional
-      `github.com/dataversepool/dataversepool`) to the real repo, and settle the real
-      author/copyright name in `LICENSE` (currently "DataversePool contributors" as a placeholder).
+- [x] Before actual NuGet publishing: update the placeholder URLs in `Directory.Build.props`
+      (`PackageProjectUrl`/`RepositoryUrl`) — updated to `github.com/teglsbo/dataversepool`.
+- [ ] Settle the real author/copyright name in `LICENSE` (currently "DataversePool contributors"
+      as a placeholder) before publishing.
 
 ## Hardening (ADR-0007) — done
 
