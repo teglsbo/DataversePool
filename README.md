@@ -25,11 +25,33 @@ construction/cloning/health yourself.
   creation through a single gate so you get the fast path, not the contention path.
 - **Per-user Dataverse service-protection limits (~52 concurrent requests/user).** Round-robin
   pooling across multiple application users is the standard way to scale beyond one user's budget
-  — see [`DataversePool.Dataverse`'s group pool](#group-pool-multiple-application-users).
+  — see [`DataversePool.Dataverse`'s group pool](#quickstart-group-pool-multiple-application-users).
 - **A dead pool member shouldn't take down the group.** The default group-pool strategy is
   health-aware: it circuit-opens a consistently-failing member, retries it after a cooldown, and
   fails open (keeps serving) rather than locking the whole pool out — see
   [ADR-0007](docs/adr/0007-race-conditions-timeouts-and-failure-scenarios.md).
+
+## Prior art / how this compares
+
+A few existing projects address parts of the same problem, but not the full scope of this library:
+
+- **[PooledServiceClientFactory](https://github.com/zhufamily/PooledServiceClientFactory)** — an
+  existing open-source `ServiceClient` pool: configurable capacity, auto-scale-down, and avoids the
+  socket-exhaustion/thread-safety issues of constructing a `ServiceClient` per request. It pools a
+  single connection string (comparable to this library's `DataverseUserPool`) but does not do
+  cross-service-principal round-robin/load-balancing, and has no circuit breaker or
+  throttle-awareness.
+- **[Microsoft's own `PowerPlatform-DataverseServiceClient` GitHub discussion #399](https://github.com/microsoft/PowerPlatform-DataverseServiceClient/discussions/399)**
+  — a community discussion suggesting manually cycling across multiple MSAL
+  `ConfidentialClientApplication` instances (i.e. multiple application users) to spread load. No
+  concrete, reusable implementation — just the idea.
+
+As far as could be determined, no existing library combines health-aware round-robin/least-connections
+load balancing **across multiple Dataverse service principals**, with per-member circuit breaking and
+throttle-awareness, the way `DataversePool.Dataverse`'s
+[group pool](#quickstart-group-pool-multiple-application-users) does — that combination is this library's main
+differentiator over rolling your own `ServiceClient` pool or using the single-connection-string
+alternatives above.
 
 ## Packages
 
