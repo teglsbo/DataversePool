@@ -16,6 +16,22 @@ public class MemberCircuitBreakerTests
         new(MaxSize: 4, CreatedCount: 0, IdleCount: 0, LeasedCount: 0,
             UnhealthyOrRecyclingCount: 0, WaitingCount: 0, ConsecutiveCreateFailures: consecutiveFailures);
 
+    private static PoolStats StatsWithOperationalFailures(int consecutiveOperationalFailures) =>
+        new(MaxSize: 4, CreatedCount: 0, IdleCount: 0, LeasedCount: 0,
+            UnhealthyOrRecyclingCount: 0, WaitingCount: 0, ConsecutiveCreateFailures: 0,
+            ConsecutiveOperationalFailures: consecutiveOperationalFailures);
+
+    [Fact]
+    public void IsEligible_False_WhenOperationalFailuresReachThreshold()
+    {
+        // docs/adr/0012: a member that creates fine but keeps failing operationally
+        // (PooledLease.MarkUnhealthy) must also trip the circuit, not just creation failures.
+        var breaker = new MemberCircuitBreaker(failureThreshold: 3, cooldownPeriod: TimeSpan.FromSeconds(30));
+        var member = new DataverseUserPool("a", "dummy-a");
+
+        Assert.False(breaker.IsEligible(member, StatsWithOperationalFailures(5), DateTimeOffset.UtcNow));
+    }
+
     [Fact]
     public void IsEligible_True_WhenCircuitClosed()
     {

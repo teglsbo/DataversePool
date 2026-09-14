@@ -6,6 +6,7 @@ public enum SlotHealthState
     RecyclingStarted,
     Recovered,
     RecoveryFailed,
+    LeakDetected,
 }
 
 /// <summary>

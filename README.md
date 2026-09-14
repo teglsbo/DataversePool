@@ -225,6 +225,7 @@ Every non-obvious choice is written up as an ADR in [`docs/adr/`](docs/adr/):
 9. [Return-scrubbing hook (CallerId leak fix) + documented single-process constraint](docs/adr/0009-return-scrubbing-hook-caller-id-leak.md)
 10. [Configurable fail-fast (not just fail-open) + real single-probe half-open circuit breaker](docs/adr/0010-configurable-fail-fast-and-single-probe-half-open.md)
 11. [Outcome-based probe completion + finalizer-thread safety](docs/adr/0011-outcome-reporting-and-finalizer-thread-safety.md)
+12. [Bounded acquire (timeout), operational-failure-aware circuit breaker, log-only leak-detection](docs/adr/0012-log-only-leak-detection-and-bounded-acquire.md)
 
 ## Status / open items
 

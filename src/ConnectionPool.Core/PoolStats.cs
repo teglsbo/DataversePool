@@ -11,4 +11,5 @@ public sealed record PoolStats(
     int LeasedCount,
     int UnhealthyOrRecyclingCount,
     int WaitingCount,
-    int ConsecutiveCreateFailures = 0);
+    int ConsecutiveCreateFailures = 0,
+    int ConsecutiveOperationalFailures = 0);

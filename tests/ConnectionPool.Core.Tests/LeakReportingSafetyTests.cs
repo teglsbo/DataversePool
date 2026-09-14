@@ -4,71 +4,82 @@ using Xunit;
 namespace ConnectionPool.Core.Tests;
 
 /// <summary>
-/// Verifies docs/adr/0011: a leaked (GC'd, undisposed) lease is reported off the CLR finalizer
-/// thread, and a faulty OnLeakDetected callback / HealthChanges observer can never (a) crash the
-/// process via an unhandled exception on the finalizer thread, or (b) prevent the slot from still
-/// being recycled.
+/// Verifies docs/adr/0012: leak detection is diagnostic-only (log-only, like HikariCP). A leaked
+/// (GC'd, undisposed) lease's resource is neither recycled nor disposed - the pool only reports it
+/// via <see cref="PoolOptions.OnLeakDetected"/>/<see cref="ResourcePool{T}.HealthChanges"/>, off the
+/// CLR finalizer thread, and a faulty callback/observer can neither crash the process nor prevent
+/// the pool from continuing to serve other, still-healthy capacity.
 /// </summary>
 public class LeakReportingSafetyTests
 {
     [Fact]
-    public async Task LeakedLease_IsStillRecycled_EvenWhenOnLeakDetectedCallbackThrows()
+    public async Task LeakedLease_IsNeverDisposedOrRecycled_ButOtherCapacityRemainsUsable()
     {
         var policy = new FakePolicy();
-        var options = new PoolOptions
-        {
-            MaxSize = 1,
-            OnLeakDetected = _ => throw new InvalidOperationException("faulty subscriber"),
-        };
-        await using var pool = new ResourcePool<FakeResource>(policy, options);
+        await using var pool = new ResourcePool<FakeResource>(policy, new PoolOptions { MaxSize = 2 });
 
-        var originalId = await LeakALeaseAsync(pool);
-
+        await LeakALeaseAsync(pool);
         ForceFinalization();
+        await Task.Delay(50); // let the thread-pool dispatched leak report run
 
-        FakeResource? newResource = null;
-        for (var i = 0; i < 100 && newResource is null; i++)
-        {
-            await using var probe = await pool.AcquireAsync();
-            if (probe.Resource.Id != originalId)
-            {
-                newResource = probe.Resource;
-            }
-            else
-            {
-                await Task.Delay(20);
-            }
-        }
+        // The leaked slot's capacity permit is gone forever by design - but the pool's other slot
+        // is unaffected and still usable.
+        await using var lease = await pool.AcquireAsync();
+        Assert.NotNull(lease.Resource);
 
-        Assert.NotNull(newResource); // recycled despite the throwing callback - no capacity stranded
+        Assert.Equal(0, policy.DisposeCallCount); // never disposed - would be unsafe if still in use elsewhere
     }
 
     [Fact]
-    public async Task LeakedLease_IsStillRecycled_EvenWhenHealthChangesObserverThrows()
+    public async Task LeakedLease_DoesNotCrashProcess_EvenWhenOnLeakDetectedCallbackThrows()
     {
         var policy = new FakePolicy();
-        await using var pool = new ResourcePool<FakeResource>(policy, new PoolOptions { MaxSize = 1 });
-        using var subscription = pool.HealthChanges.Subscribe(new ThrowingObserver());
+        var callbackInvoked = new TaskCompletionSource();
+        var options = new PoolOptions
+        {
+            MaxSize = 2,
+            OnLeakDetected = _ =>
+            {
+                callbackInvoked.TrySetResult();
+                throw new InvalidOperationException("faulty subscriber");
+            },
+        };
+        await using var pool = new ResourcePool<FakeResource>(policy, options);
 
-        var originalId = await LeakALeaseAsync(pool);
-
+        await LeakALeaseAsync(pool);
         ForceFinalization();
 
-        FakeResource? newResource = null;
-        for (var i = 0; i < 100 && newResource is null; i++)
+        // Wait (bounded) for the thread-pool-dispatched callback to run. If the throwing callback
+        // had been invoked on the finalizer thread, an unhandled exception there would have crashed
+        // this test process - reaching this line at all is part of the proof.
+        var completed = await Task.WhenAny(callbackInvoked.Task, Task.Delay(TimeSpan.FromSeconds(5)));
+        Assert.Same(callbackInvoked.Task, completed);
+
+        // Pool must still be usable afterwards - the throwing callback did not corrupt pool state.
+        await using var lease = await pool.AcquireAsync();
+        Assert.NotNull(lease.Resource);
+    }
+
+    [Fact]
+    public async Task LeakedLease_PublishesLeakDetectedHealthEvent_EvenWhenObserverThrows()
+    {
+        var policy = new FakePolicy();
+        await using var pool = new ResourcePool<FakeResource>(policy, new PoolOptions { MaxSize = 2 });
+        var received = new List<SlotHealthChanged>();
+        using var subscription = pool.HealthChanges.Subscribe(new RecordingThenThrowingObserver(received));
+
+        await LeakALeaseAsync(pool);
+        ForceFinalization();
+
+        for (var i = 0; i < 50 && received.Count == 0; i++)
         {
-            await using var probe = await pool.AcquireAsync();
-            if (probe.Resource.Id != originalId)
-            {
-                newResource = probe.Resource;
-            }
-            else
-            {
-                await Task.Delay(20);
-            }
+            await Task.Delay(20);
         }
 
-        Assert.NotNull(newResource); // recycled despite the throwing observer - no capacity stranded
+        Assert.Contains(received, e => e.State == SlotHealthState.LeakDetected);
+
+        await using var lease = await pool.AcquireAsync(); // pool still usable afterwards
+        Assert.NotNull(lease.Resource);
     }
 
     // Isolated in its own method so the JIT doesn't keep the lease rooted for the rest of the
@@ -87,10 +98,19 @@ public class LeakReportingSafetyTests
         GC.Collect();
     }
 
-    private sealed class ThrowingObserver : IObserver<SlotHealthChanged>
+    private sealed class RecordingThenThrowingObserver : IObserver<SlotHealthChanged>
     {
+        private readonly List<SlotHealthChanged> _target;
+
+        public RecordingThenThrowingObserver(List<SlotHealthChanged> target) => _target = target;
+
         public void OnCompleted() { }
         public void OnError(Exception error) { }
-        public void OnNext(SlotHealthChanged value) => throw new InvalidOperationException("faulty observer");
+
+        public void OnNext(SlotHealthChanged value)
+        {
+            _target.Add(value);
+            throw new InvalidOperationException("faulty observer");
+        }
     }
 }

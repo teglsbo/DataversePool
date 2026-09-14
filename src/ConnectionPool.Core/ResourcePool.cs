@@ -29,6 +29,7 @@ public sealed class ResourcePool<T> : IAsyncDisposable where T : notnull
     private int _waitingCount;
     private int _unhealthyOrRecyclingCount;
     private int _consecutiveCreateFailures;
+    private int _consecutiveOperationalFailures;
     private int _poolDisposed;
 
     private readonly object _observersLock = new();
@@ -77,7 +78,20 @@ public sealed class ResourcePool<T> : IAsyncDisposable where T : notnull
         Interlocked.Increment(ref _waitingCount);
         try
         {
-            await _capacityGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            if (_options.AcquireTimeout is { } acquireTimeout)
+            {
+                var acquired = await _capacityGate.WaitAsync(acquireTimeout, cancellationToken).ConfigureAwait(false);
+                if (!acquired)
+                {
+                    // Snapshot stats before decrementing _waitingCount (the finally block below) so
+                    // the exception reflects the state that actually caused the timeout.
+                    throw new PoolAcquireTimeoutException(acquireTimeout, GetStats());
+                }
+            }
+            else
+            {
+                await _capacityGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
         }
         finally
         {
@@ -148,10 +162,19 @@ public sealed class ResourcePool<T> : IAsyncDisposable where T : notnull
             LeasedCount: Math.Max(0, created - idle),
             UnhealthyOrRecyclingCount: Volatile.Read(ref _unhealthyOrRecyclingCount),
             WaitingCount: Volatile.Read(ref _waitingCount),
-            ConsecutiveCreateFailures: Volatile.Read(ref _consecutiveCreateFailures));
+            ConsecutiveCreateFailures: Volatile.Read(ref _consecutiveCreateFailures),
+            ConsecutiveOperationalFailures: Volatile.Read(ref _consecutiveOperationalFailures));
     }
 
     public IObservable<SlotHealthChanged> HealthChanges => new HealthChangesObservable(this);
+
+    /// <summary>
+    /// Records that a caller reported an operational failure via <see cref="PooledLease{T}.MarkUnhealthy"/>
+    /// (as opposed to a creation failure). Feeds <see cref="PoolStats.ConsecutiveOperationalFailures"/>
+    /// so circuit-breaker-aware group strategies can react to a member whose resources keep failing
+    /// in actual use, not only ones that fail to be created. See docs/adr/0012.
+    /// </summary>
+    internal void ReportOperationalFailure() => Interlocked.Increment(ref _consecutiveOperationalFailures);
 
     internal ValueTask ReturnAsync(Slot<T> slot)
     {
@@ -171,6 +194,9 @@ public sealed class ResourcePool<T> : IAsyncDisposable where T : notnull
             return ValueTask.CompletedTask;
         }
 
+        // A successful, healthy return is evidence the member is operationally fine again - reset
+        // the counter immediately rather than waiting for it to decay some other way.
+        Interlocked.Exchange(ref _consecutiveOperationalFailures, 0);
         slot.State = SlotState.Idle;
         slot.BecameIdleAt = DateTimeOffset.UtcNow;
         _policy.OnReturned(slot.Resource!); // scrub any per-lease state before next caller (ADR-0009)
@@ -181,24 +207,31 @@ public sealed class ResourcePool<T> : IAsyncDisposable where T : notnull
 
     internal void ReportLeakedLease(Slot<T> slot)
     {
-        // Called directly from PooledLease<T>'s finalizer thread. Keep this method itself limited
-        // to cheap, exception-free field writes; user callbacks and recycling are dispatched to the
-        // thread pool below so an unhandled exception from a subscriber can never terminate the
+        // Called directly from PooledLease<T>'s finalizer thread. Per docs/adr/0012 this is
+        // diagnostic-only (log-only leak detection, matching e.g. HikariCP): the pool does NOT
+        // recycle or dispose the resource, and does NOT release its capacity permit. The only
+        // evidence available is that the *lease wrapper* became unreachable - the underlying
+        // resource may still be referenced and actively in use elsewhere (e.g. a caller that
+        // extracted lease.Resource into a local and then dropped the lease); disposing it on that
+        // assumption risks corrupting an in-flight operation, which is worse than a leaked slot.
+        // The practical consequence: a genuine leak permanently reduces this pool's effective
+        // capacity by one until the process restarts. Keep this method itself limited to cheap,
+        // exception-free field writes; the user callback/observer notification below is dispatched
+        // to the thread pool so an unhandled exception from a subscriber can never terminate the
         // process (an unhandled exception on the finalizer thread is process-fatal) and so a slow
-        // subscriber never stalls finalization of other objects. See docs/adr/0011.
+        // subscriber never stalls finalization of other objects.
         slot.LastIncidentException = null;
         slot.LastIncidentAt = DateTimeOffset.UtcNow;
         slot.LastIncidentWasLeak = true;
-        slot.State = SlotState.Unhealthy;
 
         var incident = slot.LastIncident;
         ThreadPool.QueueUserWorkItem(
-            static state => state.pool.CompleteLeakReport(state.slot, state.incident),
-            (pool: this, slot, incident),
+            static state => state.pool.CompleteLeakReport(state.incident),
+            (pool: this, incident),
             preferLocal: false);
     }
 
-    private void CompleteLeakReport(Slot<T> slot, PoolIncidentInfo? incident)
+    private void CompleteLeakReport(PoolIncidentInfo? incident)
     {
         try
         {
@@ -206,20 +239,11 @@ public sealed class ResourcePool<T> : IAsyncDisposable where T : notnull
         }
         catch
         {
-            // A faulty leak-detection callback must never prevent the slot from being recycled -
-            // there is no reasonable caller left to observe this failure (the original lease's
-            // owner is long gone). See docs/adr/0011.
+            // A faulty leak-detection callback must not propagate onto the thread-pool worker.
+            // See docs/adr/0012.
         }
 
-        PublishHealthChanged(SlotHealthState.MarkedUnhealthy, incident);
-
-        if (Volatile.Read(ref _poolDisposed) == 1)
-        {
-            _ = DisposeAbandonedSlotAsync(slot);
-            return;
-        }
-
-        _ = RecycleInBackgroundAsync(slot);
+        PublishHealthChanged(SlotHealthState.LeakDetected, incident);
     }
 
     internal void PublishHealthChanged(SlotHealthState state, PoolIncidentInfo? incident)
@@ -275,6 +299,7 @@ public sealed class ResourcePool<T> : IAsyncDisposable where T : notnull
             slot.State = SlotState.Idle;
             slot.BecameIdleAt = DateTimeOffset.UtcNow;
             Interlocked.Exchange(ref _consecutiveCreateFailures, 0);
+            Interlocked.Exchange(ref _consecutiveOperationalFailures, 0); // a fresh resource is presumed operationally healthy again
             PublishHealthChanged(SlotHealthState.Recovered, null);
             return true;
         }

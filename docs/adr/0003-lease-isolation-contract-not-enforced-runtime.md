@@ -1,7 +1,10 @@
 # ADR-0003: Non-shared lease er en dispose-kontrakt, ikke runtime-håndhævet isolation
 
 ## Status
-Accepteret
+Accepteret (leak-tracking-adfærden nævnt under "Beslutning" er delvist opdateret af
+[ADR-0012](0012-log-only-leak-detection-and-bounded-acquire.md) — leak-tracking evakuerer/genopretter
+IKKE længere slotten automatisk, se ADR-0012 for hvorfor og den fulde nye adfærd. Resten af denne
+ADR's beslutning — dispose-kontrakt, ikke runtime-håndhævet isolation — står uændret.)
 
 ## Kontekst
 `ServiceClient` er ikke thread-safe ved deling på tværs af tråde med forskellig

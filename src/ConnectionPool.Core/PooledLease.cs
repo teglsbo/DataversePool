@@ -6,8 +6,10 @@ namespace ConnectionPool.Core;
 /// <see cref="DisposeAsync"/> must always be called (typically via <c>await using</c>) so the
 /// underlying slot returns to the pool. See docs/adr/0003-lease-isolation-contract-not-enforced-runtime.md.
 ///
-/// If a lease is garbage-collected without being disposed, the pool detects this (leak tracking) and
-/// recycles the slot rather than risk handing out a resource left in an unknown state.
+/// If a lease is garbage-collected without being disposed, the pool detects this (leak tracking) but
+/// only reports it diagnostically - it does NOT recycle/dispose the underlying resource, since the
+/// resource may still be referenced and in use elsewhere even though this wrapper became
+/// unreachable. See docs/adr/0012-log-only-leak-detection-and-bounded-acquire.md.
 /// </summary>
 public sealed class PooledLease<T> : IAsyncDisposable where T : notnull
 {
@@ -47,6 +49,7 @@ public sealed class PooledLease<T> : IAsyncDisposable where T : notnull
         _slot.LastIncidentException = exception;
         _slot.LastIncidentAt = DateTimeOffset.UtcNow;
         _slot.LastIncidentWasLeak = false;
+        _pool.ReportOperationalFailure(); // feeds circuit-breaker-aware strategies - see docs/adr/0012
         _pool.PublishHealthChanged(SlotHealthState.MarkedUnhealthy, _slot.LastIncident);
     }
 

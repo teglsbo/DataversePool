@@ -20,8 +20,14 @@ public sealed class PoolOptions
 
     /// <summary>
     /// Optional callback invoked whenever a lease is garbage-collected without having been disposed.
-    /// Intended for logging/telemetry - the pool independently reclaims and recycles the underlying
-    /// slot regardless of whether a callback is supplied.
+    /// Diagnostic-only (log-only), matching e.g. HikariCP's leak-detection behavior: the pool does
+    /// NOT recycle or dispose the underlying resource on this signal, because the only evidence
+    /// available is that the <see cref="PooledLease{T}"/> wrapper became unreachable - the resource
+    /// it wraps may still be referenced and actively in use elsewhere (e.g. a caller that extracted
+    /// <see cref="PooledLease{T}.Resource"/> into a local and then dropped the lease). A genuine
+    /// leak therefore permanently reduces this pool's effective capacity by one slot until the
+    /// process restarts - size <see cref="MaxSize"/> and monitor via this callback and
+    /// <see cref="ResourcePool{T}.HealthChanges"/> with that trade-off in mind. See docs/adr/0012.
     /// </summary>
     public Action<PoolIncidentInfo>? OnLeakDetected { get; init; }
 
@@ -39,4 +45,16 @@ public sealed class PoolOptions
     /// See docs/adr/0007.
     /// </summary>
     public TimeSpan? MaxIdleLifetime { get; init; }
+
+    /// <summary>
+    /// Maximum time <see cref="ResourcePool{T}.AcquireAsync"/> will wait for capacity to become
+    /// available before giving up and throwing <see cref="PoolAcquireTimeoutException"/>. Null
+    /// (default, backward-compatible) means wait indefinitely - the pre-ADR-0012 behavior. Mirrors
+    /// the same bounded-wait pattern most database connection pools use (e.g. HikariCP's
+    /// <c>connectionTimeout</c>, ADO.NET's <c>Connect Timeout</c>): a timeout on the wait itself,
+    /// not a hard cap on how many callers may be waiting - a waiting caller is cheap (just a
+    /// suspended <see cref="Task"/>), so the risk being bounded is caller pile-up/backpressure, not
+    /// memory. See docs/adr/0012.
+    /// </summary>
+    public TimeSpan? AcquireTimeout { get; init; }
 }

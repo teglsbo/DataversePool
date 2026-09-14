@@ -10,14 +10,16 @@ namespace ConnectionPool.Dataverse;
 /// <see cref="LeastConnectionsSlotSelectionStrategy"/> so both get identical, correct half-open
 /// semantics without duplicating the concurrency-sensitive logic.
 ///
-/// A member is "open" once <see cref="PoolStats.ConsecutiveCreateFailures"/> reaches the configured
-/// failure threshold. Once <c>cooldownPeriod</c> has elapsed since it opened, it becomes "half-open":
+/// A member is "open" once <see cref="PoolStats.ConsecutiveCreateFailures"/> OR
+/// <see cref="PoolStats.ConsecutiveOperationalFailures"/> reaches the configured failure threshold -
+/// see docs/adr/0012 for why operational (not just creation) failures now count. Once
+/// <c>cooldownPeriod</c> has elapsed since it opened, it becomes "half-open":
 /// unlike the original implementation (which let every concurrent caller treat a half-open member as
 /// eligible - a thundering-herd risk on the very connection that's trying to recover), only a single
 /// caller per cooldown window wins the probe slot via <see cref="IsEligible"/>. Everyone else stays
-/// routed elsewhere until that probe's outcome is visible (the member's
-/// <see cref="PoolStats.ConsecutiveCreateFailures"/> either resets below threshold - success - or the
-/// probe claim itself times out, allowing a fresh probe).
+/// routed elsewhere until that probe's outcome is visible (the member's failure counters reset below
+/// threshold - success, ideally reported explicitly via <see cref="CompleteProbe"/> - or the probe
+/// claim itself times out, allowing a fresh probe).
 /// </summary>
 public sealed class MemberCircuitBreaker
 {
@@ -72,7 +74,11 @@ public sealed class MemberCircuitBreaker
     /// </summary>
     public bool IsEligible(DataverseUserPool member, PoolStats stats, DateTimeOffset now)
     {
-        var isOpen = stats.ConsecutiveCreateFailures >= _failureThreshold;
+        // Open on either signal: a member that can't be created, OR one that gets created fine but
+        // keeps failing operationally (PooledLease.MarkUnhealthy), should both trip the circuit -
+        // see docs/adr/0012.
+        var isOpen = stats.ConsecutiveCreateFailures >= _failureThreshold
+            || stats.ConsecutiveOperationalFailures >= _failureThreshold;
 
         lock (_lock)
         {
