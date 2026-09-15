@@ -42,28 +42,31 @@ public static class DataversePoolServiceCollectionExtensions
     }
 
     /// <summary>
-    /// Registers a named group pool composed of previously-registered named user pools
-    /// (see <see cref="AddDataverseUserPool"/>), round-robin by default (docs/adr/0006).
+    /// Registers a named pool composed of previously-registered named user pools
+    /// (see <see cref="AddDataverseUserPool"/>), round-robin by default (docs/adr/0006). Works with
+    /// a single member name too - the recommended way to start even with one user if you might add
+    /// more later (docs/adr/0019), since scaling out then only means adding another name to
+    /// <paramref name="memberPoolNames"/>.
     /// </summary>
-    public static IServiceCollection AddDataverseGroupPool(
+    public static IServiceCollection AddDataversePool(
         this IServiceCollection services,
-        string groupName,
+        string poolName,
         IReadOnlyList<string> memberPoolNames,
         Func<IServiceProvider, ISlotSelectionStrategy>? strategyFactory = null,
-        GroupAllUnavailableBehavior allUnavailableBehavior = GroupAllUnavailableBehavior.FailOpen)
+        AllUnavailableBehavior allUnavailableBehavior = AllUnavailableBehavior.FailOpen)
     {
         ArgumentNullException.ThrowIfNull(services);
-        ArgumentException.ThrowIfNullOrWhiteSpace(groupName);
+        ArgumentException.ThrowIfNullOrWhiteSpace(poolName);
         if (memberPoolNames is null || memberPoolNames.Count == 0)
         {
             throw new ArgumentException("At least one member pool name is required.", nameof(memberPoolNames));
         }
 
-        services.AddKeyedSingleton<DataverseGroupPool>(groupName, (sp, _) =>
+        services.AddKeyedSingleton<DataversePool>(poolName, (sp, _) =>
         {
             var members = memberPoolNames.Select(sp.GetRequiredKeyedService<DataverseUserPool>);
             var strategy = strategyFactory?.Invoke(sp);
-            return new DataverseGroupPool(members, strategy, allUnavailableBehavior);
+            return new DataversePool(members, strategy, allUnavailableBehavior);
         });
 
         return services;

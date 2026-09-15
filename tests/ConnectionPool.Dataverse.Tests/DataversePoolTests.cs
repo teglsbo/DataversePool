@@ -3,12 +3,12 @@ using Xunit;
 
 namespace ConnectionPool.Dataverse.Tests;
 
-public class DataverseGroupPoolTests
+public class DataversePoolTests
 {
     [Fact]
     public void Constructor_Throws_WhenMembersEmpty()
     {
-        Assert.Throws<ArgumentException>(() => new DataverseGroupPool(Array.Empty<DataverseUserPool>()));
+        Assert.Throws<ArgumentException>(() => new DataversePool(Array.Empty<DataverseUserPool>()));
     }
 
     [Fact]
@@ -16,11 +16,29 @@ public class DataverseGroupPoolTests
     {
         var a = new DataverseUserPool("user-a", "dummy-a");
         var b = new DataverseUserPool("user-b", "dummy-b");
-        await using var group = new DataverseGroupPool(new[] { a, b });
+        await using var group = new DataversePool(new[] { a, b });
 
         Assert.Equal(new[] { "user-a", "user-b" }, group.Members.Select(m => m.Name));
 
         await group.DisposeAsync(); // idempotent-safe double dispose exercised deliberately
+    }
+
+    [Fact]
+    public async Task SingleMemberConstructor_IsEquivalentToOneElementCollection()
+    {
+        // Convenience overload for the common "just one user, might add more later" case - see
+        // docs/adr/0019. Should behave identically to passing a one-element collection.
+        var a = new DataverseUserPool("user-a", "dummy-a");
+        await using var pool = new DataversePool(a);
+
+        Assert.Single(pool.Members);
+        Assert.Same(a, pool.Members[0]);
+    }
+
+    [Fact]
+    public void SingleMemberConstructor_Throws_WhenMemberIsNull()
+    {
+        Assert.Throws<ArgumentNullException>(() => new DataversePool((DataverseUserPool)null!));
     }
 
     [Fact]
@@ -30,23 +48,23 @@ public class DataverseGroupPoolTests
         // "all unavailable" does NOT throw by default - the group pool still attempts the acquire
         // via whichever member the strategy picked.
         var a = new DataverseUserPool("user-a", "dummy-a");
-        await using var group = new DataverseGroupPool(new[] { a }, new FakeAllUnavailableStrategy());
+        await using var group = new DataversePool(new[] { a }, new FakeAllUnavailableStrategy());
 
         // Acquiring from a dummy connection string will itself fail (no real Dataverse), but it
-        // must fail via DataverseUserPool's own creation path, NOT via DataverseGroupUnavailableException -
+        // must fail via DataverseUserPool's own creation path, NOT via DataversePoolUnavailableException -
         // proving the group pool did not short-circuit before attempting the acquire.
         await Assert.ThrowsAsync<ArgumentException>(() => group.AcquireAsync()); // dummy conn string fails inside DataverseServiceClientPolicy.CreateAsync, proving no short-circuit
     }
 
     [Fact]
-    public async Task AcquireAsync_ThrowsGroupUnavailable_WhenFailFastConfigured_AndAllMembersUnavailable()
+    public async Task AcquireAsync_ThrowsPoolUnavailable_WhenFailFastConfigured_AndAllMembersUnavailable()
     {
         var a = new DataverseUserPool("user-a", "dummy-a");
         var b = new DataverseUserPool("user-b", "dummy-b");
-        await using var group = new DataverseGroupPool(
-            new[] { a, b }, new FakeAllUnavailableStrategy(), GroupAllUnavailableBehavior.FailFast);
+        await using var group = new DataversePool(
+            new[] { a, b }, new FakeAllUnavailableStrategy(), AllUnavailableBehavior.FailFast);
 
-        var ex = await Assert.ThrowsAsync<DataverseGroupUnavailableException>(() => group.AcquireAsync());
+        var ex = await Assert.ThrowsAsync<DataversePoolUnavailableException>(() => group.AcquireAsync());
 
         Assert.Equal(new[] { "user-a", "user-b" }, ex.MemberNames);
         // No member is throttled in this scenario (only circuit-open, conceptually), so there is no
@@ -62,10 +80,10 @@ public class DataverseGroupPoolTests
         a.ReportThrottled(TimeSpan.FromSeconds(30));
         b.ReportThrottled(TimeSpan.FromSeconds(5)); // shorter window - this one should win as "earliest"
 
-        await using var group = new DataverseGroupPool(
-            new[] { a, b }, new FakeAllUnavailableStrategy(), GroupAllUnavailableBehavior.FailFast);
+        await using var group = new DataversePool(
+            new[] { a, b }, new FakeAllUnavailableStrategy(), AllUnavailableBehavior.FailFast);
 
-        var ex = await Assert.ThrowsAsync<DataverseGroupUnavailableException>(() => group.AcquireAsync());
+        var ex = await Assert.ThrowsAsync<DataversePoolUnavailableException>(() => group.AcquireAsync());
 
         Assert.NotNull(ex.EarliestKnownRetryAt);
         Assert.Equal(b.ThrottledUntil, ex.EarliestKnownRetryAt);
@@ -83,10 +101,10 @@ public class DataverseGroupPoolTests
 
         await Task.Delay(30); // let a's throttle window elapse
 
-        await using var group = new DataverseGroupPool(
-            new[] { a, b }, new FakeAllUnavailableStrategy(), GroupAllUnavailableBehavior.FailFast);
+        await using var group = new DataversePool(
+            new[] { a, b }, new FakeAllUnavailableStrategy(), AllUnavailableBehavior.FailFast);
 
-        var ex = await Assert.ThrowsAsync<DataverseGroupUnavailableException>(() => group.AcquireAsync());
+        var ex = await Assert.ThrowsAsync<DataversePoolUnavailableException>(() => group.AcquireAsync());
 
         Assert.NotNull(ex.EarliestKnownRetryAt);
         Assert.Equal(b.ThrottledUntil, ex.EarliestKnownRetryAt); // a's stale/expired tick is ignored
@@ -96,7 +114,7 @@ public class DataverseGroupPoolTests
     public async Task ExecuteWithThrottleRetryAsync_Throws_WhenOperationIsNull()
     {
         var a = new DataverseUserPool("user-a", "dummy-a");
-        await using var group = new DataverseGroupPool(new[] { a });
+        await using var group = new DataversePool(new[] { a });
 
         await Assert.ThrowsAsync<ArgumentNullException>(
             () => group.ExecuteWithThrottleRetryAsync<int>(null!));
@@ -106,7 +124,7 @@ public class DataverseGroupPoolTests
     public async Task ExecuteWithThrottleRetryAsync_Throws_WhenMaxAttemptsNotPositive()
     {
         var a = new DataverseUserPool("user-a", "dummy-a");
-        await using var group = new DataverseGroupPool(new[] { a });
+        await using var group = new DataversePool(new[] { a });
 
         await Assert.ThrowsAsync<ArgumentOutOfRangeException>(
             () => group.ExecuteWithThrottleRetryAsync((client, ct) => Task.FromResult(1), maxAttempts: 0));
@@ -120,7 +138,7 @@ public class DataverseGroupPoolTests
         // This proves ExecuteWithThrottleRetryAsync does not swallow/retry acquire-level failures -
         // only failures from `operation`, once a lease was actually acquired, are eligible for retry.
         var a = new DataverseUserPool("user-a", "dummy-a");
-        await using var group = new DataverseGroupPool(new[] { a });
+        await using var group = new DataversePool(new[] { a });
 
         var operationInvoked = false;
 

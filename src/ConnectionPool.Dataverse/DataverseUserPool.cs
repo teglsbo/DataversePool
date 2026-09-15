@@ -6,7 +6,7 @@ namespace ConnectionPool.Dataverse;
 
 /// <summary>
 /// A connection pool of Dataverse <see cref="ServiceClient"/> instances for a single service
-/// user/connection string. Use <see cref="DataverseGroupPool"/> instead when you want to spread
+/// user/connection string. Use <see cref="DataversePool"/> instead when you want to spread
 /// load (and Dataverse service-protection budget) across multiple service users.
 /// See docs/adr/0006-dual-pooling-model-single-user-and-round-robin-group.md.
 /// </summary>

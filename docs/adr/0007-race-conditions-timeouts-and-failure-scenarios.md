@@ -66,7 +66,7 @@ been idle longer than the limit. Not a background timer in v1 (avoids complexity
 sweep thread) — checked lazily on the next `AcquireAsync`.
 
 ### 6. "One user in a group is dead" — round-robin still sends 1/N traffic to a permanently failing user
-If one member in a `DataverseGroupPool` is permanently unavailable (blocked app user, incorrect
+If one member in a `DataversePool` is permanently unavailable (blocked app user, incorrect
 secret, blocked IP), pure round-robin will keep sending every Nth request there, where it will
 either hang (until `CreateTimeout`) or fail repeatedly — poor tail latency and wasted
 capacity, without the other members compensating.

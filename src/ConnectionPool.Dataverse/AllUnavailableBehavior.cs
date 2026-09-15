@@ -1,12 +1,12 @@
 namespace ConnectionPool.Dataverse;
 
 /// <summary>
-/// How <see cref="DataverseGroupPool.AcquireAsync"/> behaves when the configured
+/// How <see cref="DataversePool.AcquireAsync"/> behaves when the configured
 /// <see cref="ISlotSelectionStrategy"/> reports that every member is currently circuit-open or
 /// Dataverse-throttled (<see cref="SlotSelection.AllMembersUnavailable"/>). See
 /// docs/adr/0010-configurable-fail-fast-and-single-probe-half-open.md.
 /// </summary>
-public enum GroupAllUnavailableBehavior
+public enum AllUnavailableBehavior
 {
     /// <summary>
     /// Default, backward-compatible behavior (docs/adr/0007 #6): still acquire from whichever
@@ -17,7 +17,7 @@ public enum GroupAllUnavailableBehavior
     FailOpen = 0,
 
     /// <summary>
-    /// Throw <see cref="DataverseGroupUnavailableException"/> immediately instead of acquiring from
+    /// Throw <see cref="DataversePoolUnavailableException"/> immediately instead of acquiring from
     /// a known-bad/throttled member. Appropriate when sending traffic to a member you already know
     /// is unavailable would only add load to (or extend an outage against) a system that is already
     /// struggling - i.e. you want backpressure instead of amplification. See docs/adr/0010 for why

@@ -40,7 +40,7 @@ public sealed class PoolMetrics : IDisposable
 
     /// <param name="poolName">
     /// Value for the <c>pool.name</c> tag attached to every measurement - lets you distinguish
-    /// multiple pools (e.g. each member of a <c>DataverseGroupPool</c>)
+    /// multiple pools (e.g. each member of a <c>DataversePool</c>)
     /// under the same meter.
     /// </param>
     /// <param name="statsProvider">

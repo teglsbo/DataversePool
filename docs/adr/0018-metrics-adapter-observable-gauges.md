@@ -38,10 +38,10 @@ needed to build against it on net8.0 (confirmed by building `ConnectionPool.Metr
   for GC-detected leaks. A gauge reporting "current cumulative total" is the only instrument shape
   consistent with what's actually observable here.
 - Every measurement is tagged with `pool.name` (caller-supplied string) so multiple pools - e.g. each
-  member of a `DataverseGroupPool` - can share one `Meter` and still be distinguished by an exporter.
+  member of a `DataversePool` - can share one `Meter` and still be distinguished by an exporter.
 - **`ResourcePoolMetricsExtensions.AddMetrics(poolName, meterName?)`**: a convenience extension method
   on `ResourcePool<T>` for the common case, matching the Polly package's extension-method style
-  (`AddRetryWithPoolHealthSignal`). Callers using `DataverseUserPool`/`DataverseGroupPool` directly
+  (`AddRetryWithPoolHealthSignal`). Callers using `DataverseUserPool`/`DataversePool` directly
   (which don't expose their inner `ResourcePool<T>`) construct `PoolMetrics` directly instead, passing
   `pool.GetStats` as the `statsProvider` - the same `PoolStats` type is returned either way, so no
   Dataverse-specific extension overload was needed.

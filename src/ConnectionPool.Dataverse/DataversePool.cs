@@ -4,25 +4,29 @@ using Microsoft.PowerPlatform.Dataverse.Client;
 namespace ConnectionPool.Dataverse;
 
 /// <summary>
-/// Composes multiple <see cref="DataverseUserPool"/> instances (typically one per Dataverse
+/// Composes one or more <see cref="DataverseUserPool"/> instances (one per Dataverse
 /// application/service user) and selects one per acquire via a pluggable
-/// <see cref="ISlotSelectionStrategy"/> (round-robin by default). This is how you scale out beyond
-/// a single user's Dataverse service-protection limit - see docs/adr/0006.
+/// <see cref="ISlotSelectionStrategy"/> (round-robin by default). This is the recommended
+/// top-level entry point regardless of member count: use it even for a single user if you might
+/// ever need to scale out beyond that user's Dataverse service-protection limit later - going from
+/// one member to several is then purely a construction/DI-config change (add another
+/// <see cref="DataverseUserPool"/> to the collection), not an application code change. See
+/// docs/adr/0006 and docs/adr/0019.
 ///
 /// Note this coordination is entirely in-process: throttle/circuit state is not shared across
 /// multiple instances of your application (e.g. multiple pods) targeting the same member service
 /// principals - see the README's "production constraint" section and docs/adr/0009/0010.
 /// </summary>
-public sealed class DataverseGroupPool : IAsyncDisposable
+public sealed class DataversePool : IAsyncDisposable
 {
     private readonly IReadOnlyList<DataverseUserPool> _members;
     private readonly ISlotSelectionStrategy _strategy;
-    private readonly GroupAllUnavailableBehavior _allUnavailableBehavior;
+    private readonly AllUnavailableBehavior _allUnavailableBehavior;
 
-    public DataverseGroupPool(
+    public DataversePool(
         IEnumerable<DataverseUserPool> members,
         ISlotSelectionStrategy? strategy = null,
-        GroupAllUnavailableBehavior allUnavailableBehavior = GroupAllUnavailableBehavior.FailOpen)
+        AllUnavailableBehavior allUnavailableBehavior = AllUnavailableBehavior.FailOpen)
     {
         _members = members?.ToArray() ?? throw new ArgumentNullException(nameof(members));
         if (_members.Count == 0)
@@ -34,18 +38,30 @@ public sealed class DataverseGroupPool : IAsyncDisposable
         _allUnavailableBehavior = allUnavailableBehavior;
     }
 
+    /// <summary>Convenience constructor for the common single-member case - equivalent to
+    /// <c>new DataversePool(new[] { member }, strategy, allUnavailableBehavior)</c>. Prefer this
+    /// (rather than using <paramref name="member"/> directly) if you might ever add more members
+    /// later - see the type's remarks.</summary>
+    public DataversePool(
+        DataverseUserPool member,
+        ISlotSelectionStrategy? strategy = null,
+        AllUnavailableBehavior allUnavailableBehavior = AllUnavailableBehavior.FailOpen)
+        : this(new[] { member ?? throw new ArgumentNullException(nameof(member)) }, strategy, allUnavailableBehavior)
+    {
+    }
+
     public IReadOnlyList<DataverseUserPool> Members => _members;
 
-    /// <exception cref="DataverseGroupUnavailableException">
+    /// <exception cref="DataversePoolUnavailableException">
     /// Every member is circuit-open/throttled and this pool is configured with
-    /// <see cref="GroupAllUnavailableBehavior.FailFast"/>. See docs/adr/0010.
+    /// <see cref="AllUnavailableBehavior.FailFast"/>. See docs/adr/0010.
     /// </exception>
-    public async Task<DataverseGroupLease> AcquireAsync(CancellationToken cancellationToken = default)
+    public async Task<DataverseLease> AcquireAsync(CancellationToken cancellationToken = default)
     {
         var stats = _members.Select(m => m.GetStats()).ToArray();
         var selection = _strategy.SelectNext(_members, stats);
 
-        if (selection.AllMembersUnavailable && _allUnavailableBehavior == GroupAllUnavailableBehavior.FailFast)
+        if (selection.AllMembersUnavailable && _allUnavailableBehavior == AllUnavailableBehavior.FailFast)
         {
             throw BuildUnavailableException();
         }
@@ -59,7 +75,7 @@ public sealed class DataverseGroupPool : IAsyncDisposable
             // circuit-breaker-aware strategy can reject a stale report against a since-superseded
             // claim - see docs/adr/0014.
             _strategy.ReportAcquireOutcome(selection.Member, succeeded: true, selection.ProbeClaimGeneration);
-            return new DataverseGroupLease(selection.Member, lease);
+            return new DataverseLease(selection.Member, lease);
         }
         catch (PoolAcquireTimeoutException)
         {
@@ -84,7 +100,7 @@ public sealed class DataverseGroupPool : IAsyncDisposable
         }
     }
 
-    private DataverseGroupUnavailableException BuildUnavailableException()
+    private DataversePoolUnavailableException BuildUnavailableException()
     {
         var names = _members.Select(m => m.Name).ToArray();
         var now = DateTimeOffset.UtcNow;
@@ -97,10 +113,10 @@ public sealed class DataverseGroupPool : IAsyncDisposable
         var earliest = earliestRetryAt == default ? (DateTimeOffset?)null : earliestRetryAt;
 
         var message = earliest is { } when
-            ? $"All {names.Length} group member(s) are currently circuit-open or throttled. Earliest known retry: {when:O}."
-            : $"All {names.Length} group member(s) are currently circuit-open or throttled.";
+            ? $"All {names.Length} member(s) are currently circuit-open or throttled. Earliest known retry: {when:O}."
+            : $"All {names.Length} member(s) are currently circuit-open or throttled.";
 
-        return new DataverseGroupUnavailableException(message, names, earliest);
+        return new DataversePoolUnavailableException(message, names, earliest);
     }
 
     /// <summary>
@@ -119,42 +135,55 @@ public sealed class DataverseGroupPool : IAsyncDisposable
     /// <summary>
     /// Runs <paramref name="operation"/> against a leased <see cref="ServiceClient"/>, and if it
     /// throws a Dataverse HTTP 429/service-protection signal (detected via
-    /// <see cref="DataverseThrottleDetector"/>, same as <see cref="DataverseGroupLease.ReportIfThrottled"/>),
-    /// reports the throttle on the member that served it and retries against a freshly-acquired
-    /// lease - which, thanks to the group's throttle-aware selection strategy, will steer away from
-    /// the just-throttled member as long as another one is available. See docs/adr/0017.
-    ///
+    /// <see cref="DataverseThrottleDetector"/>, same as <see cref="DataverseLease.ReportIfThrottled(Exception, TimeSpan?)"/>),
+    /// reports the throttle on the member that served it and retries. Works correctly regardless of
+    /// how many members this pool has - including exactly one:
+    /// </summary>
+    /// <remarks>
     /// <para>
-    /// This only retries on a recognized throttling signal - any other exception from
+    /// A fresh <see cref="AcquireAsync"/> after a throttle report will, thanks to the pool's
+    /// throttle-aware selection strategy, steer away from the just-throttled member as long as a
+    /// different one is available - in which case the retry happens immediately, no wait needed. But
+    /// if the freshly-acquired lease comes from the <b>same</b> member that was just throttled - the
+    /// only possible outcome for a single-member pool, or a multi-member pool where every member is
+    /// currently over budget and <see cref="AllUnavailableBehavior.FailOpen"/> hands one back anyway -
+    /// retrying instantly would just re-hit the same still-over-budget connection for no benefit. This
+    /// method detects that specific case and waits out the capped <c>Retry-After</c> before trying
+    /// again, so a single-member pool (and an all-throttled multi-member pool) both get a real,
+    /// bounded wait instead of a useless instant re-throttle. See docs/adr/0019.
+    /// </para>
+    /// <para>
+    /// Only a recognized throttling signal is retried - any other exception from
     /// <paramref name="operation"/> propagates immediately, unretried. General-purpose retry/circuit
     /// -breaking for arbitrary failures is deliberately out of scope here (that's what the optional
     /// Polly adapter package is for - see docs/adr/0005); this method exists specifically to close
-    /// the "retry on a different group member when throttled" gap, not to become a general resilience
-    /// pipeline.
+    /// the "retry when throttled" gap, not to become a general resilience pipeline.
     /// </para>
-    ///
     /// <para>
-    /// Note <see cref="DataverseGroupPool.AcquireAsync"/> itself is not retried here - if acquiring a
-    /// lease fails (e.g. <see cref="DataverseGroupUnavailableException"/> when every member is
-    /// circuit-open/throttled and <see cref="GroupAllUnavailableBehavior.FailFast"/> is configured),
+    /// Note <see cref="DataversePool.AcquireAsync"/> itself is not retried here - if acquiring a
+    /// lease fails (e.g. <see cref="DataversePoolUnavailableException"/> when every member is
+    /// circuit-open/throttled and <see cref="AllUnavailableBehavior.FailFast"/> is configured),
     /// that exception propagates immediately; only failures from <paramref name="operation"/> itself,
     /// once a lease was successfully acquired, are eligible for this retry loop.
     /// </para>
-    /// </summary>
+    /// </remarks>
     /// <param name="operation">The operation to run against the leased <see cref="ServiceClient"/>.</param>
     /// <param name="maxAttempts">
     /// Maximum number of attempts (not additional retries - a value of 1 never retries). Defaults to
-    /// the number of group members, so by default every member gets at most one attempt before
-    /// giving up. Must be positive.
+    /// <c>Math.Max(member count, 3)</c> - a plain member-count default (as used before this pool
+    /// supported the single-member case well) would give a single-member pool exactly one attempt,
+    /// i.e. no retry at all by default. Must be positive.
     /// </param>
     /// <param name="maxRetryAfter">
     /// Cap applied to Dataverse's reported <c>Retry-After</c> before it's recorded as the throttled
-    /// member's cooldown window. Defaults to <see cref="DataverseThrottleDetector.DefaultMaxRetryAfter"/>
-    /// - see that constant's docs for why Dataverse's raw value (observed up to ~17 minutes) is not
-    /// always honored verbatim.
+    /// member's cooldown window (and, for the same-member case above, before it's actually waited
+    /// out). Defaults to <see cref="DataverseThrottleDetector.DefaultMaxRetryAfter"/> - see that
+    /// constant's docs for why Dataverse's raw value (observed up to ~17 minutes) is not always
+    /// honored verbatim.
     /// </param>
     /// <param name="cancellationToken">
-    /// Propagated to both <see cref="AcquireAsync"/> and <paramref name="operation"/>.
+    /// Propagated to <see cref="AcquireAsync"/>, <paramref name="operation"/>, and the same-member
+    /// wait itself.
     /// </param>
     public async Task<T> ExecuteWithThrottleRetryAsync<T>(
         Func<ServiceClient, CancellationToken, Task<T>> operation,
@@ -164,15 +193,28 @@ public sealed class DataverseGroupPool : IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(operation);
 
-        var attempts = maxAttempts ?? _members.Count;
+        var attempts = maxAttempts ?? Math.Max(_members.Count, 3);
         if (attempts <= 0)
         {
             throw new ArgumentOutOfRangeException(nameof(maxAttempts), maxAttempts, "Must be positive.");
         }
 
+        DataverseUserPool? previouslyThrottledMember = null;
+        var previousRetryAfter = TimeSpan.Zero;
+
         for (var attempt = 1; ; attempt++)
         {
             var lease = await AcquireAsync(cancellationToken).ConfigureAwait(false);
+
+            // No better option was available than the very member we just reported as throttled -
+            // wait out the capped window before trying again instead of instantly re-hitting the
+            // same still-over-budget connection. See the method's <remarks> above.
+            if (previouslyThrottledMember is not null && ReferenceEquals(lease.Member, previouslyThrottledMember))
+            {
+                await Task.Delay(previousRetryAfter, cancellationToken).ConfigureAwait(false);
+            }
+
+            TimeSpan retryAfter;
             try
             {
                 return await operation(lease.Resource, cancellationToken).ConfigureAwait(false);
@@ -180,10 +222,10 @@ public sealed class DataverseGroupPool : IAsyncDisposable
             // ReportIfThrottled always runs (left side of && is unconditionally evaluated first), so
             // the throttle window is recorded even on the final attempt - only whether we swallow the
             // exception and loop again depends on attempts remaining.
-            catch (Exception ex) when (lease.ReportIfThrottled(ex, maxRetryAfter) && attempt < attempts)
+            catch (Exception ex) when (lease.ReportIfThrottled(ex, out retryAfter, maxRetryAfter) && attempt < attempts)
             {
-                // Fall through to the next loop iteration - a fresh AcquireAsync will steer away from
-                // the member just marked throttled, per the group's selection strategy.
+                previouslyThrottledMember = lease.Member;
+                previousRetryAfter = retryAfter;
             }
             finally
             {

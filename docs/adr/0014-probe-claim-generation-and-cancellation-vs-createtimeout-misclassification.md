@@ -20,7 +20,7 @@ effective**, along with a **new regression** introduced by the ADR-0013 work its
    `CreateTimeout` expiry: incremented `_consecutiveCreateFailures` and threw a raw
    `TimeoutException` instead of `OperationCanceledException`. Consequence: the outer
    `AcquireAsync` translation to `PoolAcquireTimeoutException` (ADR-0013 fix #1) was never hit,
-   `DataverseGroupPool`'s new specific `catch (PoolAcquireTimeoutException)` (ADR-0013 fix #4)
+   `DataversePool`'s new specific `catch (PoolAcquireTimeoutException)` (ADR-0013 fix #4)
    was therefore never hit either, and a pure capacity/cancellation event ended up in the general
    `catch`, which reported it as a **failed health probe** — exactly what ADR-0013 #4 was supposed
    to prevent. The same pattern existed in `RecycleInPlaceAsync`'s blanket `catch (Exception)`, which also
@@ -94,7 +94,7 @@ In both places, this means that an `AcquireTimeout` deadline (or the caller's ow
 expires while a creation is in progress — whether it is a fresh creation or an inline
 idle-lifetime recycle — now correctly propagates as `OperationCanceledException`, which
 `AcquireAsync`'s outer `catch` (ADR-0013) translates into `PoolAcquireTimeoutException`, which
-`DataverseGroupPool`'s specific `catch` (ADR-0013 #4) then correctly handles via
+`DataversePool`'s specific `catch` (ADR-0013 #4) then correctly handles via
 `ReportAcquireAbandoned` instead of reporting a failed probe.
 
 ### Fix for #3: Claim-generation correlation in `MemberCircuitBreaker`
@@ -116,7 +116,7 @@ in tests remain unchanged); `ISlotSelectionStrategy.ReportAcquireOutcome`/`Repor
 got corresponding new default overloads that receive the generation and forward it to
 `MemberCircuitBreaker`; both circuit-breaker-aware strategies capture the generation from
 `IsEligible` for the actually selected candidate and place it in `SlotSelection`;
-`DataverseGroupPool.AcquireAsync` includes `selection.ProbeClaimGeneration` in all
+`DataversePool.AcquireAsync` includes `selection.ProbeClaimGeneration` in all
 `ReportAcquireOutcome`/`ReportAcquireAbandoned` calls.
 
 This fixes the concrete corruption demonstrated by both experts: probe A is claimed and

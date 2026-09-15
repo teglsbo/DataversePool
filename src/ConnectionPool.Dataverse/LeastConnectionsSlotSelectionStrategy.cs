@@ -3,7 +3,7 @@ using ConnectionPool.Core;
 namespace ConnectionPool.Dataverse;
 
 /// <summary>
-/// Load-aware selection: picks the group member with the fewest currently-leased connections
+/// Load-aware selection: picks the member with the fewest currently-leased connections
 /// (<see cref="PoolStats.LeasedCount"/>), instead of blindly cycling 1/N like
 /// <see cref="HealthAwareRoundRobinSlotSelectionStrategy"/>. Ties are broken round-robin.
 ///
@@ -16,14 +16,14 @@ namespace ConnectionPool.Dataverse;
 ///
 /// This still only reacts to lease-level load (how many leases are checked out), not to
 /// Dataverse-reported throttling signals on individual requests made through a leased ServiceClient
-/// beyond the explicit <see cref="DataverseGroupLease.ReportIfThrottled"/> report (see docs/adr/0008).
+/// beyond the explicit <see cref="DataverseLease.ReportIfThrottled"/> report (see docs/adr/0008).
 ///
 /// Circuit-breaking (open/half-open/closed, with a real single-probe half-open - see
 /// docs/adr/0010) is delegated to a shared <see cref="MemberCircuitBreaker"/>, identical to
 /// <see cref="HealthAwareRoundRobinSlotSelectionStrategy"/>. This strategy also skips members
 /// currently marked Dataverse-throttled (<see cref="DataverseUserPool.IsThrottled"/>, docs/adr/0008).
 /// If *all* members are unavailable, <see cref="SlotSelection.AllMembersUnavailable"/> is reported so
-/// <see cref="DataverseGroupPool"/> can apply its configured <see cref="GroupAllUnavailableBehavior"/>.
+/// <see cref="DataversePool"/> can apply its configured <see cref="AllUnavailableBehavior"/>.
 /// </summary>
 public sealed class LeastConnectionsSlotSelectionStrategy : ISlotSelectionStrategy
 {
@@ -73,7 +73,7 @@ public sealed class LeastConnectionsSlotSelectionStrategy : ISlotSelectionStrate
         var allUnavailable = eligible.Count == 0;
 
         // Fail open: if every member currently looks unhealthy/throttled, still pick one (default
-        // behavior, see docs/adr/0007 #6; caller may override via GroupAllUnavailableBehavior). None
+        // behavior, see docs/adr/0007 #6; caller may override via AllUnavailableBehavior). None
         // of these candidates won a probe claim, so there's no generation to carry here.
         if (allUnavailable)
         {

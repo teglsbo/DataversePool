@@ -29,7 +29,7 @@ root cause** from two different angles, along with additional real, well-defined
    resources, regardless of how many already exist. A repeated call (e.g., a retried
    startup hook) can therefore exceed `MaxSize`.
 4. **A capacity timeout is incorrectly reported as a failed circuit probe** —
-   `PoolAcquireTimeoutException` is caught by `DataverseGroupPool.AcquireAsync`'s general `catch` and
+   `PoolAcquireTimeoutException` is caught by `DataversePool.AcquireAsync`'s general `catch` and
    reported to `MemberCircuitBreaker` as `succeeded: false`. A pure load/capacity timeout is
    not evidence that the *member* is unhealthy, but it could unnecessarily extend a recovering member's
    cooldown.
@@ -99,7 +99,7 @@ New `MemberCircuitBreaker.AbandonProbe(member)`: releases a claimed half-open pr
 restarting the cooldown window (unlike `CompleteProbe(succeeded: false)`). New default no-op
 `ISlotSelectionStrategy.ReportAcquireAbandoned(member)`, implemented by both
 circuit-breaker-aware strategies to call `_breaker.AbandonProbe`.
-`DataverseGroupPool.AcquireAsync` now catches `PoolAcquireTimeoutException` specifically, *before* the
+`DataversePool.AcquireAsync` now catches `PoolAcquireTimeoutException` specifically, *before* the
 general `catch`, and calls `ReportAcquireAbandoned` instead of `ReportAcquireOutcome(false)`.
 
 ### Fix for #5: `PoolStats.DetectedLeakCount` — durable leak visibility
@@ -119,7 +119,7 @@ only way to signal "disabled/unbounded" for all three.
   does not use the affected features (`AcquireTimeout`/`CreateTimeout`/`MaxIdleLifetime` remain
   `null` by default; `DetectedLeakCount` is a new, additive `PoolStats` property with default `0`;
   `ReportAcquireAbandoned` is a new default no-op interface method).
-- **Sharper error classification in `DataverseGroupPool`**: a pure capacity/load timeout no longer
+- **Sharper error classification in `DataversePool`**: a pure capacity/load timeout no longer
   incorrectly affects a member's circuit cooldown — only real create/operational failures do.
 - **`ConsecutiveOperationalFailures` is now a reliable signal** for the originally intended
   use case (a member whose operations consistently fail, but whose cloning succeeds) — the known

@@ -62,7 +62,7 @@ Instead, it is documented explicitly as a **production limitation**:
 
 > **DataversePool currently only supports correct operation when exactly one process instance owns a given
 > set of Dataverse service principals at a time.** Do NOT run multiple instances/pods of the consuming
-> application against the same `DataverseGroupPool` member set unless you explicitly accept that
+> application against the same `DataversePool` member set unless you explicitly accept that
 > throttle/circuit state is not coordinated across them (i.e., effectively N× the intended
 > service-protection budget, and no shared backpressure during a tenant-wide outage).
 

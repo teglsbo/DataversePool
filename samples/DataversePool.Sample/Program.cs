@@ -49,7 +49,7 @@ else
 {
     Console.WriteLine();
     Console.WriteLine("Only one connection string provided — skipping the group-pool smoke test.");
-    Console.WriteLine("Set DATAVERSEPOOL_SAMPLE_CONNECTION_STRING_2 (and optionally _3) to also exercise DataverseGroupPool.");
+    Console.WriteLine("Set DATAVERSEPOOL_SAMPLE_CONNECTION_STRING_2 (and optionally _3) to also exercise DataversePool.");
 }
 
 return;
@@ -135,7 +135,7 @@ static async Task RunLiveGroupSmokeTestAsync(string[] connectionStrings)
         .Select((cs, i) => new DataverseUserPool($"sample-group-member-{i + 1}", cs, options))
         .ToArray();
 
-    await using var group = new DataverseGroupPool(members);
+    await using var group = new DataversePool(members);
     Console.WriteLine("Warming up all members sequentially...");
     await group.WarmupAsync();
 

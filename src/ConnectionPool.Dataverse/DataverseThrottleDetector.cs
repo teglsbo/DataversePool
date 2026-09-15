@@ -34,7 +34,7 @@ public static class DataverseThrottleDetector
     /// an explicit override. Dataverse's service-protection limits document execution-time budgets
     /// up to 20 minutes per 5-minute sliding window, and real-world 429 responses have been observed
     /// reporting <c>Retry-After</c> values as high as ~17 minutes. Honoring that literally would keep
-    /// a group member excluded from selection for a very long time from a single throttle signal -
+    /// a member excluded from selection for a very long time from a single throttle signal -
     /// disproportionate for most applications, and risky if only a few members exist (the remaining
     /// ones absorb all traffic for that whole window). 80 seconds is a deliberately conservative
     /// default: long enough to matter, short enough that a single over-reported window doesn't

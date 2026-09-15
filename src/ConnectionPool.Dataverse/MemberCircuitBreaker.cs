@@ -3,7 +3,7 @@ using ConnectionPool.Core;
 namespace ConnectionPool.Dataverse;
 
 /// <summary>
-/// Per-process circuit-breaker bookkeeping for group member selection strategies. Deliberately has
+/// Per-process circuit-breaker bookkeeping for member selection strategies. Deliberately has
 /// no cross-process/shared state (no external store, no distributed lock) - see
 /// docs/adr/0010-configurable-fail-fast-and-single-probe-half-open.md for why that line was drawn
 /// here. Shared by <see cref="HealthAwareRoundRobinSlotSelectionStrategy"/> and

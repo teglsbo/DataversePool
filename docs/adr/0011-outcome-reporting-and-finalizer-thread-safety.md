@@ -20,7 +20,7 @@ codebase: security, a DB connection-pool design expert, and a distributed-system
    positive — `TimeSpan.Zero` would let all concurrent callers win the probe at once.
 3. (Confirmed still open, expected): the circuit still measures only creation failures, not operational failures.
 4. (Confirmed still open, expected): no bounded acquire queue/deadline in `ResourcePool`.
-5. (Non-blocking): `EarliestKnownRetryAt` in `DataverseGroupUnavailableException` could report
+5. (Non-blocking): `EarliestKnownRetryAt` in `DataversePoolUnavailableException` could report
    an already expired throttle timestamp because throttle ticks were never cleared after expiry.
 
 **The DB pool design expert** found three "blocking"-level findings:
@@ -33,7 +33,7 @@ codebase: security, a DB connection-pool design expert, and a distributed-system
    finalizer thread itself.** An unhandled exception there is process-fatal, and a slow/blocking
    subscriber would delay finalization of everything else.
 3. **The serialized creation gate (ADR-0002) applies only *within* one `DataverseUserPool`'s own
-   `ResourcePool`** — under normal load (not just warmup), `DataverseGroupPool` can absolutely trigger
+   `ResourcePool`** — under normal load (not just warmup), `DataversePool` can absolutely trigger
    concurrent `CreateAsync` calls across *different* members, which could potentially hit the same
    SDK-internal lock contention (1-3.2s) identified by ADR-0002 — but this is unverified without empirical
    measurement of whether the SDK's internal lock is per instance or process-global.
@@ -48,7 +48,7 @@ report the actual outcome of an acquire attempt:
 - **Failure** restarts the cooldown window from now and releases the claim immediately, so the *next*
   cooldown's probe is not unnecessarily blocked by an already decided attempt.
 
-`DataverseGroupPool.AcquireAsync` now calls `_strategy.ReportAcquireOutcome(member, succeeded)`
+`DataversePool.AcquireAsync` now calls `_strategy.ReportAcquireOutcome(member, succeeded)`
 after each attempt (in a try/catch around the actual `AcquireAsync` call on the selected member) —
 `OperationCanceledException` from the caller's own cancellation token is deliberately NOT reported as an
 outcome (cancellation is not a health signal about the member). `ISlotSelectionStrategy` got a new
@@ -92,7 +92,7 @@ disposing a technically still-in-use resource (because only the lease wrapper, n
 lost all references) is an inherent consequence of the leak-detection design itself and remains
 presented as a known trade-off, not a bug to "fix" without changing the entire model.
 
-### Fix: stale throttle tick in `DataverseGroupPool.BuildUnavailableException`
+### Fix: stale throttle tick in `DataversePool.BuildUnavailableException`
 `EarliestKnownRetryAt` calculation now filters `ThrottledUntil` values down to only those still
 in the future (`> DateTimeOffset.UtcNow`) before `Min()` is computed — an already expired throttle tick
 (which is never proactively cleared) is no longer incorrectly reported as a valid future
@@ -111,7 +111,7 @@ product decision from the user, which was not available when this work was perfo
   `PooledLease.MarkUnhealthy` (or a new mechanism) feeds the same `ConsecutiveCreateFailures`-like
   signal that the group strategies read, which is a larger change to `PoolStats`/`ResourcePool`'s
   responsibility split.
-- **Cross-member concurrent `CreateAsync` in `DataverseGroupPool`** — the DB pool expert himself
+- **Cross-member concurrent `CreateAsync` in `DataversePool`** — the DB pool expert himself
   recommended empirical verification (measure whether the SDK's lock contention is per instance or
   process-global) BEFORE building a global gate across group members, so as not to
   introduce unnecessary serialization that does not solve a real problem.

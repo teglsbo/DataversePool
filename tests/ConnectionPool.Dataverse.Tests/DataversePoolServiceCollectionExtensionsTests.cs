@@ -30,15 +30,15 @@ public class DataversePoolServiceCollectionExtensionsTests
     }
 
     [Fact]
-    public async Task AddDataverseGroupPool_ComposesRegisteredMemberPools()
+    public async Task AddDataversePool_ComposesRegisteredMemberPools()
     {
         var services = new ServiceCollection();
         services.AddDataverseUserPool("user-a", "dummy-a");
         services.AddDataverseUserPool("user-b", "dummy-b");
-        services.AddDataverseGroupPool("group-1", new[] { "user-a", "user-b" });
+        services.AddDataversePool("group-1", new[] { "user-a", "user-b" });
 
         await using var provider = services.BuildServiceProvider();
-        var group = provider.GetRequiredKeyedService<DataverseGroupPool>("group-1");
+        var group = provider.GetRequiredKeyedService<DataversePool>("group-1");
 
         Assert.Equal(new[] { "user-a", "user-b" }, group.Members.Select(m => m.Name));
     }

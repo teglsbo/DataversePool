@@ -44,10 +44,10 @@ maintenance nightmare during SDK upgrades). It was therefore deliberately reject
   does **not** mark the resource unhealthy/for recycling (the connection is fine, the user is just temporarily
   over its own budget). This is deliberately a separate mechanism from `MarkUnhealthy`
   (ADR-0004/0007), which is for genuinely defective connections.
-- `DataverseGroupPool.AcquireAsync()` now returns `DataverseGroupLease` (not a raw
+- `DataversePool.AcquireAsync()` now returns `DataverseLease` (not a raw
   `PooledLease<ServiceClient>`) specifically so a consumer can report a 429 back to the
   **correct** member — the pool itself otherwise does not know which member was selected for a given
-  call without this reference. `DataverseGroupLease.ReportIfThrottled(exception)` is the convenience method
+  call without this reference. `DataverseLease.ReportIfThrottled(exception)` is the convenience method
   that combines detection + reporting in one call.
 - Both selection strategies (`HealthAwareRoundRobinSlotSelectionStrategy`,
   `LeastConnectionsSlotSelectionStrategy`) now also skip throttled members, with the same
@@ -64,9 +64,9 @@ maintenance nightmare during SDK upgrades). It was therefore deliberately reject
   the SDK's internal retry budget. That is still valuable (it is exactly the situation where the group's
   round-robin would otherwise keep hammering the same member), but it is not a general
   telemetry source for how close a member is to its limit during normal operation.
-- **`DataverseGroupPool.AcquireAsync()`'s return type changed** from `PooledLease<ServiceClient>` to
-  `DataverseGroupLease` — an intentional API break, acceptable because the library is still
-  pre-1.0/preview. `DataverseGroupLease` keeps the same usage pattern (`.Resource`,
+- **`DataversePool.AcquireAsync()`'s return type changed** from `PooledLease<ServiceClient>` to
+  `DataverseLease` — an intentional API break, acceptable because the library is still
+  pre-1.0/preview. `DataverseLease` keeps the same usage pattern (`.Resource`,
   `await using`/`DisposeAsync`), so migration is minimal.
 - If a future SDK version exposes response headers for successful calls (or we switch
   to calling the Web API directly instead of through `ServiceClient`), a proactive

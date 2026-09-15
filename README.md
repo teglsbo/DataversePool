@@ -58,20 +58,27 @@ alternatives above.
 | Package | Purpose | Depends on |
 |---|---|---|
 | `DataversePool.Core` | Generic async resource pool engine. No Dataverse/network dependency. | — |
-| `DataversePool.Dataverse` | `ServiceClient` policy + single-user pool + round-robin group pool. | `DataversePool.Core`, `Microsoft.PowerPlatform.Dataverse.Client` |
+| `DataversePool.Dataverse` | `ServiceClient` policy + `DataversePool` (1..N members, round-robin/health-aware). | `DataversePool.Core`, `Microsoft.PowerPlatform.Dataverse.Client` |
 | `DataversePool.Polly` | Wires Polly v8 retry/circuit-breaker outcomes to a lease's health signal. | `DataversePool.Core`, `Polly.Core` (optional — not required by the other two packages) |
 | `DataversePool.Metrics` | Publishes pool health as `System.Diagnostics.Metrics` observable gauges (OpenTelemetry-compatible). | `DataversePool.Core` (optional — no metrics backend dependency) |
 
-## Quickstart: single user
+## Quickstart: one user (start here)
+
+Even with a single Dataverse application user today, construct a `DataversePool` (not
+`DataverseUserPool` directly) if there's any chance you'll add more users later — going from one
+member to several then only means changing how you construct/configure it, not your call sites.
+See [ADR-0019](docs/adr/0019-unify-single-and-multi-user-pools-as-dataversepool.md).
 
 ```csharp
 using ConnectionPool.Core;
 using ConnectionPool.Dataverse;
 
-var pool = new DataverseUserPool(
+var member = new DataverseUserPool(
     name: "primary",
     connectionString: "AuthType=ClientSecret;Url=...;ClientId=...;ClientSecret=...;",
     options: new PoolOptions { MaxSize = 8, PrewarmCount = 2 });
+
+var pool = new DataversePool(member); // single-member convenience constructor
 
 await pool.WarmupAsync(); // sequential, see ADR-0002 — do this once at startup
 
@@ -107,35 +114,43 @@ await using (var lease = await pool.AcquireAsync())
 > [ADR-0016](docs/adr/0016-affinity-cookie-forced-off-retry-knobs-exposed.md).
 
 ```csharp
-var pool = new DataverseUserPool(
+var member = new DataverseUserPool(
     "sample-user",
     connectionString,
     clientOptions: new DataverseClientOptions { MaxRetryCount = 0 }); // fail fast, let the pool own backoff
 ```
 
-## Quickstart: group pool (multiple application users)
+**Never going to scale beyond one user, and want to skip the selection-strategy layer entirely?**
+Use `DataverseUserPool` directly instead of wrapping it in a `DataversePool` - see ADR-0006 for
+the zero-overhead rationale. You lose `ExecuteWithThrottleRetryAsync` and `DataverseLease`, but
+`DataverseUserPool` still exposes `ReportThrottled`/`ThrottledUntil`/`IsThrottled` directly if you
+want to hand-roll retry logic yourself.
+
+## Scaling to multiple application users
 
 Use this when one application (service principal) user's ~52-concurrent-request budget isn't
-enough — register several application users and round-robin across them:
+enough — register several application users and let the *same* `DataversePool` type round-robin
+across them. This is the one behavior change from the single-user quickstart above: more members
+passed to the same constructor, nothing else in your code changes.
 
 ```csharp
 using ConnectionPool.Core;
 using ConnectionPool.Dataverse;
 
 var options = new PoolOptions { MaxSize = 8, PrewarmCount = 2 };
-var group = new DataverseGroupPool(new[]
+var pool = new DataversePool(new[]
 {
     new DataverseUserPool("app-user-1", connectionStringUser1, options),
     new DataverseUserPool("app-user-2", connectionStringUser2, options),
     new DataverseUserPool("app-user-3", connectionStringUser3, options),
 });
 
-await group.WarmupAsync(); // warms up each member sequentially
+await pool.WarmupAsync(); // warms up each member sequentially
 
-await using var lease = await group.AcquireAsync();
+await using var lease = await pool.AcquireAsync();
 // selection uses HealthAwareRoundRobinSlotSelectionStrategy by default:
 // a member that keeps failing gets circuit-opened, retried after a cooldown,
-// and the whole group fails open (rather than deadlocking) if all members are down.
+// and the whole pool fails open (rather than deadlocking) if all members are down.
 ```
 
 **Round-robin vs. load-aware selection.** The default `HealthAwareRoundRobinSlotSelectionStrategy`
@@ -145,16 +160,16 @@ If call durations vary a lot (some members can end up stuck on long-running requ
 fewest leased connections (`PoolStats.LeasedCount`), with the same dead-member circuit-breaking:
 
 ```csharp
-var group = new DataverseGroupPool(members, new LeastConnectionsSlotSelectionStrategy());
+var pool = new DataversePool(members, new LeastConnectionsSlotSelectionStrategy());
 ```
 
 **Throttle-aware routing.** Both strategies also skip a member that's currently marked as
-Dataverse-throttled. `DataverseGroupPool.AcquireAsync()` returns a `DataverseGroupLease` (not a
+Dataverse-throttled. `DataversePool.AcquireAsync()` returns a `DataverseLease` (not a
 plain lease) specifically so you can report a 429 back to the member that actually served the
 request:
 
 ```csharp
-await using var lease = await group.AcquireAsync();
+await using var lease = await pool.AcquireAsync();
 try
 {
     var response = (WhoAmIResponse)lease.Resource.Execute(new WhoAmIRequest());
@@ -162,31 +177,35 @@ try
 catch (Exception ex) when (lease.ReportIfThrottled(ex))
 {
     // Dataverse returned HTTP 429; DataverseThrottleDetector parsed Retry-After from the exception
-    // and ReportIfThrottled recorded it on lease.Member. The group's selection strategy will steer
+    // and ReportIfThrottled recorded it on lease.Member. The pool's selection strategy will steer
     // new acquires to other members until that window expires. lease.Member is still not "unhealthy"
     // - the connection itself is fine, just decide here whether to retry, rethrow, etc.
     throw;
 }
 ```
 
-**Want that retry-on-another-member to happen automatically?** Use
-`DataverseGroupPool.ExecuteWithThrottleRetryAsync` instead of hand-rolling the loop above - it
-acquires a lease, runs your operation, and on a 429 reports the throttle and retries against a
-freshly-acquired lease (naturally routed to a different member by the selection strategy):
+**Want that retry to happen automatically?** Use `DataversePool.ExecuteWithThrottleRetryAsync`
+instead of hand-rolling the loop above - it acquires a lease, runs your operation, and on a 429
+reports the throttle and retries. If a different, non-throttled member is available, the retry
+happens immediately (routed there by the selection strategy); if not - including the single-member
+case above - it actually waits out the capped `Retry-After` first, instead of instantly re-hitting
+the same still-throttled connection for no benefit. See
+[ADR-0019](docs/adr/0019-unify-single-and-multi-user-pools-as-dataversepool.md).
 
 ```csharp
-var response = await group.ExecuteWithThrottleRetryAsync(
+var response = await pool.ExecuteWithThrottleRetryAsync(
     (client, ct) => Task.FromResult((WhoAmIResponse)client.Execute(new WhoAmIRequest())));
 ```
 
 Only a recognized throttling signal is retried - any other exception from your operation propagates
-immediately. This is deliberately narrow (closing the "retry on another member when throttled" gap),
-not a general resilience pipeline - use the optional Polly adapter package for arbitrary
-retry/circuit-breaking needs.
+immediately. This is deliberately narrow (closing the "retry when throttled" gap), not a general
+resilience pipeline - use the optional Polly adapter package for arbitrary retry/circuit-breaking
+needs.
 
 > **Dataverse's `Retry-After` is capped by default, not honored verbatim.** Real-world 429 responses
 > have been observed reporting `Retry-After` values as high as ~17 minutes. Honoring that literally
-> would exclude a member from the group's rotation for a very long time from one signal.
+> would exclude a member from the pool's rotation for a very long time from one signal (or, for a
+> single-member pool, mean an actual ~17-minute wait before the next retry).
 > `DataverseThrottleDetector.DefaultMaxRetryAfter` (80 seconds) is applied everywhere a `Retry-After`
 > is translated into a duration - `ReportIfThrottled` and `ExecuteWithThrottleRetryAsync` both accept
 > an explicit `maxRetryAfter` override if you want a different cap, including `TimeSpan.MaxValue` to
@@ -207,23 +226,23 @@ concurrent caller wins the half-open "probe" slot — everyone else stays routed
 until that probe's outcome is observable, instead of every waiting caller piling onto the
 just-recovering member at once. See [ADR-0010](docs/adr/0010-configurable-fail-fast-and-single-probe-half-open.md).
 
-**What happens when every member is unavailable?** By default, `DataverseGroupPool` still picks a
-member anyway (`GroupAllUnavailableBehavior.FailOpen`, unchanged from earlier versions) — useful
+**What happens when every member is unavailable?** By default, `DataversePool` still picks a
+member anyway (`AllUnavailableBehavior.FailOpen`, unchanged from earlier versions) — useful
 when a resilience layer above you (Polly, your own retry) already handles the resulting
-failure/throttle. If you'd rather get immediate backpressure instead of adding load to a group you
+failure/throttle. If you'd rather get immediate backpressure instead of adding load to a pool you
 already know is unavailable, opt into fail-fast:
 
 ```csharp
-var group = new DataverseGroupPool(members, strategy, GroupAllUnavailableBehavior.FailFast);
+var pool = new DataversePool(members, strategy, AllUnavailableBehavior.FailFast);
 
 try
 {
-    await using var lease = await group.AcquireAsync();
+    await using var lease = await pool.AcquireAsync();
     // ...
 }
-catch (DataverseGroupUnavailableException ex)
+catch (DataversePoolUnavailableException ex)
 {
-    // ex.MemberNames - every member in the group
+    // ex.MemberNames - every member in the pool
     // ex.EarliestKnownRetryAt - earliest known throttle-window expiry across members, if any
 }
 ```
@@ -240,13 +259,15 @@ services.AddDataverseUserPool("primary", connectionString, options =>
     options.MaxSize = 8;
     options.PrewarmCount = 2;
 });
+services.AddDataversePool("primary-pool", new[] { "primary" }); // single member today, add more names later
 
 // resolve later:
-var pool = provider.GetRequiredKeyedService<DataverseUserPool>("primary");
+var pool = provider.GetRequiredKeyedService<DataversePool>("primary-pool");
 ```
 
-Registered pools warm up sequentially via one `IHostedService` per pool, relying on the generic
+Registered pools warm up sequentially via one `IHostedService` per user pool, relying on the generic
 host's sequential `StartAsync` — consistent with the "never clone in parallel" rule.
+
 
 ## Optional: Polly integration
 
@@ -283,7 +304,7 @@ standard `System.Diagnostics.Metrics` instruments — consumable by any OpenTele
 using ConnectionPool.Metrics;
 
 using var metrics = pool.AddMetrics("my-pool"); // pool: a ResourcePool<T>
-// or, for DataverseUserPool/DataverseGroupPool (no direct ResourcePool<T> access):
+// or, for DataverseUserPool/DataversePool (no direct ResourcePool<T> access):
 using var metrics = new PoolMetrics("my-pool", pool.GetStats);
 ```
 
@@ -338,6 +359,7 @@ Every non-obvious choice is written up as an ADR in [`docs/adr/`](docs/adr/):
 16. [Affinity cookie forced off in code; retry/throttle knobs (MaxRetryCount, RetryPauseTime, UseExponentialRetryDelayForConcurrencyThrottle) exposed as optional overrides](docs/adr/0016-affinity-cookie-forced-off-retry-knobs-exposed.md)
 17. [Group-level throttle retry helper (ExecuteWithThrottleRetryAsync) + capped Retry-After](docs/adr/0017-group-throttle-retry-helper-and-capped-retry-after.md)
 18. [Optional metrics adapter using System.Diagnostics.Metrics observable gauges](docs/adr/0018-metrics-adapter-observable-gauges.md)
+19. [Unify single-user and multi-user pools as DataversePool; wait-when-no-alternative throttle retry](docs/adr/0019-unify-single-and-multi-user-pools-as-dataversepool.md)
 
 ## Status / open items
 
@@ -348,7 +370,7 @@ have **not** been directly verified by this project's own tests.
 > ⚠️ **Production constraint: single process per service-principal set.** All pool, throttle, and
 > circuit-breaker state lives in-process memory only — it is **not** coordinated across multiple
 > instances of your application (e.g. multiple Kubernetes pods) sharing the same
-> `DataverseGroupPool` service principals. Running more than one instance against the same
+> `DataversePool` service principals. Running more than one instance against the same
 > principal set means each instance independently thinks it has the full Dataverse
 > service-protection budget available, a 429 seen by one instance won't stop another from
 > continuing to spend the same shared budget, and the "fail open when everything is

@@ -7,7 +7,7 @@ Accepted
 Two related gaps surfaced from a caller's perspective:
 
 1. **"Retry against a different group member when throttled" was entirely caller-written.**
-   `DataverseGroupPool.AcquireAsync()` and `DataverseGroupLease.ReportIfThrottled` already made this
+   `DataversePool.AcquireAsync()` and `DataverseLease.ReportIfThrottled` already made this
    *possible* (a throttled member is skipped by the selection strategy on the next acquire), but
    there was no helper that actually performed the acquire-execute-detect-retry loop. Every caller
    wanting this had to hand-write it.
@@ -17,24 +17,24 @@ Two related gaps surfaced from a caller's perspective:
    window, and real-world 429 responses have been observed reporting `Retry-After` values as high as
    ~17 minutes. `DataverseThrottleDetector.TryGetRetryAfter` previously honored whatever value
    Dataverse reported, verbatim. Combined with (1)'s retry loop, or even just
-   `DataverseGroupLease.ReportIfThrottled` used directly, an unbounded value would exclude a member
+   `DataverseLease.ReportIfThrottled` used directly, an unbounded value would exclude a member
    from the group's rotation for a very long time from a single signal - disproportionate for most
    applications, and risky with few members (the rest absorb all traffic for that whole window).
 
 ## Decision
-- **`DataverseGroupPool.ExecuteWithThrottleRetryAsync<T>(operation, maxAttempts?, maxRetryAfter?, ct)`**:
+- **`DataversePool.ExecuteWithThrottleRetryAsync<T>(operation, maxAttempts?, maxRetryAfter?, ct)`**:
   acquires a lease, runs `operation`, and on a recognized 429/throttling signal reports it (so the
   member is excluded going forward) and retries against a freshly-acquired lease - naturally routed
   to a different member by the group's throttle-aware selection strategy. Only throttling signals
   are retried; any other exception from `operation` propagates immediately, unretried - this is
   intentionally narrow in scope (closing the specific "retry on a different member" gap), not a
   general-purpose resilience pipeline (that remains the optional Polly adapter's job, per ADR-0005).
-  `AcquireAsync` failures themselves (e.g. `DataverseGroupUnavailableException`) are not retried by
+  `AcquireAsync` failures themselves (e.g. `DataversePoolUnavailableException`) are not retried by
   this method - only failures from `operation`, once a lease was actually acquired, are eligible.
   Defaults `maxAttempts` to the member count (each member gets at most one attempt by default).
 - **`DataverseThrottleDetector.DefaultMaxRetryAfter = 80 seconds`**, applied by default everywhere a
   `Retry-After` value is translated into a duration (`TryGetRetryAfter`,
-  `DataverseGroupLease.ReportIfThrottled`, and now `ExecuteWithThrottleRetryAsync`). All three accept
+  `DataverseLease.ReportIfThrottled`, and now `ExecuteWithThrottleRetryAsync`). All three accept
   an explicit override (`maxRetryAfter`/an overload taking a `TimeSpan`) for callers who want a
   different cap - including `TimeSpan.MaxValue` to opt back into honoring Dataverse's value
   verbatim. 80 seconds was chosen as a deliberately conservative default: long enough to matter,

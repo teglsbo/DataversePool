@@ -23,7 +23,7 @@ explicit decisions on each item:
    to creation failures (`ConsecutiveCreateFailures`), not to operational failures reported via
    `PooledLease.MarkUnhealthy` on an already-created resource. The user's response: "yes - necessary,
    so you do not keep pushing a bad one around to everyone."
-3. **Cross-member concurrent `CreateAsync` in `DataverseGroupPool`** — the DB pool expert flagged this
+3. **Cross-member concurrent `CreateAsync` in `DataversePool`** — the DB pool expert flagged this
    as a possible reintroduction of ADR-0002's lock-contention problem, but also recommended empirical
    verification of whether the SDK's internal lock is per instance or process-global before building a
    gate. The user's response: "probably just per instance; it only costs a little extra time to create if

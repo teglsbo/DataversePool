@@ -15,7 +15,7 @@ and 429/budget signals).
 Two public types in `ConnectionPool.Dataverse`:
 
 - `DataverseUserPool` — pool of `ServiceClient` instances for **one** user/connection string.
-- `DataverseGroupPool` — composes multiple `DataverseUserPool` instances and chooses
+- `DataversePool` — composes multiple `DataverseUserPool` instances and chooses
   which one to use via a pluggable strategy:
 
   ```csharp
@@ -28,13 +28,13 @@ Two public types in `ConnectionPool.Dataverse`:
   v1 provides only a simple `RoundRobinSlotSelectionStrategy`. The interface is designed
   so it can later receive a `ThrottleAwareSlotSelectionStrategy` that avoids
   members close to their budget/`dop-hint` ceiling, without changing the public API of
-  `DataverseGroupPool`.
+  `DataversePool`.
 
 ## Consequences
 - Consumers with a simple need (one user) use `DataverseUserPool` directly, without
   overhead from the group layer.
 - Group logic is isolated in the strategy — round-robin in v1 can be replaced without
-  changing the public contract of `DataverseGroupPool`.
+  changing the public contract of `DataversePool`.
 - Requires that `PoolStats` (in-use/wait-time/unhealthy-count) is available per
   member pool, so a future throttle-aware strategy has data to choose from.
 
@@ -61,3 +61,15 @@ future scope and was not done in this round.
 - `LeastConnectionsSlotSelectionStrategy`: prefer when calls have highly variable duration (some
   members may be stuck in long-running calls), so new acquires do not just continue piling up
   on an already stressed member.
+
+## Update: `DataverseGroupPool` renamed to `DataversePool`, recommended even for one member
+
+See ADR-0019 for the full reasoning. Short version: `DataverseGroupPool` was renamed to
+`DataversePool` and gained a single-member convenience constructor, and is now the recommended
+entry point even for a single Dataverse application user - "group" stopped being accurate
+terminology once this type was no longer exclusively for the multi-member case. The
+composition-over-`DataverseUserPool` architecture described above is unchanged; only the name and
+the recommended default starting point changed. `DataverseUserPool` remains available directly for
+the narrowest "never scaling, want zero selection-strategy overhead" case this ADR originally
+described.
+
