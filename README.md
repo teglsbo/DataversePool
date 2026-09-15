@@ -60,6 +60,7 @@ alternatives above.
 | `DataversePool.Core` | Generic async resource pool engine. No Dataverse/network dependency. | — |
 | `DataversePool.Dataverse` | `ServiceClient` policy + single-user pool + round-robin group pool. | `DataversePool.Core`, `Microsoft.PowerPlatform.Dataverse.Client` |
 | `DataversePool.Polly` | Wires Polly v8 retry/circuit-breaker outcomes to a lease's health signal. | `DataversePool.Core`, `Polly.Core` (optional — not required by the other two packages) |
+| `DataversePool.Metrics` | Publishes pool health as `System.Diagnostics.Metrics` observable gauges (OpenTelemetry-compatible). | `DataversePool.Core` (optional — no metrics backend dependency) |
 
 ## Quickstart: single user
 
@@ -272,6 +273,35 @@ Any `OnRetry`/`OnOpened` callback you already had on `RetryStrategyOptions`/`Cir
 keeps firing — `AddRetryWithPoolHealthSignal`/`AddCircuitBreakerWithPoolHealthSignal` only adds the
 `lease.MarkUnhealthy(...)` call, it doesn't replace your callback.
 
+## Optional: metrics (OpenTelemetry-compatible)
+
+`DataversePool.Core` has no dependency on any metrics library. If you want pool health published as
+standard `System.Diagnostics.Metrics` instruments — consumable by any OpenTelemetry exporter
+(Prometheus, OTLP, Azure Monitor, etc.) — add `DataversePool.Metrics`:
+
+```csharp
+using ConnectionPool.Metrics;
+
+using var metrics = pool.AddMetrics("my-pool"); // pool: a ResourcePool<T>
+// or, for DataverseUserPool/DataverseGroupPool (no direct ResourcePool<T> access):
+using var metrics = new PoolMetrics("my-pool", pool.GetStats);
+```
+
+This publishes every `PoolStats` field (`CreatedCount`, `IdleCount`, `LeasedCount`,
+`UnhealthyOrRecyclingCount`, `WaitingCount`, `MaxSize`, `ConsecutiveCreateFailures`,
+`ConsecutiveOperationalFailures`, `DetectedLeakCount`) as an **observable gauge** on a `Meter` named
+`"DataversePool"` (overridable), tagged with `pool.name`. Gauges, not counters, because `PoolStats` is
+a pull-based snapshot — the gauge callback only runs when a listener/exporter actually collects, so
+this adds no background polling thread. Wire an exporter to see it, e.g.:
+
+```csharp
+services.AddOpenTelemetry().WithMetrics(m => m.AddMeter("DataversePool").AddPrometheusExporter());
+```
+
+Scope is deliberately generic (the `ConnectionPool.Core` `PoolStats` fields only) — Dataverse-specific
+signals like per-member circuit breaker state aren't covered yet. See
+[ADR-0018](docs/adr/0018-metrics-adapter-observable-gauges.md).
+
 ## Sample project
 
 See [`samples/DataversePool.Sample`](samples/DataversePool.Sample) for a runnable console app demonstrating
@@ -307,6 +337,7 @@ Every non-obvious choice is written up as an ADR in [`docs/adr/`](docs/adr/):
 15. [Complexity review — pause "fix everything" review cycles, split ResourcePool.cs](docs/adr/0015-complexity-review-file-split-no-behavior-change.md)
 16. [Affinity cookie forced off in code; retry/throttle knobs (MaxRetryCount, RetryPauseTime, UseExponentialRetryDelayForConcurrencyThrottle) exposed as optional overrides](docs/adr/0016-affinity-cookie-forced-off-retry-knobs-exposed.md)
 17. [Group-level throttle retry helper (ExecuteWithThrottleRetryAsync) + capped Retry-After](docs/adr/0017-group-throttle-retry-helper-and-capped-retry-after.md)
+18. [Optional metrics adapter using System.Diagnostics.Metrics observable gauges](docs/adr/0018-metrics-adapter-observable-gauges.md)
 
 ## Status / open items
 
