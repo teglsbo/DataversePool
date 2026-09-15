@@ -92,19 +92,24 @@ await using (var lease = await pool.AcquireAsync())
 > [Microsoft's docs](https://learn.microsoft.com/en-us/dotnet/api/microsoft.powerplatform.dataverse.client.serviceclient.enableaffinitycookie)
 > for details.
 
-> **`MaxRetryCount`/`RetryPauseTime` are optional overrides, not forced.** The SDK's own defaults
-> (10 retries, 5s pause) mean a single call hitting a transient error can silently block a leased
-> client for up to ~50 seconds before an exception ever reaches this pool's throttle detection or a
-> circuit breaker built on top of it. Unlike the affinity cookie, there's no single correct value
-> here - it depends on your own timeout budget - so pass a `DataverseClientOptions` to
-> `DataverseUserPool`'s constructor to override either setting; leave it `null` (default) to keep the
-> SDK's defaults. See [ADR-0016](docs/adr/0016-affinity-cookie-forced-off-retry-knobs-exposed.md).
+> **`MaxRetryCount`/`RetryPauseTime`/`UseExponentialRetryDelayForConcurrencyThrottle` are optional
+> overrides, not forced.** The SDK's own defaults (10 retries, 5s pause) mean a single call hitting a
+> transient error can silently block a leased client for up to ~50 seconds before an exception ever
+> reaches this pool's throttle detection or a circuit breaker built on top of it. `MaxRetryCount`
+> also governs HTTP 429 (service-protection/throttling) retries, not just other transient errors -
+> set it to `0` to make the SDK fail fast on either and let this pool's own throttle
+> detection/circuit breaker drive backoff instead. (The `Retry-After` value the pool reads is the
+> real server response header, so it's still correct even with `MaxRetryCount=0` - see ADR-0016 for
+> the reasoning.) Unlike the affinity cookie, there's no single correct value here - it depends on
+> your own timeout budget - so pass a `DataverseClientOptions` to `DataverseUserPool`'s constructor
+> to override any of these; leave them `null` (default) to keep the SDK's defaults. See
+> [ADR-0016](docs/adr/0016-affinity-cookie-forced-off-retry-knobs-exposed.md).
 
 ```csharp
 var pool = new DataverseUserPool(
     "sample-user",
     connectionString,
-    clientOptions: new DataverseClientOptions { MaxRetryCount = 2, RetryPauseTime = TimeSpan.FromSeconds(1) });
+    clientOptions: new DataverseClientOptions { MaxRetryCount = 0 }); // fail fast, let the pool own backoff
 ```
 
 ## Quickstart: group pool (multiple application users)
@@ -276,7 +281,7 @@ Every non-obvious choice is written up as an ADR in [`docs/adr/`](docs/adr/):
 13. [End-to-end AcquireTimeout, fair operational-failure counting, idempotent warmup, correct probe-outcome reporting, durable leak visibility](docs/adr/0013-acquire-timeout-end-to-end-and-review-round-four-fixes.md)
 14. [Probe-claim generation correlation, and correctly distinguishing AcquireTimeout cancellation from a real CreateTimeout](docs/adr/0014-probe-claim-generation-and-cancellation-vs-createtimeout-misclassification.md)
 15. [Complexity review — pause "fix everything" review cycles, split ResourcePool.cs](docs/adr/0015-complexity-review-file-split-no-behavior-change.md)
-16. [Affinity cookie forced off in code; MaxRetryCount/RetryPauseTime exposed as optional overrides](docs/adr/0016-affinity-cookie-forced-off-retry-knobs-exposed.md)
+16. [Affinity cookie forced off in code; retry/throttle knobs (MaxRetryCount, RetryPauseTime, UseExponentialRetryDelayForConcurrencyThrottle) exposed as optional overrides](docs/adr/0016-affinity-cookie-forced-off-retry-knobs-exposed.md)
 
 ## Status / open items
 

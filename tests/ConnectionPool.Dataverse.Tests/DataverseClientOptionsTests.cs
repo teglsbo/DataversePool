@@ -6,10 +6,11 @@ namespace ConnectionPool.Dataverse.Tests;
 /// <summary>
 /// Covers <see cref="DataverseClientOptions"/> validation and its wiring into
 /// <see cref="DataverseServiceClientPolicy"/>'s constructor. This is the only part of the
-/// MaxRetryCount/RetryPauseTime override feature testable without a live Dataverse connection -
-/// see the class docs on <see cref="DataverseServiceClientPolicy"/> for why the actual override
-/// application (base client + clone) cannot be unit-tested (ServiceClient requires a live
-/// connection and cannot be subclassed/mocked).
+/// MaxRetryCount/RetryPauseTime/UseExponentialRetryDelayForConcurrencyThrottle override feature
+/// testable without a live Dataverse connection - see the class docs on
+/// <see cref="DataverseServiceClientPolicy"/> for why the actual override application (base client
+/// + clone) cannot be unit-tested (ServiceClient requires a live connection and cannot be
+/// subclassed/mocked).
 /// </summary>
 public class DataverseClientOptionsTests
 {
@@ -41,6 +42,15 @@ public class DataverseClientOptionsTests
         Assert.Throws<ArgumentOutOfRangeException>(() => options.Validate());
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Validate_AllowsEitherUseExponentialRetryDelayValue(bool value)
+    {
+        var options = new DataverseClientOptions { UseExponentialRetryDelayForConcurrencyThrottle = value };
+        options.Validate(); // should not throw - no range to violate for a bool
+    }
+
     [Fact]
     public void PolicyConstructor_ValidatesClientOptionsBeforeTouchingConnectionString()
     {
@@ -51,5 +61,15 @@ public class DataverseClientOptionsTests
         // network attempt (which only happens lazily on first CreateAsync).
         Assert.Throws<ArgumentOutOfRangeException>(
             () => new DataverseServiceClientPolicy("AuthType=OAuth;", clientOptions: invalidOptions));
+    }
+
+    [Fact]
+    public void PolicyConstructor_AcceptsUseExponentialRetryDelayWithoutThrowing()
+    {
+        var options = new DataverseClientOptions { UseExponentialRetryDelayForConcurrencyThrottle = true };
+
+        // Should not throw during construction - the property itself has no invalid range, only
+        // application to a real ServiceClient (untestable without a live connection) can fail.
+        _ = new DataverseServiceClientPolicy("AuthType=OAuth;", clientOptions: options);
     }
 }

@@ -24,9 +24,10 @@ namespace ConnectionPool.Dataverse;
 ///
 /// <para>
 /// Optionally, <see cref="DataverseClientOptions"/> passed to the constructor overrides
-/// <see cref="ServiceClient.MaxRetryCount"/>/<see cref="ServiceClient.RetryPauseTime"/> on both the
-/// base client and every clone - see that type's docs for why this (unlike affinity cookies) is
-/// left to the caller rather than forced to a fixed value.
+/// <see cref="ServiceClient.MaxRetryCount"/>/<see cref="ServiceClient.RetryPauseTime"/>/
+/// <see cref="ServiceClient.UseExponentialRetryDelayForConcurrencyThrottle"/> on both the base
+/// client and every clone - see that type's docs for why this (unlike affinity cookies) is left to
+/// the caller rather than forced to a fixed value.
 /// </para>
 /// </summary>
 public sealed class DataverseServiceClientPolicy : IPooledResourcePolicy<ServiceClient>, IAsyncDisposable
@@ -140,7 +141,9 @@ public sealed class DataverseServiceClientPolicy : IPooledResourcePolicy<Service
 
     /// <summary>
     /// Applies any configured <see cref="DataverseClientOptions.MaxRetryCount"/>/
-    /// <see cref="DataverseClientOptions.RetryPauseTime"/> overrides to <paramref name="client"/>.
+    /// <see cref="DataverseClientOptions.RetryPauseTime"/>/
+    /// <see cref="DataverseClientOptions.UseExponentialRetryDelayForConcurrencyThrottle"/>
+    /// overrides to <paramref name="client"/>.
     /// Applied to both the base client and every clone (same defensive redundancy as
     /// <see cref="ServiceClient.EnableAffinityCookie"/> above) since it is not guaranteed that
     /// <see cref="ServiceClient.Clone(ILogger)"/> copies these settings from its source.
@@ -156,6 +159,11 @@ public sealed class DataverseServiceClientPolicy : IPooledResourcePolicy<Service
         if (_clientOptions?.RetryPauseTime is { } retryPauseTime)
         {
             client.RetryPauseTime = retryPauseTime;
+        }
+
+        if (_clientOptions?.UseExponentialRetryDelayForConcurrencyThrottle is { } useExponentialRetryDelay)
+        {
+            client.UseExponentialRetryDelayForConcurrencyThrottle = useExponentialRetryDelay;
         }
     }
 }
