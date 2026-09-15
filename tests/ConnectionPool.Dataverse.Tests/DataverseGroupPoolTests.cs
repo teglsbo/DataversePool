@@ -91,4 +91,46 @@ public class DataverseGroupPoolTests
         Assert.NotNull(ex.EarliestKnownRetryAt);
         Assert.Equal(b.ThrottledUntil, ex.EarliestKnownRetryAt); // a's stale/expired tick is ignored
     }
+
+    [Fact]
+    public async Task ExecuteWithThrottleRetryAsync_Throws_WhenOperationIsNull()
+    {
+        var a = new DataverseUserPool("user-a", "dummy-a");
+        await using var group = new DataverseGroupPool(new[] { a });
+
+        await Assert.ThrowsAsync<ArgumentNullException>(
+            () => group.ExecuteWithThrottleRetryAsync<int>(null!));
+    }
+
+    [Fact]
+    public async Task ExecuteWithThrottleRetryAsync_Throws_WhenMaxAttemptsNotPositive()
+    {
+        var a = new DataverseUserPool("user-a", "dummy-a");
+        await using var group = new DataverseGroupPool(new[] { a });
+
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(
+            () => group.ExecuteWithThrottleRetryAsync((client, ct) => Task.FromResult(1), maxAttempts: 0));
+    }
+
+    [Fact]
+    public async Task ExecuteWithThrottleRetryAsync_PropagatesAcquireFailure_WithoutInvokingOperation()
+    {
+        // Dummy connection strings fail inside DataverseServiceClientPolicy.CreateAsync (no real
+        // Dataverse to connect to) - AcquireAsync itself throws before a lease is ever produced.
+        // This proves ExecuteWithThrottleRetryAsync does not swallow/retry acquire-level failures -
+        // only failures from `operation`, once a lease was actually acquired, are eligible for retry.
+        var a = new DataverseUserPool("user-a", "dummy-a");
+        await using var group = new DataverseGroupPool(new[] { a });
+
+        var operationInvoked = false;
+
+        await Assert.ThrowsAsync<ArgumentException>(() => group.ExecuteWithThrottleRetryAsync<int>((client, ct) =>
+        {
+            operationInvoked = true;
+            return Task.FromResult(1);
+        }));
+
+        Assert.False(operationInvoked);
+    }
 }
+

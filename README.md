@@ -168,6 +168,30 @@ catch (Exception ex) when (lease.ReportIfThrottled(ex))
 }
 ```
 
+**Want that retry-on-another-member to happen automatically?** Use
+`DataverseGroupPool.ExecuteWithThrottleRetryAsync` instead of hand-rolling the loop above - it
+acquires a lease, runs your operation, and on a 429 reports the throttle and retries against a
+freshly-acquired lease (naturally routed to a different member by the selection strategy):
+
+```csharp
+var response = await group.ExecuteWithThrottleRetryAsync(
+    (client, ct) => Task.FromResult((WhoAmIResponse)client.Execute(new WhoAmIRequest())));
+```
+
+Only a recognized throttling signal is retried - any other exception from your operation propagates
+immediately. This is deliberately narrow (closing the "retry on another member when throttled" gap),
+not a general resilience pipeline - use the optional Polly adapter package for arbitrary
+retry/circuit-breaking needs.
+
+> **Dataverse's `Retry-After` is capped by default, not honored verbatim.** Real-world 429 responses
+> have been observed reporting `Retry-After` values as high as ~17 minutes. Honoring that literally
+> would exclude a member from the group's rotation for a very long time from one signal.
+> `DataverseThrottleDetector.DefaultMaxRetryAfter` (80 seconds) is applied everywhere a `Retry-After`
+> is translated into a duration - `ReportIfThrottled` and `ExecuteWithThrottleRetryAsync` both accept
+> an explicit `maxRetryAfter` override if you want a different cap, including `TimeSpan.MaxValue` to
+> opt back into Dataverse's raw value. See
+> [ADR-0017](docs/adr/0017-group-throttle-retry-helper-and-capped-retry-after.md).
+
 Why 429/exception-based rather than proactively reading Dataverse's `x-ms-ratelimit-*` response
 headers on every call: headers are the theoretically better (leading, not lagging) signal, but
 `ServiceClient` doesn't surface response headers for *successful* calls anywhere in its public API
@@ -282,6 +306,7 @@ Every non-obvious choice is written up as an ADR in [`docs/adr/`](docs/adr/):
 14. [Probe-claim generation correlation, and correctly distinguishing AcquireTimeout cancellation from a real CreateTimeout](docs/adr/0014-probe-claim-generation-and-cancellation-vs-createtimeout-misclassification.md)
 15. [Complexity review — pause "fix everything" review cycles, split ResourcePool.cs](docs/adr/0015-complexity-review-file-split-no-behavior-change.md)
 16. [Affinity cookie forced off in code; retry/throttle knobs (MaxRetryCount, RetryPauseTime, UseExponentialRetryDelayForConcurrencyThrottle) exposed as optional overrides](docs/adr/0016-affinity-cookie-forced-off-retry-knobs-exposed.md)
+17. [Group-level throttle retry helper (ExecuteWithThrottleRetryAsync) + capped Retry-After](docs/adr/0017-group-throttle-retry-helper-and-capped-retry-after.md)
 
 ## Status / open items
 

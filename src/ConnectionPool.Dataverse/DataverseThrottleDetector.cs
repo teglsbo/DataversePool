@@ -30,19 +30,47 @@ public static class DataverseThrottleDetector
     private static readonly TimeSpan DefaultRetryAfterWhenUnspecified = TimeSpan.FromSeconds(5);
 
     /// <summary>
+    /// Upper bound applied to whatever <c>Retry-After</c> Dataverse reports, unless a caller passes
+    /// an explicit override. Dataverse's service-protection limits document execution-time budgets
+    /// up to 20 minutes per 5-minute sliding window, and real-world 429 responses have been observed
+    /// reporting <c>Retry-After</c> values as high as ~17 minutes. Honoring that literally would keep
+    /// a group member excluded from selection for a very long time from a single throttle signal -
+    /// disproportionate for most applications, and risky if only a few members exist (the remaining
+    /// ones absorb all traffic for that whole window). 80 seconds is a deliberately conservative
+    /// default: long enough to matter, short enough that a single over-reported window doesn't
+    /// sideline a member for most of a work session. See docs/adr/0017.
+    /// </summary>
+    public static readonly TimeSpan DefaultMaxRetryAfter = TimeSpan.FromSeconds(80);
+
+    /// <summary>
     /// Walks <paramref name="exception"/> and its <see cref="Exception.InnerException"/> chain
     /// looking for a Dataverse 429 (service-protection limit exceeded). Returns <c>true</c> and
-    /// sets <paramref name="retryAfter"/> if found.
+    /// sets <paramref name="retryAfter"/> if found, capped at <see cref="DefaultMaxRetryAfter"/>.
     /// </summary>
-    public static bool TryGetRetryAfter(Exception? exception, out TimeSpan retryAfter)
+    public static bool TryGetRetryAfter(Exception? exception, out TimeSpan retryAfter) =>
+        TryGetRetryAfter(exception, DefaultMaxRetryAfter, out retryAfter);
+
+    /// <summary>
+    /// Overload allowing the cap applied to Dataverse's reported <c>Retry-After</c> to be overridden
+    /// (see <see cref="DefaultMaxRetryAfter"/> for why a cap exists at all). Pass
+    /// <see cref="TimeSpan.MaxValue"/> to effectively disable capping and honor Dataverse's value
+    /// verbatim, however large.
+    /// </summary>
+    public static bool TryGetRetryAfter(Exception? exception, TimeSpan maxRetryAfter, out TimeSpan retryAfter)
     {
+        if (maxRetryAfter <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maxRetryAfter), maxRetryAfter, "Must be a positive duration.");
+        }
+
         for (var ex = exception; ex is not null; ex = ex.InnerException)
         {
             if (ex is HttpOperationException httpEx && IsThrottlingStatusCode(httpEx.Response?.StatusCode))
             {
-                retryAfter = TryReadRetryAfterHeader(httpEx.Response!.Headers, out var parsed)
+                var reported = TryReadRetryAfterHeader(httpEx.Response!.Headers, out var parsed)
                     ? parsed
                     : DefaultRetryAfterWhenUnspecified;
+                retryAfter = reported > maxRetryAfter ? maxRetryAfter : reported;
                 return true;
             }
         }

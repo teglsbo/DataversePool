@@ -116,6 +116,82 @@ public sealed class DataverseGroupPool : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Runs <paramref name="operation"/> against a leased <see cref="ServiceClient"/>, and if it
+    /// throws a Dataverse HTTP 429/service-protection signal (detected via
+    /// <see cref="DataverseThrottleDetector"/>, same as <see cref="DataverseGroupLease.ReportIfThrottled"/>),
+    /// reports the throttle on the member that served it and retries against a freshly-acquired
+    /// lease - which, thanks to the group's throttle-aware selection strategy, will steer away from
+    /// the just-throttled member as long as another one is available. See docs/adr/0017.
+    ///
+    /// <para>
+    /// This only retries on a recognized throttling signal - any other exception from
+    /// <paramref name="operation"/> propagates immediately, unretried. General-purpose retry/circuit
+    /// -breaking for arbitrary failures is deliberately out of scope here (that's what the optional
+    /// Polly adapter package is for - see docs/adr/0005); this method exists specifically to close
+    /// the "retry on a different group member when throttled" gap, not to become a general resilience
+    /// pipeline.
+    /// </para>
+    ///
+    /// <para>
+    /// Note <see cref="DataverseGroupPool.AcquireAsync"/> itself is not retried here - if acquiring a
+    /// lease fails (e.g. <see cref="DataverseGroupUnavailableException"/> when every member is
+    /// circuit-open/throttled and <see cref="GroupAllUnavailableBehavior.FailFast"/> is configured),
+    /// that exception propagates immediately; only failures from <paramref name="operation"/> itself,
+    /// once a lease was successfully acquired, are eligible for this retry loop.
+    /// </para>
+    /// </summary>
+    /// <param name="operation">The operation to run against the leased <see cref="ServiceClient"/>.</param>
+    /// <param name="maxAttempts">
+    /// Maximum number of attempts (not additional retries - a value of 1 never retries). Defaults to
+    /// the number of group members, so by default every member gets at most one attempt before
+    /// giving up. Must be positive.
+    /// </param>
+    /// <param name="maxRetryAfter">
+    /// Cap applied to Dataverse's reported <c>Retry-After</c> before it's recorded as the throttled
+    /// member's cooldown window. Defaults to <see cref="DataverseThrottleDetector.DefaultMaxRetryAfter"/>
+    /// - see that constant's docs for why Dataverse's raw value (observed up to ~17 minutes) is not
+    /// always honored verbatim.
+    /// </param>
+    /// <param name="cancellationToken">
+    /// Propagated to both <see cref="AcquireAsync"/> and <paramref name="operation"/>.
+    /// </param>
+    public async Task<T> ExecuteWithThrottleRetryAsync<T>(
+        Func<ServiceClient, CancellationToken, Task<T>> operation,
+        int? maxAttempts = null,
+        TimeSpan? maxRetryAfter = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(operation);
+
+        var attempts = maxAttempts ?? _members.Count;
+        if (attempts <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maxAttempts), maxAttempts, "Must be positive.");
+        }
+
+        for (var attempt = 1; ; attempt++)
+        {
+            var lease = await AcquireAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                return await operation(lease.Resource, cancellationToken).ConfigureAwait(false);
+            }
+            // ReportIfThrottled always runs (left side of && is unconditionally evaluated first), so
+            // the throttle window is recorded even on the final attempt - only whether we swallow the
+            // exception and loop again depends on attempts remaining.
+            catch (Exception ex) when (lease.ReportIfThrottled(ex, maxRetryAfter) && attempt < attempts)
+            {
+                // Fall through to the next loop iteration - a fresh AcquireAsync will steer away from
+                // the member just marked throttled, per the group's selection strategy.
+            }
+            finally
+            {
+                await lease.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+    }
+
     public async ValueTask DisposeAsync()
     {
         foreach (var member in _members)

@@ -39,11 +39,15 @@ public sealed class DataverseGroupLease : IAsyncDisposable
     /// <summary>
     /// Convenience: runs <paramref name="exception"/> through <see cref="DataverseThrottleDetector"/>
     /// and, if it recognizes a Dataverse 429/throttling signal, calls <see cref="ReportThrottled"/>
-    /// automatically. Returns <c>true</c> if throttling was detected and reported.
+    /// automatically. Returns <c>true</c> if throttling was detected and reported. The reported
+    /// duration is capped at <paramref name="maxRetryAfter"/> (defaults to
+    /// <see cref="DataverseThrottleDetector.DefaultMaxRetryAfter"/>) - see that constant's docs for
+    /// why Dataverse's own reported value is not always honored verbatim.
     /// </summary>
-    public bool ReportIfThrottled(Exception exception)
+    public bool ReportIfThrottled(Exception exception, TimeSpan? maxRetryAfter = null)
     {
-        if (DataverseThrottleDetector.TryGetRetryAfter(exception, out var retryAfter))
+        var cap = maxRetryAfter ?? DataverseThrottleDetector.DefaultMaxRetryAfter;
+        if (DataverseThrottleDetector.TryGetRetryAfter(exception, cap, out var retryAfter))
         {
             ReportThrottled(retryAfter);
             return true;

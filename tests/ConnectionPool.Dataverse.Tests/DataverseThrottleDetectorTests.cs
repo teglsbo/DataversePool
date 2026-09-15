@@ -91,4 +91,49 @@ public class DataverseThrottleDetectorTests
         Assert.True(found);
         Assert.Equal(TimeSpan.FromSeconds(12), retryAfter);
     }
+
+    [Fact]
+    public void TryGetRetryAfter_CapsAtDefaultMaxRetryAfter_WhenDataverseReportsAnExcessiveValue()
+    {
+        // Real-world Dataverse 429s have been observed reporting Retry-After as high as ~17 minutes
+        // (1020s) - honoring that verbatim would exclude a group member from selection for a very
+        // long time from a single throttle signal. The default cap protects against that.
+        var ex = BuildThrottlingException(retryAfterSeconds: 1020);
+
+        var found = DataverseThrottleDetector.TryGetRetryAfter(ex, out var retryAfter);
+
+        Assert.True(found);
+        Assert.Equal(DataverseThrottleDetector.DefaultMaxRetryAfter, retryAfter);
+    }
+
+    [Fact]
+    public void TryGetRetryAfter_DoesNotCap_WhenReportedValueIsBelowTheDefaultCap()
+    {
+        var ex = BuildThrottlingException(retryAfterSeconds: 30);
+
+        var found = DataverseThrottleDetector.TryGetRetryAfter(ex, out var retryAfter);
+
+        Assert.True(found);
+        Assert.Equal(TimeSpan.FromSeconds(30), retryAfter); // well under the 80s default cap - untouched
+    }
+
+    [Fact]
+    public void TryGetRetryAfter_HonorsExplicitOverrideCap_InsteadOfTheDefault()
+    {
+        var ex = BuildThrottlingException(retryAfterSeconds: 1020);
+
+        var found = DataverseThrottleDetector.TryGetRetryAfter(ex, TimeSpan.FromSeconds(10), out var retryAfter);
+
+        Assert.True(found);
+        Assert.Equal(TimeSpan.FromSeconds(10), retryAfter);
+    }
+
+    [Fact]
+    public void TryGetRetryAfter_Throws_WhenMaxRetryAfterIsNotPositive()
+    {
+        var ex = BuildThrottlingException(retryAfterSeconds: 30);
+
+        Assert.Throws<ArgumentOutOfRangeException>(
+            () => DataverseThrottleDetector.TryGetRetryAfter(ex, TimeSpan.Zero, out _));
+    }
 }
