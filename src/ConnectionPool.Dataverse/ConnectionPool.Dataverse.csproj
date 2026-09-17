@@ -10,6 +10,11 @@
     <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.12" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.12" />
     <PackageReference Include="Microsoft.PowerPlatform.Dataverse.Client" Version="1.2.27" />
+    <!-- Pin transitive deps pulled in by Dataverse.Client's netstandard-era/WCF
+         dependency chains: High-severity advisories at their default resolved
+         versions, fixed here. -->
+    <PackageReference Include="System.Security.Cryptography.Xml" Version="8.0.4" />
+    <PackageReference Include="System.Text.RegularExpressions" Version="4.3.1" />
   </ItemGroup>
 
   <PropertyGroup>
