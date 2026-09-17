@@ -70,8 +70,14 @@ public class AcquireTimeoutTests
         await Assert.ThrowsAsync<PoolAcquireTimeoutException>(() => pool.AcquireAsync());
         stopwatch.Stop();
 
+        // Generous bound (not a tight timing assertion): this guards against the pre-ADR-0013
+        // regression where the second acquire waited *unbounded* for the first's serialized
+        // create to finish (which here would mean hanging until releaseCreation is signaled,
+        // i.e. deadlocking against the very next line) - not against a few seconds of scheduling
+        // noise on a busy/shared CI runner. 5s (vs. the 150ms AcquireTimeout) is still ~30x
+        // tighter than "unbounded" while tolerating thread-pool/CPU contention on CI.
         Assert.True(
-            stopwatch.Elapsed < TimeSpan.FromSeconds(1),
+            stopwatch.Elapsed < TimeSpan.FromSeconds(5),
             $"Expected the second acquire to time out near AcquireTimeout while waiting behind " +
             $"serialized creation, but took {stopwatch.Elapsed}.");
 
