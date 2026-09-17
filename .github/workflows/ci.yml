@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: dotnet restore DataversePool.slnx
+
+      - name: Build
+        run: dotnet build DataversePool.slnx --no-restore --configuration Release
+
+      - name: Test (excluding opt-in live Dataverse integration tests)
+        run: >
+          dotnet test DataversePool.slnx --no-build --configuration Release
+          --filter "Category!=Integration"
