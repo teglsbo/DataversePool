@@ -18,8 +18,11 @@ Tracing `Utils.IsRequestValidForTranslationToWebAPI` in the vendored SDK also co
 (`RetrieveMultiple`, etc.) never route through the Web API/HTTP path regardless of
 the `UseWebApi` setting - only `Create`/`Update`/`Delete`/`ImportSolution`/`ExportSolution`/
 `StageSolution` are eligible. So for a read-heavy workload, pooling genuinely is the only available
-lever for concurrency; there's no way to work around the single-in-flight-request-per-`ServiceClient`
-constraint via configuration.
+lever for raising the per-application-user server-side concurrent-request ceiling; there's no way to
+work around it via configuration. (Note: a single `ServiceClient` instance does not itself serialize
+concurrent async calls - see [ADR-0023](0023-serviceclient-async-concurrency-corrected-premise.md) -
+but the server-side per-user ceiling still applies regardless of how many concurrent calls one
+instance can issue.)
 
 ## Decision
 - Added `PooledOrganizationService`, implementing `IOrganizationServiceAsync2` (which itself extends

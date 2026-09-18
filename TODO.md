@@ -1,6 +1,6 @@
 # TODO — DataversePool (Dataverse Connection Pooling)
 
-Last updated: 2026-09-14 (ADR-0022: four concurrency leak/race fixes — disposal race, canceled-retry lease leak, probe-claim leak in both slot-selection strategies, non-ready base-client leak)
+Last updated: 2026-09-18 (ADR-0023: corrected the "one request at a time" premise — a `ServiceClient` does not serialize concurrent async calls; added opt-in live-Dataverse concurrency integration test)
 
 ## Name: DataversePool (renamed from XrmPool)
 
@@ -86,13 +86,18 @@ in the entire Dataverse SDK for plain Polly users).
 
 - [ ] Confirm or refute the socket-depletion assumption for new-per-request usage (unverified).
 - [ ] Confirm or refute the CallerId cross-thread race condition with an actual parallel,
-      varying-CallerId test.
+      varying-CallerId test. Now implemented as `LiveServiceClientConcurrencyTests.ConcurrentRequests_WithDifferentCallerIds_OnSameInstance_DoNotMixUpIdentity`
+      (opt-in, `Category=Integration`) but not yet actually run against a real environment — needs
+      two impersonatable systemuser ids (`DVPOOL_IT_CALLER_ID_A`/`_B`). The separate "does a single
+      instance serialize concurrent async calls" question is now confirmed **false** (see ADR-0023),
+      but that's a different question from the CallerId race, which remains open.
 - [ ] Background sweep for MaxIdleLifetime (today only lazy-at-checkout) — deferred to v2 if needed.
 - [x] ~~Run the actual live Dataverse smoke test~~ — run and confirmed against a real org (see above).
 - [ ] Run the group-pool (round-robin) smoke test live with 2+ app users (requires an additional
       service principal beyond the one used for the single-user test).
-- [ ] Consider an integration-test project (opt-in, against a real Dataverse instance) — not
-      created in this session.
+- [x] Consider an integration-test project (opt-in, against a real Dataverse instance) — implemented
+      as `LiveServiceClientConcurrencyTests` in the existing `ConnectionPool.Dataverse.Tests` project
+      rather than a separate project (simpler, still excluded from CI via `Category!=Integration`).
 - [x] Before actual NuGet publishing: update the placeholder URLs in `Directory.Build.props`
       (`PackageProjectUrl`/`RepositoryUrl`) — updated to `github.com/teglsbo/dataversepool`.
 - [x] Settle the real author/copyright name in `LICENSE` — updated to Niels Teglsbo, along with
@@ -177,7 +182,8 @@ docs/adr/                              # architecture decisions, see ADR-0001..0
 - [ ] Confirm or refute the socket-depletion assumption for new-per-request usage (unverified, see research).
 - [ ] Confirm or refute the CallerId cross-thread race condition with an actual parallel,
       varying-CallerId test (note: this is a *different* risk than the now-fixed cross-*lease*
-      leakage, see ADR-0009).
+      leakage, see ADR-0009). Test implemented (`LiveServiceClientConcurrencyTests`), not yet run
+      against a real environment — see the "Open questions" entry above and ADR-0023.
 - [x] Throttle-aware `ISlotSelectionStrategy` — implemented via `DataverseUserPool.ReportThrottled`/`IsThrottled` + `DataverseLease.ReportIfThrottled`, see ADR-0008. Both selection strategies now skip throttled members (fail-open if all are throttled).
 - [ ] Consider whether SOAP-fault (`OrganizationServiceFault`)-based throttle detection is also needed (deliberately omitted for now, see ADR-0008 — would require an extra `System.ServiceModel.Primitives` reference and it's unverified whether this SDK version even throws SOAP faults for throttling).
 - [ ] Consider whether single-user (non-group) `DataverseUserPool` should also expose throttle state externally for monitoring (today only used internally by the group's selection strategy).
@@ -221,6 +227,7 @@ docs/adr/                              # architecture decisions, see ADR-0001..0
   - Both `HealthAwareRoundRobinSlotSelectionStrategy` and `LeastConnectionsSlotSelectionStrategy` leaked half-open probe claims for every eligible-but-not-selected candidate in a selection round — fixed by abandoning each unused claim immediately.
   - `DataverseServiceClientPolicy.GetOrCreateBaseClientAsync` left a non-ready (but non-null) base client stored in `_baseClient` before throwing — fixed to dispose and clear it first.
 - [x] `PooledOrganizationService` never reported Dataverse throttling signals back to the pool — so a multi-member `DataversePool` used only through the facade only ever got blind rotation across members with no way to route around one Dataverse just capped. Fixed: `LeaseScope` now accepts an optional `onException` callback (invoked with the lease and exception before release, with no bearing on what propagates — kept fully generic/testable), and `PooledOrganizationService` supplies `DataverseLease.ReportIfThrottled` as that callback. Retry-on-throttle for the current call is still out of scope for the facade (unchanged) — see ADR-0020.
+- [x] **Corrected the README/ADR-0020's "a `ServiceClient` only handles one request at a time" premise** — decompiling the SDK shows the async execute path (`Command_ExecuteAsyncImpl`, what `ExecuteAsync`/`IOrganizationServiceAsync2` actually use) has no lock around the underlying call; only the sync path does. A new opt-in integration test (`LiveServiceClientConcurrencyTests`, `Category=Integration`) confirmed this against a real Dataverse instance: concurrent calls on one instance ran meaningfully faster than sequential, with the gap widening as request count increased (not the flat-ratio signature a client-side lock would produce). The real reasons to pool are now stated explicitly: the per-application-user server-side concurrency ceiling (unaffected by this), construction/clone cost (unaffected), and `CallerId`-style per-instance mutable state making concurrent use across *different identities* unsafe (a correctness risk, not a throughput one) — see ADR-0023.
 
 ## Test strategy (brief, see the full design discussion in the session)
 
@@ -228,3 +235,10 @@ docs/adr/                              # architecture decisions, see ADR-0001..0
 - Dataverse adapter: fake `IPooledResourcePolicy<ServiceClient>`, tests orchestration only.
 - Polly adapter: verify `MarkUnhealthy` is called correctly on retry/circuit-open.
 - Integration test against real Dataverse: opt-in, `[Trait("Category","Integration")]`, not in normal CI.
+  Implemented: `LiveServiceClientConcurrencyTests` (`tests/ConnectionPool.Dataverse.Tests/`) — measures
+  whether a single `ServiceClient` serializes concurrent async calls, and whether concurrent `CallerId`
+  changes on a shared instance race. Both self-skip without env vars (`DVPOOL_IT_CONNECTION_STRING`,
+  optionally `DVPOOL_IT_CALLER_ID_A`/`DVPOOL_IT_CALLER_ID_B`, `DVPOOL_IT_REQUEST_COUNT`) — no creds
+  needed to build/run the rest of the suite. The `CallerId`-race test itself has not yet actually been
+  run against a real environment (needs two impersonatable systemuser ids) — the socket-depletion and
+  `CallerId` cross-thread-race open questions below are updated to reflect this, not resolved by it.

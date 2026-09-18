@@ -1,10 +1,15 @@
 # DataversePool
 
 Connection pooling for [`Microsoft.PowerPlatform.Dataverse.Client.ServiceClient`](https://learn.microsoft.com/power-platform/developer/data-platform/xrm-tooling/use-dataverse-service-client) —
-because a `ServiceClient` only handles **one request at a time**, and cloning a new one is
+not because a single `ServiceClient` instance serializes concurrent async calls (measured against a
+real Dataverse instance, it doesn't — see [ADR-0023](docs/adr/0023-serviceclient-async-concurrency-corrected-premise.md)),
+but because (1) Dataverse enforces a per-application-user concurrent-request ceiling that only
+spreading traffic across multiple service principals can raise, (2) cloning a new client is
 expensive enough (hundreds of ms to seconds, see [ADR-0002](docs/adr/0002-serial-creation-gate.md))
 that doing it per-request/per-thread is a real bottleneck and, if done in parallel, actively
-counter-productive due to internal lock contention.
+counter-productive due to internal lock contention, and (3) a `ServiceClient` carries per-instance
+mutable state (e.g. `CallerId`) that makes sharing one instance across concurrent callers using
+different identities unsafe, even though the requests themselves can run concurrently.
 
 DataversePool gives you a small, generic async resource pool (`DataversePool.Core`) plus a Dataverse-specific
 adapter (`DataversePool.Dataverse`) and an optional Polly v8 integration (`DataversePool.Polly`) — so you check
@@ -23,9 +28,15 @@ construction/cloning/health yourself.
   sequential) up to 1–3.2s (cold, or under construction-time lock contention) — see
   [ADR-0002](docs/adr/0002-serial-creation-gate-no-parallel-cloning.md). DataversePool serializes all
   creation through a single gate so you get the fast path, not the contention path.
-- **Per-user Dataverse service-protection limits (~52 concurrent requests/user).** Round-robin
-  pooling across multiple application users is the standard way to scale beyond one user's budget
-  — see [`DataversePool.Dataverse`'s group pool](#quickstart-group-pool-multiple-application-users).
+- **Per-user Dataverse service-protection limits (~52 concurrent requests/user).** This is the real,
+  server-side constraint — round-robin pooling across multiple application users is the standard way
+  to scale beyond one user's budget, independent of how a single `ServiceClient` instance behaves
+  under concurrent load — see [`DataversePool.Dataverse`'s group pool](#quickstart-group-pool-multiple-application-users).
+- **`CallerId` (and similar per-instance state) isn't safe to share across concurrent identities.**
+  It's a plain property read at call time, not per-call/thread-local state, so two callers using the
+  same instance with different `CallerId` values concurrently can race. Pooling gives each caller/lease
+  an instance it isn't sharing concurrently with a *different identity* — see
+  [ADR-0023](docs/adr/0023-serviceclient-async-concurrency-corrected-premise.md).
 - **A dead pool member shouldn't take down the group.** The default group-pool strategy is
   health-aware: it circuit-opens a consistently-failing member, retries it after a cooldown, and
   fails open (keeps serving) rather than locking the whole pool out — see
@@ -36,9 +47,9 @@ construction/cloning/health yourself.
 > only `Create`/`Update`/`Delete`/`ImportSolution`/`ExportSolution`/`StageSolution` are eligible for
 > that translation, regardless of the `UseWebApi` connection setting. So a read-heavy caller (e.g.
 > an existence-check/lookup workload doing many `RetrieveMultiple` calls) always goes through the
-> legacy proxy and always contends for that one `ServiceClient`'s single in-flight-request slot —
-> `UseWebApi: true` does nothing for that contention. Pooling is the only lever for concurrency on
-> read-heavy paths, independent of `UseWebApi`.
+> legacy proxy and always contends for the same per-application-user server-side request ceiling —
+> `UseWebApi: true` does nothing for that contention. Round-robin pooling across application users
+> is the only lever for raising that ceiling, independent of `UseWebApi`.
 
 ## Prior art / how this compares
 
@@ -430,6 +441,10 @@ Every non-obvious choice is written up as an ADR in [`docs/adr/`](docs/adr/):
 17. [Group-level throttle retry helper (ExecuteWithThrottleRetryAsync) + capped Retry-After](docs/adr/0017-group-throttle-retry-helper-and-capped-retry-after.md)
 18. [Optional metrics adapter using System.Diagnostics.Metrics observable gauges](docs/adr/0018-metrics-adapter-observable-gauges.md)
 19. [Unify single-user and multi-user pools as DataversePool; wait-when-no-alternative throttle retry](docs/adr/0019-unify-single-and-multi-user-pools-as-dataversepool.md)
+20. [`PooledOrganizationService` - an `IOrganizationServiceAsync2` facade over the pool](docs/adr/0020-pooled-organizationservice-facade.md)
+21. [Base-client factory constructor for `DataverseServiceClientPolicy`/`DataverseUserPool`](docs/adr/0021-base-client-factory-constructor.md)
+22. [Shutdown disposal race, throttle-retry lease leak, probe-claim leak fixes](docs/adr/0022-shutdown-and-probe-claim-leak-fixes.md)
+23. [Corrected premise: a `ServiceClient` does not serialize concurrent async requests](docs/adr/0023-serviceclient-async-concurrency-corrected-premise.md)
 
 ## Status / open items
 
