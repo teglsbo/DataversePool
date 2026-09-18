@@ -12,21 +12,36 @@
     <PackageReference Include="Microsoft.PowerPlatform.Dataverse.Client" Version="1.2.27" />
     <!-- Pin transitive deps pulled in by Dataverse.Client's netstandard-era/WCF
          dependency chains: High-severity advisories at their default resolved
-         versions, fixed here. -->
+         versions, fixed here. Only needed on net8.0 - on net10.0 the shared
+         framework already provides a patched System.Text.RegularExpressions,
+         and pinning it there just produces an unnecessary NU1510 warning. -->
     <PackageReference Include="System.Security.Cryptography.Xml" Version="10.0.12" />
-    <PackageReference Include="System.Text.RegularExpressions" Version="4.3.1" />
+    <PackageReference Include="System.Text.RegularExpressions" Version="4.3.1" Condition="'$(TargetFramework)' == 'net8.0'" />
   </ItemGroup>
 
   <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PackageId>DataversePool.Dataverse</PackageId>
     <Description>Connection pooling for Microsoft.PowerPlatform.Dataverse.Client's ServiceClient: single-user pools and round-robin group pools with dead-member circuit breaking, built on DataversePool.Core.</Description>
+    <!-- NU1510 fires for the net8.0-only System.Text.RegularExpressions pin below once this project
+         multi-targets (it doesn't when net8.0 is the sole TargetFramework) - NuGet's package-pruning
+         analysis evaluates across the combined multi-TFM restore graph rather than strictly per-TFM.
+         The pin is still required on net8.0 (see the comment next to it); suppressed here rather
+         than removed. -->
+    <NoWarn>$(NoWarn);NU1510</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
     <None Include="..\..\README.md" Pack="true" PackagePath="\" Condition="Exists('..\..\README.md')" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Lets ConnectionPool.Dataverse.Tests unit-test LeaseScope directly (the lease-lifecycle
+         primitive PooledOrganizationService is built on) without exposing it as public API - see
+         docs/adr/0020. -->
+    <InternalsVisibleTo Include="ConnectionPool.Dataverse.Tests" />
   </ItemGroup>
 
 </Project>

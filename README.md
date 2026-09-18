@@ -31,6 +31,15 @@ construction/cloning/health yourself.
   fails open (keeps serving) rather than locking the whole pool out — see
   [ADR-0007](docs/adr/0007-race-conditions-timeouts-and-failure-scenarios.md).
 
+> **`UseWebApi` is not a substitute for pooling on read-heavy workloads.** In the current SDK,
+> `RetrieveMultiple` (and reads generally) never route through the Web API/HTTP translation path —
+> only `Create`/`Update`/`Delete`/`ImportSolution`/`ExportSolution`/`StageSolution` are eligible for
+> that translation, regardless of the `UseWebApi` connection setting. So a read-heavy caller (e.g.
+> an existence-check/lookup workload doing many `RetrieveMultiple` calls) always goes through the
+> legacy proxy and always contends for that one `ServiceClient`'s single in-flight-request slot —
+> `UseWebApi: true` does nothing for that contention. Pooling is the only lever for concurrency on
+> read-heavy paths, independent of `UseWebApi`.
+
 ## Prior art / how this compares
 
 A few existing projects address parts of the same problem, but not the full scope of this library:
@@ -322,6 +331,39 @@ services.AddOpenTelemetry().WithMetrics(m => m.AddMeter("DataversePool").AddProm
 Scope is deliberately generic (the `ConnectionPool.Core` `PoolStats` fields only) — Dataverse-specific
 signals like per-member circuit breaker state aren't covered yet. See
 [ADR-0018](docs/adr/0018-metrics-adapter-observable-gauges.md).
+
+## Optional: drop-in `IOrganizationServiceAsync` facade
+
+If your codebase already has code built around a constructor-injected `IOrganizationServiceAsync`/
+`IOrganizationServiceAsync2` — the standard way to consume this SDK — you don't have to rewrite every
+call site to an explicit acquire-lease/use/dispose pattern to adopt pooling. `PooledOrganizationService`
+implements that interface directly on top of a pool: each call acquires a lease, runs the SDK call,
+and releases the lease before returning.
+
+```csharp
+// Before: constructor-injected IOrganizationServiceAsync2, unchanged.
+public class ExistenceChecker
+{
+    private readonly IOrganizationServiceAsync2 _service;
+    public ExistenceChecker(IOrganizationServiceAsync2 service) => _service = service;
+
+    public Task<EntityCollection> FindAsync(QueryBase query, CancellationToken ct) =>
+        _service.RetrieveMultipleAsync(query, ct);
+}
+
+// After: only the DI registration changes.
+services.AddDataverseUserPool("primary", connectionString);
+services.AddDataversePool("primary-pool", new[] { "primary" });
+services.AddSingleton<IOrganizationServiceAsync2>(sp =>
+    new PooledOrganizationService(sp.GetRequiredKeyedService<DataversePool>("primary-pool")));
+services.AddSingleton<ExistenceChecker>();
+```
+
+Exceptions from the underlying `ServiceClient` call propagate unchanged through the facade. It does
+not retry or report throttling back to the pool — use
+[`DataversePool.ExecuteWithThrottleRetryAsync`](#scaling-to-multiple-application-users)
+directly if you need that and can work against `DataverseLease` instead of the plain interface. See
+[ADR-0020](docs/adr/0020-pooled-organizationservice-facade.md).
 
 ## Sample project
 
