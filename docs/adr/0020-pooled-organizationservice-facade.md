@@ -5,7 +5,7 @@ Accepted
 
 ## Context
 External feedback from a real prospective adopter (a high-concurrency Dataverse ingestion pipeline
-doing up to 100,000 sequential `RetrieveMultiple` existence-check round-trips per run, independently
+doing a large volume of sequential `RetrieveMultiple` existence-check round-trips per run, independently
 investigating why raising its own app-level concurrency didn't scale reads) identified a concrete
 integration gap: most existing codebases inject a long-lived, constructor-injected
 `IOrganizationServiceAsync`/`IOrganizationServiceAsync2` - the standard way to consume this SDK.
