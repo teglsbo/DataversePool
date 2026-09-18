@@ -365,6 +365,32 @@ not retry or report throttling back to the pool — use
 directly if you need that and can work against `DataverseLease` instead of the plain interface. See
 [ADR-0020](docs/adr/0020-pooled-organizationservice-facade.md).
 
+> **Cancellation caveat:** a `CancellationToken` passed to `PooledOrganizationService.RetrieveMultipleAsync`
+> (or any read call) only prevents a *new* call from starting — it cannot abort a `RetrieveMultiple`
+> already in flight. This SDK never routes `retrievemultiple` through the WebAPI/HTTP path (see the
+> `UseWebApi` note above), and the legacy WCF/SOAP path it always uses instead does not accept a
+> `CancellationToken` mid-call. If you rely on cancellation-based timeouts around read-heavy
+> workloads, budget for the in-flight call to still complete (or fail on its own) after your token
+> fires.
+
+### Constructing the base client without a connection string
+
+`DataverseServiceClientPolicy`/`DataverseUserPool` also accept a
+`Func<CancellationToken, Task<ServiceClient>>` base-client factory instead of a connection string,
+for authentication that doesn't fit `AuthType=ClientSecret;Url=...;ClientId=...;ClientSecret=...;` —
+for example, an MSAL confidential-client flow or any other custom token-provider callback passed to
+`new ServiceClient(instanceUri, tokenProviderFunction, ...)`. The factory is invoked at most once
+(serialized the same way as the connection-string path); every pooled slot is still produced by
+cloning the resulting base client, never by invoking the factory again.
+
+```csharp
+var pool = new DataverseUserPool("primary", async ct =>
+{
+    var token = await myTokenProvider.GetTokenAsync(ct);
+    return new ServiceClient(instanceUri, _ => Task.FromResult(token), useUniqueInstance: true);
+});
+```
+
 ## Sample project
 
 See [`samples/DataversePool.Sample`](samples/DataversePool.Sample) for a runnable console app demonstrating

@@ -32,7 +32,8 @@ namespace ConnectionPool.Dataverse;
 /// </summary>
 public sealed class DataverseServiceClientPolicy : IPooledResourcePolicy<ServiceClient>, IAsyncDisposable
 {
-    private readonly string _connectionString;
+    private readonly string? _connectionString;
+    private readonly Func<CancellationToken, Task<ServiceClient>>? _baseClientFactory;
     private readonly ILogger? _logger;
     private readonly DataverseClientOptions? _clientOptions;
     private readonly SemaphoreSlim _baseInitGate = new(1, 1);
@@ -48,6 +49,34 @@ public sealed class DataverseServiceClientPolicy : IPooledResourcePolicy<Service
         clientOptions?.Validate();
 
         _connectionString = connectionString;
+        _logger = logger;
+        _clientOptions = clientOptions;
+    }
+
+    /// <summary>
+    /// Constructs the policy from a caller-supplied factory that produces the one authenticated
+    /// "base" <see cref="ServiceClient"/> this policy clones from, instead of a connection string.
+    /// Use this when your authentication doesn't fit the
+    /// <c>AuthType=ClientSecret;Url=...;ClientId=...;ClientSecret=...;</c> connection-string shape
+    /// that the connection-string constructor builds on - for example, an MSAL confidential-client
+    /// flow or any other custom token-provider callback passed to
+    /// <c>new ServiceClient(instanceUri, tokenProviderFunction, ...)</c>.
+    ///
+    /// <para>
+    /// Same guarantees as the connection-string constructor: <paramref name="baseClientFactory"/> is
+    /// invoked at most once (serialized by the same base-init gate as the connection-string path -
+    /// see docs/adr/0002), and every pooled slot is still produced by <see cref="ServiceClient.Clone(ILogger)"/>
+    /// of the resulting base client, never by invoking the factory again. The base client returned
+    /// by the factory must already be ready (<see cref="ServiceClient.IsReady"/>) - this policy does
+    /// not retry or re-authenticate a factory that returns a non-ready client.
+    /// </para>
+    /// </summary>
+    public DataverseServiceClientPolicy(Func<CancellationToken, Task<ServiceClient>> baseClientFactory, ILogger? logger = null, DataverseClientOptions? clientOptions = null)
+    {
+        _baseClientFactory = baseClientFactory ?? throw new ArgumentNullException(nameof(baseClientFactory));
+
+        clientOptions?.Validate();
+
         _logger = logger;
         _clientOptions = clientOptions;
     }
@@ -119,10 +148,12 @@ public sealed class DataverseServiceClientPolicy : IPooledResourcePolicy<Service
             }
 
             _baseClient?.Dispose();
-            _baseClient = new ServiceClient(_connectionString, _logger);
-            if (!_baseClient.IsReady)
+            _baseClient = _baseClientFactory is not null
+                ? await _baseClientFactory(cancellationToken).ConfigureAwait(false)
+                : new ServiceClient(_connectionString, _logger);
+            if (_baseClient is null || !_baseClient.IsReady)
             {
-                var error = _baseClient.LastError;
+                var error = _baseClient?.LastError;
                 throw new InvalidOperationException($"Failed to establish base Dataverse connection: {error}");
             }
 

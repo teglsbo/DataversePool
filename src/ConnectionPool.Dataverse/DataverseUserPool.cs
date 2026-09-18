@@ -25,6 +25,19 @@ public sealed class DataverseUserPool : IAsyncDisposable
         _pool = new ResourcePool<ServiceClient>(_policy, options);
     }
 
+    /// <summary>
+    /// Constructs this member from a caller-supplied base-client factory instead of a connection
+    /// string - see <see cref="DataverseServiceClientPolicy(Func{CancellationToken, Task{ServiceClient}}, ILogger?, DataverseClientOptions?)"/>
+    /// for when to use this (e.g. MSAL/custom token-provider authentication that doesn't fit the
+    /// connection-string constructor).
+    /// </summary>
+    public DataverseUserPool(string name, Func<CancellationToken, Task<ServiceClient>> baseClientFactory, PoolOptions? options = null, ILogger? logger = null, DataverseClientOptions? clientOptions = null)
+    {
+        Name = name;
+        _policy = new DataverseServiceClientPolicy(baseClientFactory, logger, clientOptions);
+        _pool = new ResourcePool<ServiceClient>(_policy, options);
+    }
+
     /// <summary>Sequentially creates the configured prewarm count of connections. See docs/adr/0002.</summary>
     public Task WarmupAsync(CancellationToken cancellationToken = default) => _pool.WarmupAsync(cancellationToken);
 

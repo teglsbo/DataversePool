@@ -4,18 +4,18 @@
 Accepted
 
 ## Context
-External feedback from a real prospective adopter (a high-concurrency Dataverse ingestion pipeline
-doing a large volume of sequential `RetrieveMultiple` existence-check round-trips per run, independently
-investigating why raising its own app-level concurrency didn't scale reads) identified a concrete
-integration gap: most existing codebases inject a long-lived, constructor-injected
+Most existing codebases inject a long-lived, constructor-injected
 `IOrganizationServiceAsync`/`IOrganizationServiceAsync2` - the standard way to consume this SDK.
 Adopting `DataversePool` as written required restructuring every such call site to an explicit
 "acquire a `DataverseLease`, use `lease.Resource`, dispose the lease" pattern per call. For a
 codebase with many existing call sites built against the standard interface, that rewrite is a real
-adoption blocker, not just an inconvenience.
+adoption blocker, not just an inconvenience. A high-concurrency, read-heavy workload (e.g. an
+existence-check/lookup stage doing many sequential `RetrieveMultiple` calls, independently
+investigating why raising its own app-level concurrency didn't scale reads) is exactly the kind of
+caller this rewrite friction would otherwise block from adopting the pool at all.
 
-The same feedback also confirmed (via `Utils.IsRequestValidForTranslationToWebAPI` in the vendored
-SDK) that reads (`RetrieveMultiple`, etc.) never route through the Web API/HTTP path regardless of
+Tracing `Utils.IsRequestValidForTranslationToWebAPI` in the vendored SDK also confirms that reads
+(`RetrieveMultiple`, etc.) never route through the Web API/HTTP path regardless of
 the `UseWebApi` setting - only `Create`/`Update`/`Delete`/`ImportSolution`/`ExportSolution`/
 `StageSolution` are eligible. So for a read-heavy workload, pooling genuinely is the only available
 lever for concurrency; there's no way to work around the single-in-flight-request-per-`ServiceClient`
@@ -76,3 +76,10 @@ constraint via configuration.
   - A genuine end-to-end smoke test (facade wrapping a real pool, against a live Dataverse
     environment) has not been run this session - flagged as an open item, same caveat already
     documented for the group-pool path in ADR-0019/0006.
+- **Cancellation is only "no new call", not "abort in flight"**: since reads never route through the
+  WebAPI/HTTP path (see Context above), a `CancellationToken` passed to `RetrieveMultipleAsync` (or
+  any other read) can prevent a call from *starting* but cannot abort one already in flight on the
+  legacy WCF/SOAP path, which doesn't accept a token mid-call. Documented as a caveat next to the
+  README's facade section so a caller relying on cancellation-based timeouts around read-heavy
+  workloads - this ADR's own motivating scenario - knows this up front rather than discovering it
+  under a stuck timeout.
