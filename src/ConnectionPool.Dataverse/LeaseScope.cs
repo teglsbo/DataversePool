@@ -11,6 +11,16 @@ namespace ConnectionPool.Dataverse;
 /// <see cref="PooledOrganizationService"/> itself is deliberately trivial (one-line delegation per
 /// interface member) precisely so that all of its real risk lives here, in one place that can
 /// actually be tested - see docs/adr/0020.
+///
+/// <para>
+/// <paramref name="onException"/> (accepted by both overloads below) lets a caller observe an
+/// exception from <c>operation</c> against the lease that produced it, without altering
+/// propagation - it always runs before the lease is released, and whatever it does (or throws) has
+/// no bearing on the original exception, which is always what ultimately propagates. This is how
+/// <see cref="PooledOrganizationService"/> reports Dataverse throttling signals back to the pool
+/// (see docs/adr/0020) while keeping this type itself fully generic/Dataverse-agnostic - the
+/// callback is supplied by the caller, not baked in here.
+/// </para>
 /// </summary>
 internal static class LeaseScope
 {
@@ -21,13 +31,19 @@ internal static class LeaseScope
     public static async Task<TResult> RunAsync<TLease, TResult>(
         Func<CancellationToken, Task<TLease>> acquire,
         Func<TLease, Task<TResult>> operation,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action<TLease, Exception>? onException = null)
         where TLease : IAsyncDisposable
     {
         var lease = await acquire(cancellationToken).ConfigureAwait(false);
         try
         {
             return await operation(lease).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            onException?.Invoke(lease, ex);
+            throw;
         }
         finally
         {
@@ -39,13 +55,19 @@ internal static class LeaseScope
     public static async Task RunAsync<TLease>(
         Func<CancellationToken, Task<TLease>> acquire,
         Func<TLease, Task> operation,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action<TLease, Exception>? onException = null)
         where TLease : IAsyncDisposable
     {
         var lease = await acquire(cancellationToken).ConfigureAwait(false);
         try
         {
             await operation(lease).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            onException?.Invoke(lease, ex);
+            throw;
         }
         finally
         {

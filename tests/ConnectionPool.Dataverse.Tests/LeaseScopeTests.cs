@@ -127,4 +127,91 @@ public class LeaseScopeTests
 
         Assert.Equal(cts.Token, observed);
     }
+
+    [Fact]
+    public async Task RunAsync_WithResult_InvokesOnException_WithLeaseAndException_BeforeRelease_AndStillPropagatesSameException()
+    {
+        var lease = new FakeLease();
+        var thrown = new InvalidOperationException("boom");
+        FakeLease? observedLease = null;
+        Exception? observedException = null;
+        var disposeCountWhenObserved = -1;
+
+        var actual = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            LeaseScope.RunAsync<FakeLease, int>(
+                acquire: _ => Task.FromResult(lease),
+                operation: l => throw thrown,
+                cancellationToken: CancellationToken.None,
+                onException: (l, ex) =>
+                {
+                    observedLease = l;
+                    observedException = ex;
+                    disposeCountWhenObserved = l.DisposeCount;
+                }));
+
+        Assert.Same(thrown, actual); // callback has no bearing on what ultimately propagates
+        Assert.Same(lease, observedLease);
+        Assert.Same(thrown, observedException);
+        Assert.Equal(0, disposeCountWhenObserved); // called before the lease is released
+        Assert.Equal(1, lease.DisposeCount); // still released exactly once afterwards
+    }
+
+    [Fact]
+    public async Task RunAsync_WithoutResult_InvokesOnException_WithLeaseAndException_BeforeRelease_AndStillPropagatesSameException()
+    {
+        var lease = new FakeLease();
+        var thrown = new InvalidOperationException("boom");
+        FakeLease? observedLease = null;
+        Exception? observedException = null;
+
+        var actual = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            LeaseScope.RunAsync<FakeLease>(
+                acquire: _ => Task.FromResult(lease),
+                operation: l => throw thrown,
+                cancellationToken: CancellationToken.None,
+                onException: (l, ex) =>
+                {
+                    observedLease = l;
+                    observedException = ex;
+                }));
+
+        Assert.Same(thrown, actual);
+        Assert.Same(lease, observedLease);
+        Assert.Same(thrown, observedException);
+        Assert.Equal(1, lease.DisposeCount);
+    }
+
+    [Fact]
+    public async Task RunAsync_DoesNotInvokeOnException_WhenOperationSucceeds()
+    {
+        var lease = new FakeLease();
+        var invoked = false;
+
+        var result = await LeaseScope.RunAsync<FakeLease, int>(
+            acquire: _ => Task.FromResult(lease),
+            operation: l => Task.FromResult(42),
+            cancellationToken: CancellationToken.None,
+            onException: (l, ex) => invoked = true);
+
+        Assert.Equal(42, result);
+        Assert.False(invoked);
+    }
+
+    [Fact]
+    public async Task RunAsync_DoesNotInvokeOnException_WhenAcquireItselfThrows()
+    {
+        // Nothing was ever acquired, so there is no lease to report against - onException must not
+        // be invoked (it would have no lease to pass).
+        var thrown = new InvalidOperationException("acquire failed");
+        var invoked = false;
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            LeaseScope.RunAsync<FakeLease, int>(
+                acquire: _ => throw thrown,
+                operation: l => Task.FromResult(1),
+                cancellationToken: CancellationToken.None,
+                onException: (l, ex) => invoked = true));
+
+        Assert.False(invoked);
+    }
 }

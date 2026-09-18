@@ -26,6 +26,7 @@ public sealed class FakePolicy : IPooledResourcePolicy<FakeResource>
     public int MaxObservedConcurrentCreations;
     public Func<FakeResource, PoolIncidentInfo?, bool>? HealthOverride;
     public Func<Task>? BeforeCreateDelay;
+    public Func<FakeResource, Task>? BeforeDisposeDelay;
     public bool FailNextCreate;
 
     public async Task<FakeResource> CreateAsync(CancellationToken cancellationToken)
@@ -64,11 +65,15 @@ public sealed class FakePolicy : IPooledResourcePolicy<FakeResource>
         return lastIncident is null;
     }
 
-    public ValueTask DisposeResourceAsync(FakeResource resource)
+    public async ValueTask DisposeResourceAsync(FakeResource resource)
     {
+        if (BeforeDisposeDelay is not null)
+        {
+            await BeforeDisposeDelay(resource).ConfigureAwait(false);
+        }
+
         resource.Disposed = true;
         Interlocked.Increment(ref DisposeCallCount);
-        return ValueTask.CompletedTask;
     }
 
     public void OnReturned(FakeResource resource) => Interlocked.Increment(ref OnReturnedCallCount);

@@ -40,12 +40,21 @@ constraint via configuration.
   implement these against instead, so blocking is the only option for satisfying the interface's
   required synchronous surface. Callers should prefer the `*Async` members directly wherever they
   control the call site.
-- Deliberately **not** included: retry-on-throttle behavior, or reporting throttle signals back to
-  the pool. `DataversePool.ExecuteWithThrottleRetryAsync` (ADR-0017/0019) already covers that, but it
-  needs a `DataverseLease` in hand to report against - exposing that would mean this facade's surface
-  is no longer identical to the plain SDK interface, defeating the point of a drop-in adapter. A
-  caller that wants throttle-aware retry and is willing to give up interface-parity should use
-  `ExecuteWithThrottleRetryAsync` directly instead of this facade.
+- Reports a recognized Dataverse throttling signal (HTTP 429) back to the pool. The acquire/
+  run/release helper (`LeaseScope`) accepts an optional `onException` callback, invoked with the
+  lease and the exception before the lease is released (and with no bearing on what ultimately
+  propagates) - `PooledOrganizationService` supplies `DataverseLease.ReportIfThrottled` as that
+  callback. This keeps `LeaseScope` itself fully generic/Dataverse-agnostic (still directly
+  unit-testable against a fake lease and a fake callback) while giving the facade the same
+  throttle-awareness `DataversePool.ExecuteWithThrottleRetryAsync` (ADR-0017/0019) reports
+  explicitly - so a multi-member `DataversePool` consumed only through this facade still steers
+  future acquires away from a member Dataverse just throttled, instead of plain round-robin
+  distribution with no throttle-awareness at all.
+- Still deliberately **not** included: retry-on-throttle. Reporting a throttle signal so *future*
+  acquires avoid the member is one thing; automatically retrying the *current* call is another -
+  the latter changes this call's own latency/semantics in a way a drop-in interface adapter
+  shouldn't do silently. A caller that wants the current call retried, not just future ones routed
+  elsewhere, should use `ExecuteWithThrottleRetryAsync` directly instead of this facade.
 
 ## Consequences
 - Adopting `DataversePool` for an existing codebase built around constructor-injected
@@ -64,7 +73,10 @@ constraint via configuration.
     released exactly once on success, on the operation throwing, and on the operation being
     canceled; the original exception instance (not just type) propagates unchanged; a failed acquire
     is not swallowed or retried; the `CancellationToken` passed to the facade is the same instance
-    observed by `acquire`.
+    observed by `acquire`; the optional `onException` callback is invoked with the lease and the
+    exception exactly once when the operation throws (before the lease is released), never invoked
+    on success or on an acquire-level failure, and has no bearing on the exception that ultimately
+    propagates.
   - `PooledOrganizationService`'s wiring: both constructors reject `null`; calling any interface
     member against a pool backed by an invalid ("dummy") connection string throws (proving the
     facade genuinely attempts an acquire rather than being a no-op, and that whatever

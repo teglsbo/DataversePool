@@ -109,4 +109,52 @@ public class LeastConnectionsSlotSelectionStrategyTests
 
         Assert.All(selections, name => Assert.Equal("healthy-busy", name));
     }
+
+    [Fact]
+    public void SelectNext_AbandonsUnselectedProbeClaims_SoTheyAreNotBlockedUntilTimeout()
+    {
+        // Regression test: IsEligible is called once per half-open candidate scanned during
+        // selection, and previously only the ultimately-selected candidate's claim was ever
+        // completed/abandoned via ReportAcquireOutcome/ReportAcquireAbandoned - any other half-open
+        // candidate that also won a probe claim but wasn't picked leaked its claim until
+        // probeClaimTimeout expired, incorrectly blocking it from a fresh probe even though nothing
+        // was actually in flight for it. Fixed by abandoning every non-selected candidate's claim
+        // immediately after picking the winner. See docs/adr/0022.
+        var members = new[]
+        {
+            new DataverseUserPool("half-open-a", "dummy-a"),
+            new DataverseUserPool("half-open-b", "dummy-b"),
+            new DataverseUserPool("half-open-c", "dummy-c"),
+        };
+        var breaker = new MemberCircuitBreaker(
+            failureThreshold: 2, cooldownPeriod: TimeSpan.FromMilliseconds(50), probeClaimTimeout: TimeSpan.FromMinutes(5));
+        var strategy = new LeastConnectionsSlotSelectionStrategy(breaker);
+        var stats = new[] { Stats(leasedCount: 0, consecutiveFailures: 5), Stats(leasedCount: 0, consecutiveFailures: 5), Stats(leasedCount: 0, consecutiveFailures: 5) };
+
+        // First pass: opens all three circuits (not yet eligible - just opened this round).
+        strategy.SelectNext(members, stats);
+        Thread.Sleep(100); // exceed cooldown - all three are now half-open/eligible, tied on load
+
+        // Second pass: all three are eligible and each wins its own probe claim inside IsEligible,
+        // but only one is ultimately selected.
+        var selection = strategy.SelectNext(members, stats);
+        var now = DateTimeOffset.UtcNow;
+
+        foreach (var member in members)
+        {
+            var stillEligible = breaker.IsEligible(member, Stats(leasedCount: 0, consecutiveFailures: 5), now);
+            if (member == selection.Member)
+            {
+                // The winner's claim is real and still held - a fresh probe must not be handed
+                // out for the same member while its outcome is unresolved.
+                Assert.False(stillEligible);
+            }
+            else
+            {
+                // Every non-selected half-open candidate must have had its claim abandoned, so a
+                // fresh probe is immediately available again - not blocked for probeClaimTimeout.
+                Assert.True(stillEligible, $"{member.Name} should not still be holding a leaked probe claim.");
+            }
+        }
+    }
 }

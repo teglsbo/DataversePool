@@ -206,17 +206,19 @@ public sealed class DataversePool : IAsyncDisposable
         {
             var lease = await AcquireAsync(cancellationToken).ConfigureAwait(false);
 
-            // No better option was available than the very member we just reported as throttled -
-            // wait out the capped window before trying again instead of instantly re-hitting the
-            // same still-over-budget connection. See the method's <remarks> above.
-            if (previouslyThrottledMember is not null && ReferenceEquals(lease.Member, previouslyThrottledMember))
-            {
-                await Task.Delay(previousRetryAfter, cancellationToken).ConfigureAwait(false);
-            }
-
             TimeSpan retryAfter;
             try
             {
+                // No better option was available than the very member we just reported as throttled -
+                // wait out the capped window before trying again instead of instantly re-hitting the
+                // same still-over-budget connection. See the method's <remarks> above. Deliberately
+                // inside this try/finally (not before it) - if this delay itself is canceled, the
+                // lease must still be disposed rather than leaked. See docs/adr/0022.
+                if (previouslyThrottledMember is not null && ReferenceEquals(lease.Member, previouslyThrottledMember))
+                {
+                    await Task.Delay(previousRetryAfter, cancellationToken).ConfigureAwait(false);
+                }
+
                 return await operation(lease.Resource, cancellationToken).ConfigureAwait(false);
             }
             // ReportIfThrottled always runs (left side of && is unconditionally evaluated first), so

@@ -93,6 +93,20 @@ public sealed class LeastConnectionsSlotSelectionStrategy : ISlotSelectionStrate
 
         var next = Interlocked.Increment(ref _cursor);
         var (index, tiedPos) = tied[(int)((uint)next % (uint)tied.Count)];
+
+        // Any OTHER half-open candidate scanned above (claimGenerations[i] not null) but not the
+        // one selected this round won a real probe claim from IsEligible - without releasing it,
+        // that member stays blocked from a fresh probe until probeClaimTimeout expires, even though
+        // no attempt is actually in flight for it. Release those unused claims immediately instead
+        // of leaking them. See docs/adr/0022.
+        for (var i = 0; i < eligible.Count; i++)
+        {
+            if (i != tiedPos && claimGenerations[i] is { } unusedClaim)
+            {
+                _breaker.AbandonProbe(members[eligible[i]], unusedClaim);
+            }
+        }
+
         return new SlotSelection(members[index], AllMembersUnavailable: false, claimGenerations[tiedPos]);
     }
 

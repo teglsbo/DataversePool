@@ -164,6 +164,16 @@ public sealed partial class ResourcePool<T> : IAsyncDisposable where T : notnull
 
             try
             {
+                // A concurrent DisposeAsync may have started (and can even transiently release
+                // capacity permits back to _capacityGate while shutting down, see DisposeAsync)
+                // after this acquire already passed the entry ThrowIfDisposed() check above. Re-check
+                // immediately after winning a permit so such a caller fails cleanly instead of being
+                // handed a resource out of a pool that is mid-teardown. See docs/adr/0022.
+                if (Volatile.Read(ref _poolDisposed) == 1)
+                {
+                    throw new ObjectDisposedException(nameof(ResourcePool<T>));
+                }
+
                 Slot<T> slot;
                 while (true)
                 {
@@ -383,14 +393,17 @@ public sealed partial class ResourcePool<T> : IAsyncDisposable where T : notnull
             }
         }
 
-        for (var i = 0; i < acquiredPermits; i++)
-        {
-            _capacityGate.Release();
-        }
-
+        // Drain _idle while still holding every permit collected above, so a concurrent
+        // AcquireAsync cannot win one of these permits (once released, below) and pop/create a
+        // slot while this loop is in the middle of disposing idle resources. See docs/adr/0022.
         while (_idle.TryPop(out var slot))
         {
             await SafeDisposeAsync(slot.Resource).ConfigureAwait(false);
+        }
+
+        for (var i = 0; i < acquiredPermits; i++)
+        {
+            _capacityGate.Release();
         }
 
         List<IObserver<SlotHealthChanged>> observersSnapshot;

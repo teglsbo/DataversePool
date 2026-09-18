@@ -17,14 +17,16 @@ namespace ConnectionPool.Dataverse;
 /// docs/adr/0020.
 ///
 /// <para>
-/// This is a convenience bridge, not a replacement for the pool API: it does not retry, and does not
-/// detect/report Dataverse throttling back to the pool (see
-/// <see cref="DataversePool.ExecuteWithThrottleRetryAsync{T}"/> for that, which needs a
-/// <see cref="DataverseLease"/> in hand to report against - something this facade deliberately does
-/// not expose, to keep its surface identical to the plain SDK interface). Exceptions from the
-/// underlying <see cref="ServiceClient"/> call propagate completely unchanged (same type, same
-/// stack) - a caller catching e.g. a fault exception around a call today keeps working exactly the
-/// same through this facade.
+/// This is a convenience bridge, not a replacement for the full pool API: it does not retry a
+/// throttled call. It does, however, report a recognized Dataverse throttling signal (HTTP 429)
+/// back to whichever member served the failing call, via the same
+/// <see cref="DataverseLease.ReportIfThrottled"/> mechanism <see cref="DataversePool.ExecuteWithThrottleRetryAsync{T}"/>
+/// uses - so a multi-member <see cref="DataversePool"/> consumed only through this facade still
+/// steers future acquires away from a member that Dataverse just throttled, not just plain
+/// round-robin distribution with no throttle-awareness. Exceptions from the underlying
+/// <see cref="ServiceClient"/> call always propagate completely unchanged (same type, same stack) -
+/// this reporting is a side effect observed on the way out, never something that alters or
+/// suppresses what the caller sees. See docs/adr/0020.
 /// </para>
 ///
 /// <para>
@@ -59,10 +61,15 @@ public sealed class PooledOrganizationService : IOrganizationServiceAsync2
     }
 
     private Task<TResult> RunAsync<TResult>(Func<ServiceClient, Task<TResult>> operation, CancellationToken cancellationToken) =>
-        LeaseScope.RunAsync(_acquireLease, lease => operation(lease.Resource), cancellationToken);
+        LeaseScope.RunAsync(_acquireLease, lease => operation(lease.Resource), cancellationToken, ReportIfThrottled);
 
     private Task RunAsync(Func<ServiceClient, Task> operation, CancellationToken cancellationToken) =>
-        LeaseScope.RunAsync(_acquireLease, lease => operation(lease.Resource), cancellationToken);
+        LeaseScope.RunAsync(_acquireLease, lease => operation(lease.Resource), cancellationToken, ReportIfThrottled);
+
+    // Best-effort: DataverseThrottleDetector only recognizes a specific Dataverse 429 shape, so this
+    // is a no-op for any other exception (including a plain OperationCanceledException from a
+    // caller-supplied token). See docs/adr/0020.
+    private static void ReportIfThrottled(DataverseLease lease, Exception exception) => lease.ReportIfThrottled(exception);
 
     // ----- IOrganizationServiceAsync2 (cancellable) -----
 

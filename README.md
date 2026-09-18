@@ -360,10 +360,12 @@ services.AddSingleton<ExistenceChecker>();
 ```
 
 Exceptions from the underlying `ServiceClient` call propagate unchanged through the facade. It does
-not retry or report throttling back to the pool — use
+report a recognized Dataverse throttling signal (HTTP 429) back to whichever member served the
+failing call, so a multi-member `DataversePool` used only through this facade still steers future
+acquires away from a member Dataverse just throttled — but it does not retry the current call. Use
 [`DataversePool.ExecuteWithThrottleRetryAsync`](#scaling-to-multiple-application-users)
-directly if you need that and can work against `DataverseLease` instead of the plain interface. See
-[ADR-0020](docs/adr/0020-pooled-organizationservice-facade.md).
+directly if you need the current call retried too, working against `DataverseLease` instead of the
+plain interface. See [ADR-0020](docs/adr/0020-pooled-organizationservice-facade.md).
 
 > **Cancellation caveat:** a `CancellationToken` passed to `PooledOrganizationService.RetrieveMultipleAsync`
 > (or any read call) only prevents a *new* call from starting — it cannot abort a `RetrieveMultiple`

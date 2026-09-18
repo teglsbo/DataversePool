@@ -1,6 +1,6 @@
 # TODO — DataversePool (Dataverse Connection Pooling)
 
-Last updated: 2026-09-14 (ADR-0015: complexity review — no code duplication/dead knobs found, split ResourcePool.cs into ResourcePool.cs + ResourcePool.Recycling.cs for readability, no behavior change; paused further blanket "fix everything" review rounds)
+Last updated: 2026-09-14 (ADR-0022: four concurrency leak/race fixes — disposal race, canceled-retry lease leak, probe-claim leak in both slot-selection strategies, non-ready base-client leak)
 
 ## Name: DataversePool (renamed from XrmPool)
 
@@ -215,6 +215,12 @@ docs/adr/                              # architecture decisions, see ADR-0001..0
 - [x] Two more fixes rounding out the facade/auth story:
   - **`DataverseServiceClientPolicy`/`DataverseUserPool` base-client factory constructor** — accepts `Func<CancellationToken, Task<ServiceClient>>` as an alternative to a connection string, for callers whose authentication (e.g. MSAL/custom token-provider callbacks) doesn't fit the `AuthType=ClientSecret;...` connection-string shape — see ADR-0021.
   - README/ADR-0020 clarified that a `CancellationToken` passed to `PooledOrganizationService`'s read methods (`RetrieveMultipleAsync` etc.) only prevents a *new* call from starting, not aborting one already in flight — reads never route through the WebAPI/HTTP path, and the legacy WCF/SOAP path they always use doesn't accept a token mid-call.
+- [x] Four concurrency leak/race fixes found during a closer review of the shutdown, throttle-retry, and probe-selection paths — see ADR-0022:
+  - `ResourcePool<T>.DisposeAsync` could transiently hand a concurrent `AcquireAsync` caller a resource (or a fresh slot) out of a pool that was still mid-teardown — fixed by draining `_idle` before releasing collected permits, plus a second disposed-state check right after `AcquireAsync` wins a permit.
+  - `DataversePool.ExecuteWithThrottleRetryAsync` leaked a lease if the same-member retry-wait was canceled — fixed by moving that wait inside the existing try/finally.
+  - Both `HealthAwareRoundRobinSlotSelectionStrategy` and `LeastConnectionsSlotSelectionStrategy` leaked half-open probe claims for every eligible-but-not-selected candidate in a selection round — fixed by abandoning each unused claim immediately.
+  - `DataverseServiceClientPolicy.GetOrCreateBaseClientAsync` left a non-ready (but non-null) base client stored in `_baseClient` before throwing — fixed to dispose and clear it first.
+- [x] `PooledOrganizationService` never reported Dataverse throttling signals back to the pool — so a multi-member `DataversePool` used only through the facade only ever got blind rotation across members with no way to route around one Dataverse just capped. Fixed: `LeaseScope` now accepts an optional `onException` callback (invoked with the lease and exception before release, with no bearing on what propagates — kept fully generic/testable), and `PooledOrganizationService` supplies `DataverseLease.ReportIfThrottled` as that callback. Retry-on-throttle for the current call is still out of scope for the facade (unchanged) — see ADR-0020.
 
 ## Test strategy (brief, see the full design discussion in the session)
 
