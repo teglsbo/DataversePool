@@ -38,7 +38,7 @@ construction/cloning/health yourself.
   an instance it isn't sharing concurrently with a *different identity* — see
   [ADR-0023](docs/adr/0023-serviceclient-async-concurrency-corrected-premise.md).
 - **A dead pool member shouldn't take down the group.** The default group-pool strategy is
-  health-aware: it circuit-opens a consistently-failing member, retries it after a cooldown, and
+  health-aware: It circuit-opens a consistently-failing member, retries it after a cooldown, and
   fails open (keeps serving) rather than locking the whole pool out — see
   [ADR-0007](docs/adr/0007-race-conditions-timeouts-and-failure-scenarios.md).
 
@@ -56,7 +56,7 @@ construction/cloning/health yourself.
 A few existing projects address parts of the same problem, but not the full scope of this library:
 
 - **[PooledServiceClientFactory](https://github.com/zhufamily/PooledServiceClientFactory)** — an
-  existing open-source `ServiceClient` pool: configurable capacity, auto-scale-down, and avoids the
+  existing open-source `ServiceClient` pool: Configurable capacity, auto-scale-down, and avoids the
   socket-exhaustion/thread-safety issues of constructing a `ServiceClient` per request. It pools a
   single connection string (comparable to this library's `DataverseUserPool`) but does not do
   cross-service-principal round-robin/load-balancing, and has no circuit breaker or
@@ -82,7 +82,7 @@ alternatives above.
 | `DataversePool.Polly` | Wires Polly v8 retry/circuit-breaker outcomes to a lease's health signal. | `DataversePool.Core`, `Polly.Core` (optional — not required by the other two packages) |
 | `DataversePool.Metrics` | Publishes pool health as `System.Diagnostics.Metrics` observable gauges (OpenTelemetry-compatible). | `DataversePool.Core` (optional — no metrics backend dependency) |
 
-## Quickstart: one user (start here)
+## Quickstart: One user (start here)
 
 Even with a single Dataverse application user today, construct a `DataversePool` (not
 `DataverseUserPool` directly) if there's any chance you'll add more users later — going from one
@@ -112,7 +112,7 @@ await using (var lease = await pool.AcquireAsync())
 
 > **`EnableAffinityCookie` is forced to `false` automatically.** Dataverse's server affinity cookie
 > (on by default) pins all requests from one `ServiceClient` to a single backend node - good for a
-> single interactive session, but counter-productive here: a pool exists specifically to spread
+> single interactive session, but counter-productive here: A pool exists specifically to spread
 > concurrent requests out, and pinning every pooled resource's traffic to one node just recreates a
 > single-node bottleneck server-side. `DataverseServiceClientPolicy` sets this to `false` in code on
 > every client it creates (base and clones), regardless of what your connection string says, so you
@@ -150,7 +150,7 @@ want to hand-roll retry logic yourself.
 
 Use this when one application (service principal) user's ~52-concurrent-request budget isn't
 enough — register several application users and let the *same* `DataversePool` type round-robin
-across them. This is the one behavior change from the single-user quickstart above: more members
+across them. This is the one behavior change from the single-user quickstart above: More members
 passed to the same constructor, nothing else in your code changes.
 
 ```csharp
@@ -233,14 +233,14 @@ needs.
 > [ADR-0017](docs/adr/0017-group-throttle-retry-helper-and-capped-retry-after.md).
 
 Why 429/exception-based rather than proactively reading Dataverse's `x-ms-ratelimit-*` response
-headers on every call: headers are the theoretically better (leading, not lagging) signal, but
+headers on every call: Headers are the theoretically better (leading, not lagging) signal, but
 `ServiceClient` doesn't surface response headers for *successful* calls anywhere in its public API
 — only on failure, via `HttpOperationException.Response`. See
 [ADR-0008](docs/adr/0008-throttle-detection-429-not-headers.md) for the full reasoning and its
 limits (this only reports throttling that a caller both hits *and* explicitly reports back — the
 pool cannot infer it on its own).
 
-**Circuit breaking: real single-probe half-open.** Both strategies delegate open/half-open/closed
+**Circuit breaking: Real single-probe half-open.** Both strategies delegate open/half-open/closed
 bookkeeping to a shared `MemberCircuitBreaker`. When a member's cooldown expires, only a *single*
 concurrent caller wins the half-open "probe" slot — everyone else stays routed to other members
 until that probe's outcome is observable, instead of every waiting caller piling onto the
@@ -314,7 +314,7 @@ Any `OnRetry`/`OnOpened` callback you already had on `RetryStrategyOptions`/`Cir
 keeps firing — `AddRetryWithPoolHealthSignal`/`AddCircuitBreakerWithPoolHealthSignal` only adds the
 `lease.MarkUnhealthy(...)` call, it doesn't replace your callback.
 
-## Optional: metrics (OpenTelemetry-compatible)
+## Optional: Metrics (OpenTelemetry-compatible)
 
 `DataversePool.Core` has no dependency on any metrics library. If you want pool health published as
 standard `System.Diagnostics.Metrics` instruments — consumable by any OpenTelemetry exporter
@@ -323,7 +323,7 @@ standard `System.Diagnostics.Metrics` instruments — consumable by any OpenTele
 ```csharp
 using ConnectionPool.Metrics;
 
-using var metrics = pool.AddMetrics("my-pool"); // pool: a ResourcePool<T>
+using var metrics = pool.AddMetrics("my-pool"); // Pool: a ResourcePool<T>
 // or, for DataverseUserPool/DataversePool (no direct ResourcePool<T> access):
 using var metrics = new PoolMetrics("my-pool", pool.GetStats);
 ```
@@ -343,16 +343,16 @@ Scope is deliberately generic (the `ConnectionPool.Core` `PoolStats` fields only
 signals like per-member circuit breaker state aren't covered yet. See
 [ADR-0018](docs/adr/0018-metrics-adapter-observable-gauges.md).
 
-## Optional: drop-in `IOrganizationServiceAsync` facade
+## Optional: Drop-in `IOrganizationServiceAsync` facade
 
 If your codebase already has code built around a constructor-injected `IOrganizationServiceAsync`/
 `IOrganizationServiceAsync2` — the standard way to consume this SDK — you don't have to rewrite every
 call site to an explicit acquire-lease/use/dispose pattern to adopt pooling. `PooledOrganizationService`
-implements that interface directly on top of a pool: each call acquires a lease, runs the SDK call,
+implements that interface directly on top of a pool: Each call acquires a lease, runs the SDK call,
 and releases the lease before returning.
 
 ```csharp
-// Before: constructor-injected IOrganizationServiceAsync2, unchanged.
+// Before: Constructor-injected IOrganizationServiceAsync2, unchanged.
 public class ExistenceChecker
 {
     private readonly IOrganizationServiceAsync2 _service;
@@ -362,7 +362,7 @@ public class ExistenceChecker
         _service.RetrieveMultipleAsync(query, ct);
 }
 
-// After: only the DI registration changes.
+// After: Only the DI registration changes.
 services.AddDataverseUserPool("primary", connectionString);
 services.AddDataversePool("primary-pool", new[] { "primary" });
 services.AddSingleton<IOrganizationServiceAsync2>(sp =>
@@ -427,8 +427,8 @@ Every non-obvious choice is written up as an ADR in [`docs/adr/`](docs/adr/):
 3. [Lease isolation is a dispose contract, not runtime-enforced](docs/adr/0003-lease-isolation-contract-not-enforced-runtime.md)
 4. [No synchronous checkout validation — signal-based health instead](docs/adr/0004-no-checkout-validation-lazy-health-signal-instead.md)
 5. [Polly as an optional adapter](docs/adr/0005-polly-as-optional-adapter-not-core-dependency.md)
-6. [Dual pooling model: single-user + round-robin group](docs/adr/0006-dual-pooling-model-single-user-and-round-robin-group.md)
-7. [Hardening: races, timeouts, dead group members](docs/adr/0007-race-conditions-timeouts-and-failure-scenarios.md)
+6. [Dual pooling model: Single-user + round-robin group](docs/adr/0006-dual-pooling-model-single-user-and-round-robin-group.md)
+7. [Hardening: Races, timeouts, dead group members](docs/adr/0007-race-conditions-timeouts-and-failure-scenarios.md)
 8. [Throttle detection: 429/exception, not proactive headers](docs/adr/0008-throttle-detection-429-not-headers.md)
 9. [Return-scrubbing hook (CallerId leak fix) + documented single-process constraint](docs/adr/0009-return-scrubbing-hook-caller-id-leak.md)
 10. [Configurable fail-fast (not just fail-open) + real single-probe half-open circuit breaker](docs/adr/0010-configurable-fail-fast-and-single-probe-half-open.md)
@@ -444,7 +444,7 @@ Every non-obvious choice is written up as an ADR in [`docs/adr/`](docs/adr/):
 20. [`PooledOrganizationService` - an `IOrganizationServiceAsync2` facade over the pool](docs/adr/0020-pooled-organizationservice-facade.md)
 21. [Base-client factory constructor for `DataverseServiceClientPolicy`/`DataverseUserPool`](docs/adr/0021-base-client-factory-constructor.md)
 22. [Shutdown disposal race, throttle-retry lease leak, probe-claim leak fixes](docs/adr/0022-shutdown-and-probe-claim-leak-fixes.md)
-23. [Corrected premise: a `ServiceClient` does not serialize concurrent async requests](docs/adr/0023-serviceclient-async-concurrency-corrected-premise.md)
+23. [Corrected premise: A `ServiceClient` does not serialize concurrent async requests](docs/adr/0023-serviceclient-async-concurrency-corrected-premise.md)
 
 ## Status / open items
 
@@ -452,7 +452,7 @@ See [`TODO.md`](TODO.md) — in particular, the "Open questions" section lists c
 believed true (e.g. socket exhaustion on new-per-request usage, `CallerId` cross-thread races) but
 have **not** been directly verified by this project's own tests.
 
-> ⚠️ **Production constraint: single process per service-principal set.** All pool, throttle, and
+> ⚠️ **Production constraint: Single process per service-principal set.** All pool, throttle, and
 > circuit-breaker state lives in-process memory only — it is **not** coordinated across multiple
 > instances of your application (e.g. multiple Kubernetes pods) sharing the same
 > `DataversePool` service principals. Running more than one instance against the same
