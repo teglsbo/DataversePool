@@ -4,3 +4,6 @@ obj/
 *.user
 .env
 .env.*
+*.swp
+*.swo
+*~

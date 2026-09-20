@@ -62,9 +62,10 @@ plaintext during this session). Result:
 
 This confirms the entire chain — connection-string parsing, warmup/clone, lease hand-out, the
 `IPooledResourcePolicy<T>` integration — genuinely works against a live Dataverse instance, not
-just against fakes/mocks. The group pool (round-robin across multiple app users) has **not** been
-tried live yet, since only one app user's credentials were available (requires
-`DATAVERSEPOOL_SAMPLE_CONNECTION_STRING_2`/`_3` for an additional service principal).
+just against fakes/mocks. **Update**: the group pool (round-robin across multiple app users) has
+now also been tried live — a second real Entra app registration + Dataverse application user was
+created specifically for this, see `LiveDataversePoolMultiUserTests` and the "Open questions"
+section below.
 
 ## Polly adapter (ConnectionPool.Dataverse.Polly) — done
 
@@ -104,8 +105,18 @@ in the entire Dataverse SDK for plain Polly users).
       question from this one.
 - [ ] Background sweep for MaxIdleLifetime (today only lazy-at-checkout) — deferred to v2 if needed.
 - [x] ~~Run the actual live Dataverse smoke test~~ — run and confirmed against a real org (see above).
-- [ ] Run the group-pool (round-robin) smoke test live with 2+ app users (requires an additional
-      service principal beyond the one used for the single-user test).
+- [x] Run the group-pool (round-robin) smoke test live with 2+ app users — a second Entra app
+      registration + Dataverse application user was created for this. Confirmed via
+      `LiveDataversePoolMultiUserTests`: (1) round-robin split exactly 10/10 across 20 acquires
+      between two genuinely distinct authenticated identities; (2) 8 concurrent acquires dispatched
+      4/4 across both members simultaneously, confirming the pool can fan out across members
+      concurrently — the actual mechanism the "raises the concurrency ceiling" claim depends on
+      (this does not, and safely cannot, drive load high enough to hit the real per-user
+      service-protection limit itself). Also measured while setting this up:
+      `LiveImpersonationOverheadTests` found `CallerAADObjectId` impersonation adds negligible
+      per-call latency (+3.6ms/call, 1.07x baseline, on an apples-to-apples `RetrieveMultiple`
+      comparison) — impersonation's real cost is correctness/operational (shared mutable state,
+      see above), not throughput.
 - [x] Consider an integration-test project (opt-in, against a real Dataverse instance) — implemented
       as `LiveServiceClientConcurrencyTests` in the existing `ConnectionPool.Dataverse.Tests` project
       rather than a separate project (simpler, still excluded from CI via `Category!=Integration`).
