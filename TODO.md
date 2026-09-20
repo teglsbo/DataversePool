@@ -117,6 +117,16 @@ in the entire Dataverse SDK for plain Polly users).
       per-call latency (+3.6ms/call, 1.07x baseline, on an apples-to-apples `RetrieveMultiple`
       comparison) — impersonation's real cost is correctness/operational (shared mutable state,
       see above), not throughput.
+- [x] Verify all three `ISlotSelectionStrategy` implementations against real members (previously
+      only ever exercised against fakes) — `LiveDataversePoolStrategyTests`: (1) plain
+      `RoundRobinSlotSelectionStrategy` strictly alternates between two real members even when one
+      already holds an extra outstanding lease, confirming it genuinely ignores load; (2)
+      `LeastConnectionsSlotSelectionStrategy` routed all 4 new acquires to the less-loaded member
+      while the other held an extra lease, confirming it genuinely steers by `LeasedCount`; (3)
+      `HealthAwareRoundRobinSlotSelectionStrategy` given one real, genuinely-broken member (valid
+      connection string, deliberately invalid client secret) failed exactly `failureThreshold`
+      (2) times then stopped selecting it entirely — every one of 8 logical calls eventually
+      succeeded via the healthy member with zero further failures once the circuit opened.
 - [x] Consider an integration-test project (opt-in, against a real Dataverse instance) — implemented
       as `LiveServiceClientConcurrencyTests` in the existing `ConnectionPool.Dataverse.Tests` project
       rather than a separate project (simpler, still excluded from CI via `Category!=Integration`).
