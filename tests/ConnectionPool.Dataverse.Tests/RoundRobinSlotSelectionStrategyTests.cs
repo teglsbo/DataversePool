@@ -37,4 +37,32 @@ public class RoundRobinSlotSelectionStrategyTests
         Assert.Throws<InvalidOperationException>(
             () => strategy.SelectNext(Array.Empty<DataverseUserPool>(), Array.Empty<ConnectionPool.Core.PoolStats>()));
     }
+
+    /// <summary>
+    /// Unlike <see cref="LeastConnectionsSlotSelectionStrategy"/> and
+    /// <see cref="HealthAwareRoundRobinSlotSelectionStrategy"/>, plain round-robin has no concept of
+    /// a Dataverse throttle report at all (see docs/adr/0008) - it keeps cycling through every
+    /// member strictly in order, including one that was just reported throttled. This is the
+    /// documented trade-off: round-robin will keep sending 1/N of new traffic to a member that is
+    /// currently over its own Dataverse request budget.
+    /// </summary>
+    [Fact]
+    public void SelectNext_KeepsSelectingAThrottledMember_UnlikeThrottleAwareStrategies()
+    {
+        var members = new[]
+        {
+            new DataverseUserPool("user-a", "dummy-connection-a"),
+            new DataverseUserPool("user-b", "dummy-connection-b"),
+        };
+        members[0].ReportThrottled(TimeSpan.FromMinutes(5));
+
+        var stats = members.Select(m => m.GetStats()).ToArray();
+        var strategy = new RoundRobinSlotSelectionStrategy();
+
+        var selections = Enumerable.Range(0, 4)
+            .Select(_ => strategy.SelectNext(members, stats).Member.Name)
+            .ToArray();
+
+        Assert.Equal(new[] { "user-a", "user-b", "user-a", "user-b" }, selections);
+    }
 }

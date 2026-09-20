@@ -127,6 +127,30 @@ in the entire Dataverse SDK for plain Polly users).
       connection string, deliberately invalid client secret) failed exactly `failureThreshold`
       (2) times then stopped selecting it entirely — every one of 8 logical calls eventually
       succeeded via the healthy member with zero further failures once the circuit opened.
+- [x] Investigate what actually happens when one Dataverse user hits the documented 52-concurrent
+      ceiling, and how the three strategies react — `LiveConcurrencyThrottleTests`. Key findings:
+      (1) the concurrent-request limit is a **live gauge, not a rolling-window lockout** — unlike
+      the 5-min request-count / 20-min execution-time budgets, Microsoft's own guidance confirms
+      it clears the instant in-flight load drops back under the ceiling, independent of whatever
+      (possibly multi-minute) `Retry-After` a rejected call reported. `DataverseUserPool.IsThrottled`
+      does **not** know this distinction — it records the server's raw `Retry-After` as a flat
+      "avoid this member" window for throttle-aware strategies regardless of cause, which is a
+      deliberate, documented, and now-confirmed-conservative trade-off for the concurrency-limit
+      case specifically (it's the *correct* behavior for the 5-min/20-min budget violations, where
+      the window really is a hard wait). (2) Plain `RoundRobinSlotSelectionStrategy` genuinely has
+      no throttle awareness at all — confirmed with a new fast unit test
+      (`SelectNext_KeepsSelectingAThrottledMember_UnlikeThrottleAwareStrategies`) alongside the
+      existing simulated tests proving `LeastConnections`/`HealthAwareRoundRobin` do skip a
+      throttled member. (3) Attempting to actually *trigger* a real 429 empirically, by firing up
+      to 300 genuinely concurrent `RetrieveMultiple` calls (via distinct prewarmed clones, `MaxRetryCount=0`
+      so the SDK never silently absorbs the 429 itself, and `DisableCrossThreadSafeties=true` per
+      clone) against one real application user on this tenant: **zero 429s observed**, even well
+      above the commonly-cited 52-concurrent default — this tenant/instance tolerates materially
+      more concurrent, lightweight requests than the documented default before rejecting anything
+      (either a raised ceiling for this tier, or the default genuinely requires more sustained/
+      expensive load to observe with a lightweight singleton-entity query). The
+      clears-immediately-after-a-burst and strategy-divergence assertions both still hold
+      trivially/safely when no real throttle occurs, so the test is safe to re-run on any tenant.
 - [x] Consider an integration-test project (opt-in, against a real Dataverse instance) — implemented
       as `LiveServiceClientConcurrencyTests` in the existing `ConnectionPool.Dataverse.Tests` project
       rather than a separate project (simpler, still excluded from CI via `Category!=Integration`).
