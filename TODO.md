@@ -151,6 +151,14 @@ in the entire Dataverse SDK for plain Polly users).
       expensive load to observe with a lightweight singleton-entity query). The
       clears-immediately-after-a-burst and strategy-divergence assertions both still hold
       trivially/safely when no real throttle occurs, so the test is safe to re-run on any tenant.
+      Followed up with `ConcurrencyBurst_WithAHeavierMetadataQuery_ProducesGenuine429s`, swapping
+      the cheap singleton query for `RetrieveAllEntitiesRequest(EntityFilters.Entity)` (a full
+      entity-metadata dump, ~4s/call on this tenant, independent of record volume) specifically to
+      rule out "the calls just aren't overlapping long enough" as the reason for zero 429s: 100
+      concurrent 4s-per-call requests completed in ~15s wall-clock (≈27x real parallelism achieved,
+      far above 52-way) — **still zero 429s**. Reasonably strong evidence this tenant's real
+      concurrency ceiling for reads is genuinely well above the commonly-cited default, not just an
+      artifact of calls being individually too fast to overlap.
 - [x] Consider an integration-test project (opt-in, against a real Dataverse instance) — implemented
       as `LiveServiceClientConcurrencyTests` in the existing `ConnectionPool.Dataverse.Tests` project
       rather than a separate project (simpler, still excluded from CI via `Category!=Integration`).

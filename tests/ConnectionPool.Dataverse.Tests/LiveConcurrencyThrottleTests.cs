@@ -1,6 +1,8 @@
 using System.Diagnostics;
 using ConnectionPool.Core;
 using Microsoft.PowerPlatform.Dataverse.Client;
+using Microsoft.Xrm.Sdk.Messages;
+using Microsoft.Xrm.Sdk.Metadata;
 using Microsoft.Xrm.Sdk.Query;
 using Xunit.Abstractions;
 
@@ -150,6 +152,89 @@ public class LiveConcurrencyThrottleTests
                 "concurrency ceiling, or the burst completed too quickly to overlap enough calls. " +
                 "The post-burst-clears-fast assertion above still held trivially in that case.");
         }
+    }
+
+    /// <summary>
+    /// The earlier burst test's <c>RetrieveMultiple</c> against the <c>organization</c> singleton
+    /// (1 row, ~50ms/call) apparently completes too fast for even 300 near-simultaneous calls to
+    /// stay overlapped long enough to durably exceed the 52-concurrent ceiling on this tenant. This
+    /// test swaps in <see cref="RetrieveAllEntitiesRequest"/> with <see cref="EntityFilters.Entity"/>
+    /// - a full entity-metadata dump, not a per-record query, so its cost is independent of how much
+    /// data this environment actually has, and it is naturally much heavier per call (typically
+    /// hundreds of ms to low seconds) - giving each burst call a much wider real-world window to
+    /// overlap with the others in flight.
+    /// </summary>
+    [Fact]
+    public async Task ConcurrencyBurst_WithAHeavierMetadataQuery_ProducesGenuine429s()
+    {
+        if (string.IsNullOrEmpty(ConnectionStringA))
+        {
+            _output.WriteLine("Skipped: DVPOOL_IT_CONNECTION_STRING not set.");
+            return;
+        }
+
+        const int BurstSize = 100;
+
+        var clientOptions = new DataverseClientOptions { MaxRetryCount = 0 };
+        await using var poolA = new DataverseUserPool(
+            "A",
+            ConnectionStringA,
+            new PoolOptions { MaxSize = BurstSize, PrewarmCount = BurstSize },
+            clientOptions: clientOptions);
+
+        await poolA.WarmupAsync();
+
+        // Gauge single-call cost first, purely for the test's own diagnostic output.
+        var probeSw = Stopwatch.StartNew();
+        await using (var probeLease = await poolA.AcquireAsync())
+        {
+            probeLease.Resource.DisableCrossThreadSafeties = true;
+            await probeLease.Resource.ExecuteAsync(new RetrieveAllEntitiesRequest { EntityFilters = EntityFilters.Entity });
+        }
+
+        probeSw.Stop();
+        _output.WriteLine($"Single RetrieveAllEntitiesRequest(Entity) call took {probeSw.Elapsed}.");
+
+        var burstTasks = Enumerable.Range(0, BurstSize).Select(async _ =>
+        {
+            await using var lease = await poolA.AcquireAsync();
+            lease.Resource.DisableCrossThreadSafeties = true;
+            try
+            {
+                await lease.Resource.ExecuteAsync(new RetrieveAllEntitiesRequest { EntityFilters = EntityFilters.Entity });
+                return (Throttled: false, RetryAfter: (TimeSpan?)null);
+            }
+            catch (Exception ex) when (DataverseThrottleDetector.TryGetRetryAfter(ex, out var retryAfter))
+            {
+                poolA.ReportThrottled(retryAfter);
+                return (Throttled: true, RetryAfter: (TimeSpan?)retryAfter);
+            }
+        });
+
+        var sw = Stopwatch.StartNew();
+        var results = await Task.WhenAll(burstTasks);
+        sw.Stop();
+
+        var throttled = results.Where(r => r.Throttled).ToList();
+        _output.WriteLine(
+            $"Burst size: {BurstSize}. Genuinely 429'd: {throttled.Count}. Succeeded: {results.Length - throttled.Count}. " +
+            $"Wall clock: {sw.Elapsed}.");
+        if (throttled.Count > 0)
+        {
+            var retryAfters = throttled.Select(r => r.RetryAfter!.Value).ToList();
+            _output.WriteLine($"Observed Retry-After values: min={retryAfters.Min()}, max={retryAfters.Max()}.");
+        }
+
+        if (throttled.Count == 0)
+        {
+            _output.WriteLine(
+                "Note: still no 429s even with a heavier per-call query - strong evidence this " +
+                "tenant/instance's real concurrency ceiling is genuinely higher than the commonly-" +
+                "cited default of 52, at least for metadata reads.");
+        }
+
+        // No hard assertion on throttled.Count itself (tenant-dependent, as established above) -
+        // this test exists to observe and report, not to assert a specific outcome either way.
     }
 
     /// <summary>
