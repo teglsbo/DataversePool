@@ -153,12 +153,21 @@ in the entire Dataverse SDK for plain Polly users).
       trivially/safely when no real throttle occurs, so the test is safe to re-run on any tenant.
       Followed up with `ConcurrencyBurst_WithAHeavierMetadataQuery_ProducesGenuine429s`, swapping
       the cheap singleton query for `RetrieveAllEntitiesRequest(EntityFilters.Entity)` (a full
-      entity-metadata dump, ~4s/call on this tenant, independent of record volume) specifically to
-      rule out "the calls just aren't overlapping long enough" as the reason for zero 429s: 100
-      concurrent 4s-per-call requests completed in ~15s wall-clock (≈27x real parallelism achieved,
-      far above 52-way) — **still zero 429s**. Reasonably strong evidence this tenant's real
-      concurrency ceiling for reads is genuinely well above the commonly-cited default, not just an
-      artifact of calls being individually too fast to overlap.
+      entity-metadata dump, independent of record volume, so naturally much heavier per call).
+      **Important self-correction during this investigation**: an initial run reported "≈27x real
+      parallelism achieved" purely from `serial-time / wall-clock`, and concluded that was "well
+      above 52-way" — that math only gives *average* concurrency across the whole run, not true
+      peak, and 27 is actually *below* 52, so that first result didn't actually prove anything.
+      Rewrote the test to directly instrument real-time in-flight concurrency with an
+      `Interlocked` counter (peak, not inferred) and to catch *every* exception shape, not just the
+      one `DataverseThrottleDetector` already recognizes, so a rejection taking an unexpected form
+      couldn't silently disappear as a false "success" either. Result with 150 real, directly-
+      verified concurrent in-flight calls (not estimated): **zero rejections of any kind** — no
+      recognized 429, no other exception type either. This is now solid evidence (not an
+      inference) that this tenant/instance's real read-concurrency ceiling is genuinely well above
+      the commonly-cited default of 52 - or that this specific request type (metadata reads) isn't
+      subject to it the same way. Writes were not attempted (higher risk of leaving test data
+      behind and slower to reason about safety), left as a possible future follow-up.
 - [x] Consider an integration-test project (opt-in, against a real Dataverse instance) — implemented
       as `LiveServiceClientConcurrencyTests` in the existing `ConnectionPool.Dataverse.Tests` project
       rather than a separate project (simpler, still excluded from CI via `Category!=Integration`).

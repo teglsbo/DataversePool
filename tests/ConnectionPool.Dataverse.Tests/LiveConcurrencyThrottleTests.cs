@@ -164,6 +164,14 @@ public class LiveConcurrencyThrottleTests
     /// hundreds of ms to low seconds) - giving each burst call a much wider real-world window to
     /// overlap with the others in flight.
     /// </summary>
+    /// <remarks>
+    /// Directly instruments the actual peak number of calls genuinely in flight at once (an
+    /// <see cref="Interlocked"/> counter, not inferred from wall-clock speedup - a naive "400s
+    /// serial vs 15s actual" calculation only gives the *average* concurrency across the run, which
+    /// undercounts the true peak). Also deliberately does <b>not</b> use a narrow exception filter
+    /// on the burst calls - every exception, recognized 429 or not, is caught and classified, so a
+    /// misclassified/differently-shaped rejection cannot silently disappear as a false "success".
+    /// </remarks>
     [Fact]
     public async Task ConcurrencyBurst_WithAHeavierMetadataQuery_ProducesGenuine429s()
     {
@@ -173,7 +181,7 @@ public class LiveConcurrencyThrottleTests
             return;
         }
 
-        const int BurstSize = 100;
+        const int BurstSize = 150; // comfortably above 52 even accounting for ramp-up/ramp-down at the edges
 
         var clientOptions = new DataverseClientOptions { MaxRetryCount = 0 };
         await using var poolA = new DataverseUserPool(
@@ -195,19 +203,37 @@ public class LiveConcurrencyThrottleTests
         probeSw.Stop();
         _output.WriteLine($"Single RetrieveAllEntitiesRequest(Entity) call took {probeSw.Elapsed}.");
 
+        var currentInFlight = 0;
+        var peakInFlight = 0;
+
         var burstTasks = Enumerable.Range(0, BurstSize).Select(async _ =>
         {
             await using var lease = await poolA.AcquireAsync();
             lease.Resource.DisableCrossThreadSafeties = true;
+
+            var nowInFlight = Interlocked.Increment(ref currentInFlight);
+            InterlockedMax(ref peakInFlight, nowInFlight);
             try
             {
                 await lease.Resource.ExecuteAsync(new RetrieveAllEntitiesRequest { EntityFilters = EntityFilters.Entity });
-                return (Throttled: false, RetryAfter: (TimeSpan?)null);
+                return (Outcome: "Success", RetryAfter: (TimeSpan?)null, ExceptionType: (string?)null);
             }
-            catch (Exception ex) when (DataverseThrottleDetector.TryGetRetryAfter(ex, out var retryAfter))
+            catch (Exception ex)
             {
-                poolA.ReportThrottled(retryAfter);
-                return (Throttled: true, RetryAfter: (TimeSpan?)retryAfter);
+                // No exception filter here on purpose - classify every outcome instead of only
+                // catching the shape DataverseThrottleDetector already recognizes, so a rejection
+                // that takes an unexpected form cannot silently vanish as a false "success".
+                if (DataverseThrottleDetector.TryGetRetryAfter(ex, out var retryAfter))
+                {
+                    poolA.ReportThrottled(retryAfter);
+                    return (Outcome: "RecognizedThrottle", RetryAfter: (TimeSpan?)retryAfter, ExceptionType: ex.GetType().Name);
+                }
+
+                return (Outcome: "OtherException", RetryAfter: (TimeSpan?)null, ExceptionType: $"{ex.GetType().Name}: {ex.Message}");
+            }
+            finally
+            {
+                Interlocked.Decrement(ref currentInFlight);
             }
         });
 
@@ -215,26 +241,68 @@ public class LiveConcurrencyThrottleTests
         var results = await Task.WhenAll(burstTasks);
         sw.Stop();
 
-        var throttled = results.Where(r => r.Throttled).ToList();
+        var byOutcome = results.GroupBy(r => r.Outcome).ToDictionary(g => g.Key, g => g.Count());
         _output.WriteLine(
-            $"Burst size: {BurstSize}. Genuinely 429'd: {throttled.Count}. Succeeded: {results.Length - throttled.Count}. " +
-            $"Wall clock: {sw.Elapsed}.");
-        if (throttled.Count > 0)
+            $"Burst size: {BurstSize}. Peak genuinely-concurrent in-flight calls observed: {peakInFlight}. " +
+            $"Wall clock: {sw.Elapsed}. Naive average-concurrency estimate (serial-time / wall-clock): " +
+            $"{BurstSize * probeSw.Elapsed.TotalSeconds / sw.Elapsed.TotalSeconds:F1}x.");
+        foreach (var (outcome, count) in byOutcome)
         {
-            var retryAfters = throttled.Select(r => r.RetryAfter!.Value).ToList();
+            _output.WriteLine($"  {outcome}: {count}");
+        }
+
+        var recognizedThrottled = results.Where(r => r.Outcome == "RecognizedThrottle").ToList();
+        if (recognizedThrottled.Count > 0)
+        {
+            var retryAfters = recognizedThrottled.Select(r => r.RetryAfter!.Value).ToList();
             _output.WriteLine($"Observed Retry-After values: min={retryAfters.Min()}, max={retryAfters.Max()}.");
         }
 
-        if (throttled.Count == 0)
+        var otherExceptions = results.Where(r => r.Outcome == "OtherException").Select(r => r.ExceptionType).Distinct().ToList();
+        if (otherExceptions.Count > 0)
         {
-            _output.WriteLine(
-                "Note: still no 429s even with a heavier per-call query - strong evidence this " +
-                "tenant/instance's real concurrency ceiling is genuinely higher than the commonly-" +
-                "cited default of 52, at least for metadata reads.");
+            _output.WriteLine("Unrecognized exception shapes seen (would NOT have been caught by the earlier narrow filter):");
+            foreach (var type in otherExceptions)
+            {
+                _output.WriteLine($"  {type}");
+            }
         }
 
-        // No hard assertion on throttled.Count itself (tenant-dependent, as established above) -
-        // this test exists to observe and report, not to assert a specific outcome either way.
+        if (recognizedThrottled.Count == 0 && otherExceptions.Count == 0)
+        {
+            if (peakInFlight > 52)
+            {
+                _output.WriteLine(
+                    $"Note: genuinely reached {peakInFlight} concurrent in-flight calls (verified by direct " +
+                    "instrumentation, not inferred from average speedup) with zero rejections of any kind - " +
+                    "reasonably strong evidence this tenant/instance's real concurrency ceiling for reads is " +
+                    "genuinely higher than the commonly-cited default of 52.");
+            }
+            else
+            {
+                _output.WriteLine(
+                    $"Note: peak concurrency actually reached was only {peakInFlight}, which never exceeded " +
+                    "52 - zero 429s here does NOT show the limit doesn't apply, only that this run didn't " +
+                    "generate enough real concurrent load to test it. Increase BurstSize and/or per-call cost.");
+            }
+        }
+
+        // No hard assertion on outcome counts themselves (tenant/timing-dependent, as established
+        // above) - this test exists to observe and report peak concurrency plus every outcome shape,
+        // not to assert a specific result either way.
+    }
+
+    private static void InterlockedMax(ref int target, int candidate)
+    {
+        int initial;
+        do
+        {
+            initial = Volatile.Read(ref target);
+            if (candidate <= initial)
+            {
+                return;
+            }
+        } while (Interlocked.CompareExchange(ref target, candidate, initial) != initial);
     }
 
     /// <summary>
