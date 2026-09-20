@@ -101,14 +101,28 @@ public sealed class DataverseServiceClientPolicy : IPooledResourcePolicy<Service
         => lastIncident is null && resource.IsReady;
 
     /// <summary>
-    /// Clears <see cref="ServiceClient.CallerId"/> (Dataverse's "act as another user" impersonation
-    /// field) before a returned client goes back on the idle stack. Without this, a caller that
-    /// impersonates a user and disposes its lease without resetting <c>CallerId</c> would leave the
-    /// exact same <see cref="ServiceClient"/> instance impersonating that user for whichever
+    /// Clears both <see cref="ServiceClient.CallerId"/> and
+    /// <see cref="ServiceClient.CallerAADObjectId"/> (Dataverse's two "act as another user"
+    /// impersonation fields) before a returned client goes back on the idle stack. Without this, a
+    /// caller that impersonates a user and disposes its lease without resetting these would leave
+    /// the exact same <see cref="ServiceClient"/> instance impersonating that user for whichever
     /// unrelated caller acquires it next - a real cross-caller identity leak. See
     /// docs/adr/0009-return-scrubbing-hook-caller-id-leak.md.
     /// </summary>
-    public void OnReturned(ServiceClient resource) => resource.CallerId = Guid.Empty;
+    /// <remarks>
+    /// <c>CallerId</c> (systemuserid-based) is the legacy/SOAP-era impersonation mechanism and is
+    /// silently ignored for OAuth/client-secret-authenticated connections - the property that
+    /// actually impersonates in that case is <c>CallerAADObjectId</c> (the target user's Entra
+    /// object id). ADR-0009 originally only reset <c>CallerId</c>; this was a gap for OAuth-based
+    /// pools until <c>CallerAADObjectId</c> was also reset here - see ADR-0023 for how this was
+    /// found (empirically reproducing a concurrent identity mixup) and confirmed both properties
+    /// need resetting regardless of which auth type a given pool happens to use.
+    /// </remarks>
+    public void OnReturned(ServiceClient resource)
+    {
+        resource.CallerId = Guid.Empty;
+        resource.CallerAADObjectId = null;
+    }
 
     public ValueTask DisposeResourceAsync(ServiceClient resource)
     {
