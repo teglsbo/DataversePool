@@ -38,6 +38,32 @@ execute under the other's identity. This is a correctness risk, independent of w
 serialize or run concurrently, and was not something the original "one request at a time" framing
 called out at all.
 
+**Follow-up investigation confirmed and sharpened this risk further** (same integration test file,
+second test, also run against the real environment):
+
+- `CallerId` (systemuserid-based impersonation) turned out to be the wrong property to test with in
+  the first place: for OAuth/client-secret-authenticated connections (`AuthType=ClientSecret`, the
+  connection type this library targets), setting `CallerId` is **silently ignored** — no exception,
+  no impersonation, the request just executes as the app user. The correct property for this auth
+  type is `CallerAADObjectId` (the target user's Entra/Azure AD object id, not their systemuserid),
+  which the server actually validates (a missing `prvActOnBehalfOfAnotherUser` privilege produces a
+  real fault).
+- `WhoAmIRequest` — the obvious way to verify who a call executed as — turned out to be unusable for
+  this: Dataverse deliberately makes `WhoAmI` **ignore impersonation** and always return the real,
+  non-impersonated caller (documented Microsoft behavior). It would report the app user's own id
+  even when impersonation via `CallerAADObjectId` is fully working, making it useless for detecting
+  a mixup either way.
+- The test was rewritten to create a real record per concurrent iteration while impersonating (each
+  iteration setting `CallerAADObjectId` immediately before a `CreateAsync`), then reading back the
+  resulting record's `createdby` field, which *does* reflect the impersonated identity that actually
+  performed the create (records are deleted again afterward, while still impersonating their owner,
+  since the app user itself has no direct access to a record owned by someone else).
+- Run against the real environment (2 identities, 15 iterations each, 30 concurrent creates total on
+  one shared `ServiceClient`): **1 of 30 records was created under the wrong impersonated identity**
+  — a record intended for user B was instead attributed to user A. This is a direct, empirical
+  reproduction of the race, not just a theoretical one inferred from reading the SDK's property
+  design.
+
 ## Decision
 - Correct the premise stated in the README and ADR-0020: drop the "one request at a time"/
   "single in-flight-request slot" framing as a literal client-side constraint.
@@ -48,10 +74,11 @@ called out at all.
      it — this was always the correct rationale and is unaffected by this correction.
   2. **Construction/clone cost** (ADR-0002) is real and orthogonal to per-instance concurrency
      behavior — still a valid reason to pool/reuse instead of constructing per request.
-  3. **`CallerId`-style per-instance mutable state** makes sharing one instance across concurrent
-     callers using *different identities* unsafe — pooling naturally avoids this by handing each
-     lease exclusive use of an instance for its duration, but this is a correctness argument, not a
-     throughput one.
+  3. **`CallerId`/`CallerAADObjectId`-style per-instance mutable state** makes sharing one instance
+     across concurrent callers using *different identities* unsafe — confirmed empirically (1/30
+     mixup rate above), not just theoretically. Pooling naturally avoids this by handing each lease
+     exclusive use of an instance for its duration; this is a correctness argument, not a throughput
+     one.
   4. Health-aware routing/circuit-breaking around a misbehaving member (ADR-0007) remains valid and
      unrelated to this correction.
 - Do **not** claim or rely on any specific concurrency ratio/number as a stable guarantee — the SDK's
@@ -59,15 +86,19 @@ called out at all.
   exists to let anyone re-verify this against their own environment/SDK version, not to pin a number.
 - Leave `DataversePool`'s and `DataverseUserPool`'s existing exclusive-lease-per-checkout design
   unchanged. It was never *only* justified by the (incorrect) serialization claim, and remains correct
-  for the reasons above (server-side quota, construction cost, and `CallerId` correctness).
+  for the reasons above (server-side quota, construction cost, and identity-mixup correctness).
 
 ## Consequences
 - README and ADR-0020 updated to state the corrected reasons to pool instead of the inaccurate
   "one request at a time" framing.
 - New opt-in integration test added so this can be independently re-verified against any real
   Dataverse instance and SDK version, without requiring credentials in CI.
+- The identity-mixup risk is no longer a documented-but-unverified concern: it has been reproduced
+  against a real environment. This directly validates ADR-0009's fix (resetting `CallerId` on
+  `OnReturned` so it doesn't leak between leases) and the general principle that an instance must
+  never be shared across concurrent callers with different intended identities, pooled or not.
 - Open question, not resolved here: whether `DataverseUserPool` gains meaningful throughput from
   pooling *multiple clones of the same identity* versus reusing one instance carefully (given
-  `CallerId` is fixed and not being raced), versus whether its value for a single application user is
+  identity is fixed and not being raced), versus whether its value for a single application user is
   purely about avoiding reconstruction after a failure/health-check-fails scenario. Not changed by
   this ADR; left as a possible future investigation.

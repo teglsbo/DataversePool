@@ -85,12 +85,23 @@ in the entire Dataverse SDK for plain Polly users).
 ## Open questions / follow-up
 
 - [ ] Confirm or refute the socket-depletion assumption for new-per-request usage (unverified).
-- [ ] Confirm or refute the CallerId cross-thread race condition with an actual parallel,
-      varying-CallerId test. Now implemented as `LiveServiceClientConcurrencyTests.ConcurrentRequests_WithDifferentCallerIds_OnSameInstance_DoNotMixUpIdentity`
-      (opt-in, `Category=Integration`) but not yet actually run against a real environment — needs
-      two impersonatable systemuser ids (`DVPOOL_IT_CALLER_ID_A`/`_B`). The separate "does a single
-      instance serialize concurrent async calls" question is now confirmed **false** (see ADR-0023),
-      but that's a different question from the CallerId race, which remains open.
+- [x] Confirm or refute the CallerId cross-thread race condition with an actual parallel,
+      varying-identity test — **confirmed real** against a live Dataverse instance. Two findings
+      that reshaped the test itself: (1) `CallerId` (systemuserid-based impersonation) is silently
+      ignored for OAuth/client-secret auth — no error, it just doesn't impersonate; the correct
+      property is `CallerAADObjectId` (target user's Entra object id), which the server actually
+      validates. (2) `WhoAmIRequest` deliberately ignores impersonation and always returns the real
+      caller (documented Microsoft behavior), so it can't be used to detect a mixup at all — the
+      test now creates a real record per iteration while impersonating and checks the `createdby`
+      field instead. With that fixed, `LiveServiceClientConcurrencyTests.ConcurrentRequests_WithDifferentCallerAadObjectIds_OnSameInstance_DoNotMixUpIdentity`
+      (opt-in, `Category=Integration`, needs `DVPOOL_IT_CALLER_AAD_OBJECT_ID_A`/`_B`) reproduced the
+      race: **1 of 30 concurrent creates was attributed to the wrong impersonated identity** when
+      `CallerAADObjectId` was mutated concurrently on one shared `ServiceClient`. This is direct,
+      empirical confirmation — not just a theoretical risk — that sharing one instance across
+      concurrent callers with different identities is unsafe, independent of throughput. See
+      ADR-0023 for details. The separate "does a single instance serialize concurrent async calls"
+      question is confirmed **false** (also ADR-0023) — that's a different, now-separately-resolved
+      question from this one.
 - [ ] Background sweep for MaxIdleLifetime (today only lazy-at-checkout) — deferred to v2 if needed.
 - [x] ~~Run the actual live Dataverse smoke test~~ — run and confirmed against a real org (see above).
 - [ ] Run the group-pool (round-robin) smoke test live with 2+ app users (requires an additional
@@ -180,10 +191,15 @@ docs/adr/                              # architecture decisions, see ADR-0001..0
 ## Open questions / follow-up
 
 - [ ] Confirm or refute the socket-depletion assumption for new-per-request usage (unverified, see research).
-- [ ] Confirm or refute the CallerId cross-thread race condition with an actual parallel,
-      varying-CallerId test (note: this is a *different* risk than the now-fixed cross-*lease*
-      leakage, see ADR-0009). Test implemented (`LiveServiceClientConcurrencyTests`), not yet run
-      against a real environment — see the "Open questions" entry above and ADR-0023.
+- [x] Confirm or refute the CallerId cross-thread race condition with an actual parallel,
+      varying-identity test (note: this is a *different* risk than the now-fixed cross-*lease*
+      leakage, see ADR-0009). **Confirmed real** against a live Dataverse instance — 1/30
+      concurrent creates were attributed to the wrong impersonated identity when
+      `CallerAADObjectId` was mutated concurrently on one shared `ServiceClient` (`CallerId` had
+      to be dropped in favor of `CallerAADObjectId` — it's silently ignored for OAuth auth — and
+      `WhoAmIRequest`-based verification had to be replaced with a `createdby`-on-real-record
+      check, since `WhoAmI` deliberately ignores impersonation). See the "Open questions" entry
+      above and ADR-0023.
 - [x] Throttle-aware `ISlotSelectionStrategy` — implemented via `DataverseUserPool.ReportThrottled`/`IsThrottled` + `DataverseLease.ReportIfThrottled`, see ADR-0008. Both selection strategies now skip throttled members (fail-open if all are throttled).
 - [ ] Consider whether SOAP-fault (`OrganizationServiceFault`)-based throttle detection is also needed (deliberately omitted for now, see ADR-0008 — would require an extra `System.ServiceModel.Primitives` reference and it's unverified whether this SDK version even throws SOAP faults for throttling).
 - [ ] Consider whether single-user (non-group) `DataverseUserPool` should also expose throttle state externally for monitoring (today only used internally by the group's selection strategy).
@@ -236,9 +252,10 @@ docs/adr/                              # architecture decisions, see ADR-0001..0
 - Polly adapter: verify `MarkUnhealthy` is called correctly on retry/circuit-open.
 - Integration test against real Dataverse: opt-in, `[Trait("Category","Integration")]`, not in normal CI.
   Implemented: `LiveServiceClientConcurrencyTests` (`tests/ConnectionPool.Dataverse.Tests/`) — measures
-  whether a single `ServiceClient` serializes concurrent async calls, and whether concurrent `CallerId`
-  changes on a shared instance race. Both self-skip without env vars (`DVPOOL_IT_CONNECTION_STRING`,
-  optionally `DVPOOL_IT_CALLER_ID_A`/`DVPOOL_IT_CALLER_ID_B`, `DVPOOL_IT_REQUEST_COUNT`) — no creds
-  needed to build/run the rest of the suite. The `CallerId`-race test itself has not yet actually been
-  run against a real environment (needs two impersonatable systemuser ids) — the socket-depletion and
-  `CallerId` cross-thread-race open questions below are updated to reflect this, not resolved by it.
+  whether a single `ServiceClient` serializes concurrent async calls, and whether concurrent
+  `CallerAADObjectId` changes on a shared instance race. Both self-skip without env vars
+  (`DVPOOL_IT_CONNECTION_STRING`, optionally `DVPOOL_IT_CALLER_AAD_OBJECT_ID_A`/`_B`,
+  `DVPOOL_IT_REQUEST_COUNT`) — no creds needed to build/run the rest of the suite. Both tests have
+  now actually been run against a real environment: the serialization test confirms no client-side
+  lock on the async path, and the identity-race test reproduced a genuine mixup (1/30 concurrent
+  creates attributed to the wrong impersonated identity) — see ADR-0023.
