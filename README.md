@@ -1,20 +1,27 @@
 # DataversePool
 
-Connection pooling for [`Microsoft.PowerPlatform.Dataverse.Client.ServiceClient`](https://learn.microsoft.com/power-platform/developer/data-platform/xrm-tooling/use-dataverse-service-client) —
-not because a single `ServiceClient` instance serializes concurrent async calls (measured against a
-real Dataverse instance, it doesn't — see [ADR-0023](docs/adr/0023-serviceclient-async-concurrency-corrected-premise.md)),
-but because (1) Dataverse enforces a per-application-user concurrent-request ceiling that only
-spreading traffic across multiple service principals can raise, (2) cloning a new client is
-expensive enough (hundreds of ms to seconds, see [ADR-0002](docs/adr/0002-serial-creation-gate.md))
-that doing it per-request/per-thread is a real bottleneck and, if done in parallel, actively
-counter-productive due to internal lock contention, and (3) a `ServiceClient` carries per-instance
-mutable state (e.g. `CallerId`) that makes sharing one instance across concurrent callers using
-different identities unsafe, even though the requests themselves can run concurrently.
+Connection pooling for [`Microsoft.PowerPlatform.Dataverse.Client.ServiceClient`](https://learn.microsoft.com/power-platform/developer/data-platform/xrm-tooling/use-dataverse-service-client),
+built around one core fact: **Dataverse's concurrent-request budget is enforced per application
+user, not per environment/tenant** (~52 concurrent requests per user is the commonly-cited default —
+see the [empirical notes](#a-note-on-the-52-concurrent-request-limit) below). A single application
+user can only ever push so much traffic through Dataverse at once, no matter how it's called. The
+only way to raise that ceiling is to spread load across **multiple** application users (service
+principals) — and once you're doing that, you need something to round-robin/load-balance across
+them, keep enough clients warm and ready to avoid paying construction cost per request, and stop
+routing to a member that's gone bad or is currently throttled. That's what DataversePool is: a
+small, generic async resource pool (`DataversePool.Core`) plus a Dataverse-specific adapter
+(`DataversePool.Dataverse`, with health-aware/least-connections/round-robin load balancing across
+members and per-member circuit breaking + throttle-awareness) and an optional Polly v8 integration
+(`DataversePool.Polly`) — so you check out a ready-to-use `ServiceClient` from whichever member the
+pool decides is best, use it, and return/dispose it, instead of managing
+construction/cloning/round-robin/health yourself.
 
-DataversePool gives you a small, generic async resource pool (`DataversePool.Core`) plus a Dataverse-specific
-adapter (`DataversePool.Dataverse`) and an optional Polly v8 integration (`DataversePool.Polly`) — so you check
-out a ready-to-use `ServiceClient`, use it, and return/dispose it, instead of managing
-construction/cloning/health yourself.
+It's also useful with just a **single** application user, for two smaller reasons: cloning a new
+`ServiceClient` is expensive enough (hundreds of ms to seconds — see
+[ADR-0002](docs/adr/0002-serial-creation-gate.md)) that constructing one per request/thread is a
+real bottleneck, and a `ServiceClient` carries per-instance mutable state (e.g. `CallerId`) that
+isn't safe to share across concurrent callers using different identities. But the multi-application-user
+case — raising your effective throughput ceiling — is the main reason this library exists.
 
 > Status: **pre-1.0 / preview**. Core design is implemented and tested (see [`TODO.md`](TODO.md)
 > for exact scope and open items). API may still shift before a 1.0 release.
@@ -22,16 +29,37 @@ construction/cloning/health yourself.
 > Sister project: DataverseDuck (`dvduck`) — a separate tool, not a
 > dependency of this library.
 
+## A note on the 52-concurrent-request limit
+
+If you came here assuming a single `ServiceClient` instance *itself* serializes concurrent async
+calls (e.g. because of some internal lock), and that this library exists to work around *that* —
+it doesn't, and it isn't. Measured directly against a real Dataverse instance, a single
+`ServiceClient` genuinely executes concurrent calls concurrently; see
+[ADR-0023](docs/adr/0023-serviceclient-async-concurrency-corrected-premise.md) for that
+measurement, and this library's own live tests, which reached **150 directly-verified,
+simultaneously in-flight read calls, and 100 directly-verified, simultaneously in-flight real
+`Create` calls, against one real application user with zero throttling in either case** on the
+tenant tested — well above the commonly-cited 52 default, for both reads and writes (see
+`TODO.md` for the full instrumented results).
+
+That doesn't make the per-user concurrent-request ceiling irrelevant, though — it's a real,
+documented, server-enforced limit, just not one that a single `ServiceClient` instance's own
+threading model has anything to do with hitting or avoiding. Round-robin pooling across multiple
+application users (this library's actual purpose, see above) raises that ceiling by spreading load
+across the users the limit applies to; it isn't "working around" `ServiceClient` itself.
+
 ## Why not just `new ServiceClient(...)` per request?
 
 - **Serialized/expensive construction.** A `ServiceClient` clone can take from ~1ms (warm,
   sequential) up to 1–3.2s (cold, or under construction-time lock contention) — see
   [ADR-0002](docs/adr/0002-serial-creation-gate-no-parallel-cloning.md). DataversePool serializes all
   creation through a single gate so you get the fast path, not the contention path.
-- **Per-user Dataverse service-protection limits (~52 concurrent requests/user).** This is the real,
-  server-side constraint — round-robin pooling across multiple application users is the standard way
-  to scale beyond one user's budget, independent of how a single `ServiceClient` instance behaves
-  under concurrent load — see [`DataversePool.Dataverse`'s group pool](#quickstart-group-pool-multiple-application-users).
+- **Per-user Dataverse service-protection limits (~52 concurrent requests/user, commonly cited —
+  see the note above on how high that ceiling actually turned out to be in practice).** This is the
+  real, server-side constraint — round-robin pooling across multiple application users is the
+  standard way to scale beyond one user's budget, independent of how a single `ServiceClient`
+  instance behaves under concurrent load — see
+  [`DataversePool.Dataverse`'s group pool](#quickstart-group-pool-multiple-application-users).
 - **`CallerId` (and similar per-instance state) isn't safe to share across concurrent identities.**
   It's a plain property read at call time, not per-call/thread-local state, so two callers using the
   same instance with different `CallerId` values concurrently can race. Pooling gives each caller/lease

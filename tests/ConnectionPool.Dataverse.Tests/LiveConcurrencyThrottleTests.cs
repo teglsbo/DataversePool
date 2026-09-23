@@ -1,6 +1,8 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using ConnectionPool.Core;
 using Microsoft.PowerPlatform.Dataverse.Client;
+using Microsoft.Xrm.Sdk;
 using Microsoft.Xrm.Sdk.Messages;
 using Microsoft.Xrm.Sdk.Metadata;
 using Microsoft.Xrm.Sdk.Query;
@@ -303,6 +305,146 @@ public class LiveConcurrencyThrottleTests
                 return;
             }
         } while (Interlocked.CompareExchange(ref target, candidate, initial) != initial);
+    }
+
+    /// <summary>
+    /// The two burst tests above are both read-only. Writes (<c>Create</c>/<c>Update</c>/<c>Delete</c>)
+    /// are commonly believed to be where the concurrent-request ceiling actually bites harder, since
+    /// they carry real server-side cost (plugins, auditing, indexing) beyond just the HTTP round
+    /// trip. This test fires a genuine concurrent burst of <c>Create</c> calls against the <c>task</c>
+    /// entity (a lightweight, dependency-free activity type, no custom entity required) - same
+    /// direct peak-concurrency instrumentation and catch-all exception classification as the
+    /// metadata-read burst above, so nothing can hide a rejection here either - and always cleans up
+    /// every record it creates in a <c>finally</c>, tagging each one with a per-run GUID in case
+    /// manual cleanup is ever needed.
+    /// </summary>
+    [Fact]
+    public async Task ConcurrencyBurst_WithRealWrites_ProducesGenuine429s()
+    {
+        if (string.IsNullOrEmpty(ConnectionStringA))
+        {
+            _output.WriteLine("Skipped: DVPOOL_IT_CONNECTION_STRING not set.");
+            return;
+        }
+
+        const int BurstSize = 100;
+        var runTag = Guid.NewGuid().ToString("N");
+
+        var clientOptions = new DataverseClientOptions { MaxRetryCount = 0 };
+        await using var poolA = new DataverseUserPool(
+            "A",
+            ConnectionStringA,
+            new PoolOptions { MaxSize = BurstSize, PrewarmCount = BurstSize },
+            clientOptions: clientOptions);
+
+        await poolA.WarmupAsync();
+
+        var currentInFlight = 0;
+        var peakInFlight = 0;
+        var createdIds = new ConcurrentBag<Guid>();
+
+        try
+        {
+            var burstTasks = Enumerable.Range(0, BurstSize).Select(async i =>
+            {
+                await using var lease = await poolA.AcquireAsync();
+                lease.Resource.DisableCrossThreadSafeties = true;
+
+                var nowInFlight = Interlocked.Increment(ref currentInFlight);
+                InterlockedMax(ref peakInFlight, nowInFlight);
+                try
+                {
+                    var recordId = await lease.Resource.CreateAsync(new Entity("task")
+                    {
+                        ["subject"] = $"DataversePool-IT-{runTag}-{i}",
+                    });
+                    createdIds.Add(recordId);
+                    return (Outcome: "Success", RetryAfter: (TimeSpan?)null, ExceptionType: (string?)null);
+                }
+                catch (Exception ex)
+                {
+                    if (DataverseThrottleDetector.TryGetRetryAfter(ex, out var retryAfter))
+                    {
+                        poolA.ReportThrottled(retryAfter);
+                        return (Outcome: "RecognizedThrottle", RetryAfter: (TimeSpan?)retryAfter, ExceptionType: ex.GetType().Name);
+                    }
+
+                    return (Outcome: "OtherException", RetryAfter: (TimeSpan?)null, ExceptionType: $"{ex.GetType().Name}: {ex.Message}");
+                }
+                finally
+                {
+                    Interlocked.Decrement(ref currentInFlight);
+                }
+            });
+
+            var sw = Stopwatch.StartNew();
+            var results = await Task.WhenAll(burstTasks);
+            sw.Stop();
+
+            var byOutcome = results.GroupBy(r => r.Outcome).ToDictionary(g => g.Key, g => g.Count());
+            _output.WriteLine(
+                $"Burst size: {BurstSize} real Create calls. Peak genuinely-concurrent in-flight calls " +
+                $"observed: {peakInFlight}. Wall clock: {sw.Elapsed}.");
+            foreach (var (outcome, count) in byOutcome)
+            {
+                _output.WriteLine($"  {outcome}: {count}");
+            }
+
+            var recognizedThrottled = results.Where(r => r.Outcome == "RecognizedThrottle").ToList();
+            if (recognizedThrottled.Count > 0)
+            {
+                var retryAfters = recognizedThrottled.Select(r => r.RetryAfter!.Value).ToList();
+                _output.WriteLine($"Observed Retry-After values: min={retryAfters.Min()}, max={retryAfters.Max()}.");
+            }
+
+            var otherExceptions = results.Where(r => r.Outcome == "OtherException").Select(r => r.ExceptionType).Distinct().ToList();
+            if (otherExceptions.Count > 0)
+            {
+                _output.WriteLine("Unrecognized exception shapes seen:");
+                foreach (var type in otherExceptions)
+                {
+                    _output.WriteLine($"  {type}");
+                }
+            }
+
+            if (recognizedThrottled.Count == 0 && otherExceptions.Count == 0)
+            {
+                if (peakInFlight > 52)
+                {
+                    _output.WriteLine(
+                        $"Note: genuinely reached {peakInFlight} concurrent in-flight real Create calls " +
+                        "with zero rejections of any kind - the concurrent-request ceiling does not appear " +
+                        "to bite harder on writes than on reads for this tenant/instance either.");
+                }
+                else
+                {
+                    _output.WriteLine(
+                        $"Note: peak concurrency actually reached was only {peakInFlight}, which never " +
+                        "exceeded 52 - inconclusive either way for this run.");
+                }
+            }
+
+            // No hard assertion on outcome counts themselves (tenant/timing-dependent) - this test
+            // exists to observe and report peak concurrency plus every outcome shape for real writes,
+            // matching the read-only bursts above.
+        }
+        finally
+        {
+            // Always clean up every record actually created, regardless of what else happened above.
+            foreach (var recordId in createdIds)
+            {
+                try
+                {
+                    await using var cleanupLease = await poolA.AcquireAsync();
+                    await cleanupLease.Resource.DeleteAsync("task", recordId);
+                }
+                catch
+                {
+                    // Leave it - it's tagged with runTag in its subject and can be found/cleaned up
+                    // manually if a delete itself failed (e.g. also throttled).
+                }
+            }
+        }
     }
 
     /// <summary>

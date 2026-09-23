@@ -166,8 +166,15 @@ in the entire Dataverse SDK for plain Polly users).
       recognized 429, no other exception type either. This is now solid evidence (not an
       inference) that this tenant/instance's real read-concurrency ceiling is genuinely well above
       the commonly-cited default of 52 - or that this specific request type (metadata reads) isn't
-      subject to it the same way. Writes were not attempted (higher risk of leaving test data
-      behind and slower to reason about safety), left as a possible future follow-up.
+      subject to it the same way. Followed up with `ConcurrencyBurst_WithRealWrites_ProducesGenuine429s`
+      (real `Create` calls against the `task` entity, same instrumentation, always cleans up every
+      created record in a `finally` and tags each with a per-run GUID) since writes carry real
+      server-side cost (plugins/auditing/indexing) that reads don't, and were suspected to be where
+      the ceiling might actually bite. Result: 100 genuinely concurrent in-flight `Create` calls
+      (peak directly verified, not inferred), **zero rejections of any kind** here either — and a
+      separate post-run query confirmed zero orphaned test records (cleanup fully succeeded). The
+      concurrent-request ceiling does not appear to bite harder on writes than on reads for this
+      tenant/instance.
 - [x] Consider an integration-test project (opt-in, against a real Dataverse instance) — implemented
       as `LiveServiceClientConcurrencyTests` in the existing `ConnectionPool.Dataverse.Tests` project
       rather than a separate project (simpler, still excluded from CI via `Category!=Integration`).
