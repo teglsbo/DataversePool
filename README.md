@@ -473,6 +473,7 @@ Every non-obvious choice is written up as an ADR in [`docs/adr/`](docs/adr/):
 21. [Base-client factory constructor for `DataverseServiceClientPolicy`/`DataverseUserPool`](docs/adr/0021-base-client-factory-constructor.md)
 22. [Shutdown disposal race, throttle-retry lease leak, probe-claim leak fixes](docs/adr/0022-shutdown-and-probe-claim-leak-fixes.md)
 23. [Corrected premise: A `ServiceClient` does not serialize concurrent async requests](docs/adr/0023-serviceclient-async-concurrency-corrected-premise.md)
+24. [Proposed operation-level metrics on instrumented execution paths](docs/adr/0024-operation-level-metrics-on-instrumented-execution-paths.md)
 
 ## Status / open items
 
