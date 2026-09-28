@@ -29,6 +29,11 @@ case — raising your effective throughput ceiling — is the main reason this l
 > about **40% more successful operations per second** in this saturated burst, not merely simulated
 > routing behavior. The same 160-operation workload also completed through real `DataversePool`
 > leases with an exact 80/80 member split and no rejection.
+>
+> A separate practical write benchmark inserted 1,000 independent rows into the purpose-built
+> `new_loadthin` standard table. One user with 32 leases averaged **333.8 rows/s**; two users with
+> 32 leases each averaged **484.8 rows/s**. That is **1.45x throughput** and about **32% shorter
+> completion time**, with every one of the 4,000 measured rows succeeding and then being deleted.
 
 > Status: **pre-1.0 / preview**. Core design is implemented and tested (see [`TODO.md`](TODO.md)
 > for exact scope and open items). API may still shift before a 1.0 release.
@@ -81,6 +86,37 @@ HTTP harness: every worker acquired a group lease and invoked the same slow quer
 operations returned HTTP 200, and the corrected burst duration was 33.7s (p50 19.9s, p95 32.1s).
 This pool test uses DataversePool's normal production policy with affinity disabled; the pinned
 test above remains the controlled proof of the per-user, per-server limit.
+
+### Practical insert throughput
+
+The concurrency result also translates into faster useful work rather than only more accepted
+requests. `LiveInsertThroughputBenchmarkTests` uses the existing `new_loadthin` custom standard
+table: one primary key, one name column, no application business logic, and one individual
+`CreateAsync` per `DataversePool` lease. It deliberately does not use `CreateMultiple` or
+`ExecuteMultiple` for the measured inserts.
+
+Four balanced runs inserted 1,000 independent rows each in the order single A, two users, two
+users, single B. Each identity therefore handled the same total number of rows. Concurrency was
+kept below the observed write limit: 32 leases for a single user and 32 per user (64 total) for two.
+This is intentionally a scale-out comparison rather than a same-aggregate-concurrency control:
+adding the second identity adds another safe 32-operation lane, which is the capacity DataversePool
+exists to expose. The earlier pinned and 160-worker tests isolate identity budgets at equal offered
+load.
+
+| Mode | Run 1 | Run 2 | Average |
+|---|---:|---:|---:|
+| One application user | 286.5 rows/s | 381.1 rows/s | **333.8 rows/s** |
+| Two application users | 452.8 rows/s | 516.8 rows/s | **484.8 rows/s** |
+
+All four runs completed 1,000/1,000 inserts with zero throttle or other error. Two users were
+**1.45x faster by throughput**, reducing average completion time from 3.06s to 2.07s. Cleanup then
+deleted all 4,000 rows exactly, with no batch fault.
+
+An earlier overload probe used 160 workers for both modes. The single-user runs received explicit
+`Number of concurrent requests exceeded the limit of 40` faults (27 and 55 respectively), while
+both two-user runs completed 1,000/1,000. This differs from the pinned read query's measured limit
+of 100 and is another reason not to treat any one observed number as a universal `MaxSize`:
+operation path, backend server, environment, and routing all matter.
 
 That doesn't make the per-user concurrent-request ceiling irrelevant, though — it's a real,
 documented, server-enforced limit, just not one that a single `ServiceClient` instance's own

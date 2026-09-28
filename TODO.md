@@ -1,8 +1,8 @@
 # TODO — DataversePool (Dataverse Connection Pooling)
 
-Last updated: 2026-09-28 (live tests measured a 100-active-request limit per application user on one
-pinned Dataverse server, demonstrated about 40% higher successful saturated-burst throughput with
-two users, and repeated the >100-success case through real `DataversePool` leases)
+Last updated: 2026-09-28 (live tests measured independent per-user concurrency budgets and a
+practical 1.45x insert-throughput improvement with two application users through real
+`DataversePool` leases)
 
 ## Name: DataversePool (renamed from XrmPool)
 
@@ -223,6 +223,23 @@ in the entire Dataverse SDK for plain Polly users).
       harness remains the controlled per-server-limit experiment. Still open: repeated steady-state
       A/B runs to quantify sustainable throughput and find the next shared bottleneck rather than
       only proving the per-user limit scales.
+      Added `LiveInsertThroughputBenchmarkTests` for a practical write comparison against the
+      existing purpose-built `new_loadthin` standard table. Each measured operation is one
+      independent `CreateAsync` through a real `DataversePool` lease; no bulk message and no retry
+      is used. An initial 160-worker overload probe found a distinct write-path/server limit:
+      single-user runs produced 27 and 55 faults stating `Number of concurrent requests exceeded
+      the limit of 40`, while both two-user runs completed 1,000/1,000. The final non-overloaded
+      benchmark therefore used 32 leases per application user: single-user concurrency 32 versus
+      two-user aggregate concurrency 64, with the same 1,000-row workload in balanced
+      single-A/two/two/single-B order. Results: single A 286.5 rows/s, single B 381.1 rows/s
+      (average **333.8**); two-user runs 452.8 and 516.8 rows/s (average **484.8**). Every measured
+      insert succeeded, with no 429 or other error. Two users delivered **1.45x throughput** and
+      reduced average completion time from 3.06s to 2.07s (~32%). Exact cleanup deleted all
+      4,000 created rows with zero batch fault. This is direct evidence that multi-user routing can
+      make a real SQL-backed Dataverse insert workload finish faster, not only admit more synthetic
+      requests. This is explicitly a scale-out comparison: per-user concurrency stays at the safe
+      value 32 while adding a second identity raises aggregate concurrency from 32 to 64. Equal
+      offered-load isolation is covered separately by the pinned and 160-worker experiments.
 - [x] Consider an integration-test project (opt-in, against a real Dataverse instance) — implemented
       as `LiveServiceClientConcurrencyTests` in the existing `ConnectionPool.Dataverse.Tests` project
       rather than a separate project (simpler, still excluded from CI via `Category!=Integration`).
