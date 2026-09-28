@@ -11,10 +11,9 @@ using Xunit.Abstractions;
 namespace ConnectionPool.Dataverse.Tests;
 
 /// <summary>
-/// Opt-in, live-Dataverse tests that deliberately trigger a <b>genuine</b> HTTP 429
-/// service-protection response by exceeding one real application user's concurrent-request ceiling
-/// (documented as 52 concurrent requests per user), instead of only ever simulating it via
-/// <see cref="DataverseUserPool.ReportThrottled"/> in fakes.
+/// Opt-in, live-Dataverse tests that investigate one real application user's effective
+/// concurrency ceiling and classify every observed rejection, instead of only ever simulating
+/// throttling via <see cref="DataverseUserPool.ReportThrottled"/> in fakes.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -275,10 +274,10 @@ public class LiveConcurrencyThrottleTests
             if (peakInFlight > 52)
             {
                 _output.WriteLine(
-                    $"Note: genuinely reached {peakInFlight} concurrent in-flight calls (verified by direct " +
-                    "instrumentation, not inferred from average speedup) with zero rejections of any kind - " +
-                    "reasonably strong evidence this tenant/instance's real concurrency ceiling for reads is " +
-                    "genuinely higher than the commonly-cited default of 52.");
+                    $"Note: reached {peakInFlight} locally outstanding SDK calls (verified by direct " +
+                    "instrumentation, not inferred from average speedup) with zero rejections of any kind. " +
+                    "This does not prove all calls were executing inside Dataverse simultaneously because " +
+                    "client, transport, or server queues may sit between those observations.");
             }
             else
             {
@@ -294,6 +293,127 @@ public class LiveConcurrencyThrottleTests
         // not to assert a specific result either way.
     }
 
+    /// <summary>
+    /// Keeps a fixed number of heavyweight, non-<c>WhoAmI</c> requests continuously outstanding
+    /// instead of issuing a one-shot burst that may drain before the server observes sustained
+    /// pressure. Each worker immediately starts another full entity-metadata request when its
+    /// previous request completes, while every rejection shape remains visible.
+    /// </summary>
+    [Fact]
+    public async Task SustainedConcurrency_WithHeavyMetadataRequests_ExposesTheEffectiveCeiling()
+    {
+        if (string.IsNullOrEmpty(ConnectionStringA))
+        {
+            _output.WriteLine("Skipped: DVPOOL_IT_CONNECTION_STRING not set.");
+            return;
+        }
+
+        var workerCount = GetPositiveEnvironmentInteger("DVPOOL_IT_SUSTAINED_WORKERS", 80);
+        var measurementDuration = TimeSpan.FromSeconds(
+            GetPositiveEnvironmentInteger("DVPOOL_IT_SUSTAINED_SECONDS", 20));
+
+        var clientOptions = new DataverseClientOptions { MaxRetryCount = 0 };
+        await using var poolA = new DataverseUserPool(
+            "A",
+            ConnectionStringA,
+            new PoolOptions { MaxSize = workerCount, PrewarmCount = workerCount },
+            clientOptions: clientOptions);
+
+        await poolA.WarmupAsync();
+
+        var readyWorkers = 0;
+        var startGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var currentInFlight = 0;
+        var peakInFlight = 0;
+        var attempts = 0;
+        var successes = 0;
+        var recognizedThrottles = 0;
+        var otherExceptions = new ConcurrentDictionary<string, int>();
+        var retryAfters = new ConcurrentBag<TimeSpan>();
+        var latencies = new ConcurrentBag<TimeSpan>();
+
+        var workers = Enumerable.Range(0, workerCount).Select(async _ =>
+        {
+            await using var lease = await poolA.AcquireAsync();
+            lease.Resource.DisableCrossThreadSafeties = true;
+
+            if (Interlocked.Increment(ref readyWorkers) == workerCount)
+            {
+                startGate.SetResult();
+            }
+
+            await startGate.Task;
+            var deadline = Stopwatch.GetTimestamp() + (long)(measurementDuration.TotalSeconds * Stopwatch.Frequency);
+
+            while (Stopwatch.GetTimestamp() < deadline)
+            {
+                Interlocked.Increment(ref attempts);
+                var nowInFlight = Interlocked.Increment(ref currentInFlight);
+                InterlockedMax(ref peakInFlight, nowInFlight);
+                var callSw = Stopwatch.StartNew();
+                try
+                {
+                    await lease.Resource.ExecuteAsync(
+                        new RetrieveAllEntitiesRequest { EntityFilters = EntityFilters.Entity });
+                    Interlocked.Increment(ref successes);
+                }
+                catch (Exception ex)
+                {
+                    if (DataverseThrottleDetector.TryGetRetryAfter(ex, out var retryAfter))
+                    {
+                        Interlocked.Increment(ref recognizedThrottles);
+                        retryAfters.Add(retryAfter);
+                    }
+                    else
+                    {
+                        otherExceptions.AddOrUpdate(
+                            DescribeException(ex),
+                            1,
+                            static (_, count) => count + 1);
+                    }
+                }
+                finally
+                {
+                    callSw.Stop();
+                    latencies.Add(callSw.Elapsed);
+                    Interlocked.Decrement(ref currentInFlight);
+                }
+            }
+        }).ToArray();
+
+        var runSw = Stopwatch.StartNew();
+        await Task.WhenAll(workers);
+        runSw.Stop();
+
+        var latencyValues = latencies.Order().ToArray();
+        _output.WriteLine(
+            $"Sustained heavy metadata pressure: workers={workerCount}, target duration={measurementDuration}, " +
+            $"actual duration={runSw.Elapsed}, attempts={attempts}, successes={successes}, " +
+            $"recognized throttles={recognizedThrottles}, other exceptions={otherExceptions.Values.Sum()}, " +
+            $"peak locally outstanding SDK calls={peakInFlight}.");
+
+        if (latencyValues.Length > 0)
+        {
+            _output.WriteLine(
+                $"Latency: p50={Percentile(latencyValues, 0.50)}, p95={Percentile(latencyValues, 0.95)}, " +
+                $"p99={Percentile(latencyValues, 0.99)}, max={latencyValues[^1]}.");
+        }
+
+        if (!retryAfters.IsEmpty)
+        {
+            _output.WriteLine(
+                $"Observed Retry-After values: min={retryAfters.Min()}, max={retryAfters.Max()}.");
+        }
+
+        foreach (var (exception, count) in otherExceptions.OrderBy(pair => pair.Key))
+        {
+            _output.WriteLine($"Other exception ({count}x): {exception}");
+        }
+
+        Assert.Equal(attempts, successes + recognizedThrottles + otherExceptions.Values.Sum());
+        Assert.Equal(workerCount, peakInFlight);
+    }
+
     private static void InterlockedMax(ref int target, int candidate)
     {
         int initial;
@@ -305,6 +425,29 @@ public class LiveConcurrencyThrottleTests
                 return;
             }
         } while (Interlocked.CompareExchange(ref target, candidate, initial) != initial);
+    }
+
+    private static TimeSpan Percentile(TimeSpan[] sortedValues, double percentile)
+    {
+        var index = (int)Math.Ceiling(percentile * sortedValues.Length) - 1;
+        return sortedValues[Math.Clamp(index, 0, sortedValues.Length - 1)];
+    }
+
+    private static int GetPositiveEnvironmentInteger(string name, int defaultValue)
+    {
+        var rawValue = Environment.GetEnvironmentVariable(name);
+        return int.TryParse(rawValue, out var value) && value > 0 ? value : defaultValue;
+    }
+
+    private static string DescribeException(Exception exception)
+    {
+        var chain = new List<string>();
+        for (var current = exception; current is not null; current = current.InnerException)
+        {
+            chain.Add($"{current.GetType().Name}: {current.Message}");
+        }
+
+        return string.Join(" -> ", chain);
     }
 
     /// <summary>
@@ -412,9 +555,9 @@ public class LiveConcurrencyThrottleTests
                 if (peakInFlight > 52)
                 {
                     _output.WriteLine(
-                        $"Note: genuinely reached {peakInFlight} concurrent in-flight real Create calls " +
-                        "with zero rejections of any kind - the concurrent-request ceiling does not appear " +
-                        "to bite harder on writes than on reads for this tenant/instance either.");
+                        $"Note: reached {peakInFlight} locally outstanding real Create calls with zero " +
+                        "rejections of any kind. This does not prove they were all executing inside " +
+                        "Dataverse simultaneously.");
                 }
                 else
                 {

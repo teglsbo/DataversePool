@@ -2,8 +2,8 @@
 
 Connection pooling for [`Microsoft.PowerPlatform.Dataverse.Client.ServiceClient`](https://learn.microsoft.com/power-platform/developer/data-platform/xrm-tooling/use-dataverse-service-client),
 built around one core fact: **Dataverse's concurrent-request budget is enforced per application
-user, not per environment/tenant** (~52 concurrent requests per user is the commonly-cited default —
-see the [empirical notes](#a-note-on-the-52-concurrent-request-limit) below). A single application
+user, not per environment/tenant** (the exact limit is environment-dependent — see the
+[live measurements](#live-proof-multiple-application-users-raise-throughput) below). A single application
 user can only ever push so much traffic through Dataverse at once, no matter how it's called. The
 only way to raise that ceiling is to spread load across **multiple** application users (service
 principals) — and once you're doing that, you need something to round-robin/load-balance across
@@ -23,30 +23,72 @@ real bottleneck, and a `ServiceClient` carries per-instance mutable state (e.g. 
 isn't safe to share across concurrent callers using different identities. But the multi-application-user
 case — raising your effective throughput ceiling — is the main reason this library exists.
 
+> **Verified against a real Dataverse environment:** one pinned application user completed 110
+> slow requests and rejected 18 with an explicit concurrency-limit HTTP 429 in 32.7 seconds. Two
+> distinct application users on the same server completed all 160 requests in 34.0 seconds. That is
+> about **40% more successful operations per second** in this saturated burst, not merely simulated
+> routing behavior. The same 160-operation workload also completed through real `DataversePool`
+> leases with an exact 80/80 member split and no rejection.
+
 > Status: **pre-1.0 / preview**. Core design is implemented and tested (see [`TODO.md`](TODO.md)
 > for exact scope and open items). API may still shift before a 1.0 release.
 >
 > Sister project: DataverseDuck (`dvduck`) — a separate tool, not a
 > dependency of this library.
 
-## A note on the 52-concurrent-request limit
+## Live proof: multiple application users raise throughput
 
 If you came here assuming a single `ServiceClient` instance *itself* serializes concurrent async
 calls (e.g. because of some internal lock), and that this library exists to work around *that* —
 it doesn't, and it isn't. Measured directly against a real Dataverse instance, a single
 `ServiceClient` genuinely executes concurrent calls concurrently; see
 [ADR-0023](docs/adr/0023-serviceclient-async-concurrency-corrected-premise.md) for that
-measurement, and this library's own live tests, which reached **150 directly-verified,
-simultaneously in-flight read calls, and 100 directly-verified, simultaneously in-flight real
-`Create` calls, against one real application user with zero throttling in either case** on the
-tenant tested — well above the commonly-cited 52 default, for both reads and writes (see
-`TODO.md` for the full instrumented results).
+measurement. This library's live tests have also reached 150 locally outstanding metadata reads
+and 100 locally outstanding real `Create` calls against one application user with zero rejection.
+A sustained test reached 320 locally outstanding heavy metadata calls without a 429, but latency
+collapsed (p50 38s, p95 56s) and one call eventually failed at the SSL transport layer. "Locally
+outstanding" is deliberately not described as 320 requests executing simultaneously inside
+Dataverse: client, transport, or server queues may sit between those measurements.
+
+A direct Web API test then removed most of that ambiguity: one `HttpClient`, one shared
+`ARRAffinity` cookie (pinning every request to the same Dataverse web server), no retries, and the
+slow `solutioncomponents?$top=5000` query. All 64 requests in the first burst succeeded. With 128
+workers released within 26ms, **110 succeeded and 18 received HTTP 429** with error
+`0x80072326`: `Number of concurrent requests exceeded the limit of 100`. The rejected responses
+reported `Retry-After` values from 6m03s to 7m07s. This tenant therefore has a measured
+per-application-user concurrent-request limit of **100**, not the commonly cited 52.
+
+The same test was then run with **two distinct application users sharing the same affinity
+cookie/server**: 160 requests started within 39ms, split 80/80. All **160 returned HTTP 200**,
+with no 429 or transport failure. The burst completed in 34.0s (p50 21.0s, p95 33.4s), compared
+with the one-user 128-request burst's 110 successes and 18 concurrency rejections in 32.7s. This
+is approximately 4.70 successful operations/s versus 3.36/s: about **40% higher successful
+throughput** under saturation. It directly demonstrates that the per-user ceiling is independent
+per application user and that two users can keep more than one user's 100-request budget accepted
+on the same server. See
+`LivePinnedWebApiConcurrencyTests` and `TODO.md` for the full instrumented results.
+
+An increasing two-user ladder sharpened the boundary. Bursts of 180 (90/90), 200 (100/100), and
+220 (110/110 offered) all completed without rejection. At 240 (120/120 offered), each user
+completed 114 requests and received 6 explicit concurrency-limit 429s; at 256, each completed 115
+and received 13. The *offered-burst* threshold therefore fell between 220 and 240 for this query,
+while the server continued to state the actual active limit as 100 per user. Offered requests can
+exceed 200 because some finish or wait in queues before all requests are simultaneously active.
+
+The 160-request case was also executed through the real `DataversePool` API rather than the direct
+HTTP harness: every worker acquired a group lease and invoked the same slow query through
+`lease.Resource.ExecuteWebRequestAsync`. Round-robin selected each member exactly 80 times, all 160
+operations returned HTTP 200, and the corrected burst duration was 33.7s (p50 19.9s, p95 32.1s).
+This pool test uses DataversePool's normal production policy with affinity disabled; the pinned
+test above remains the controlled proof of the per-user, per-server limit.
 
 That doesn't make the per-user concurrent-request ceiling irrelevant, though — it's a real,
 documented, server-enforced limit, just not one that a single `ServiceClient` instance's own
 threading model has anything to do with hitting or avoiding. Round-robin pooling across multiple
 application users (this library's actual purpose, see above) raises that ceiling by spreading load
-across the users the limit applies to; it isn't "working around" `ServiceClient` itself.
+across the users the limit applies to; it isn't "working around" `ServiceClient` itself. A
+longer repeated one-user-versus-two-user benchmark is still required to quantify steady-state
+throughput and determine where a shared environment or endpoint bottleneck eventually takes over.
 
 ## Why not just `new ServiceClient(...)` per request?
 
@@ -55,7 +97,7 @@ across the users the limit applies to; it isn't "working around" `ServiceClient`
   [ADR-0002](docs/adr/0002-serial-creation-gate-no-parallel-cloning.md). DataversePool serializes all
   creation through a single gate so you get the fast path, not the contention path.
 - **Per-user Dataverse service-protection limits (~52 concurrent requests/user, commonly cited —
-  see the note above on how high that ceiling actually turned out to be in practice).** This is the
+  but measured as 100 per user on one pinned server in this sandbox).** This is the
   real, server-side constraint — round-robin pooling across multiple application users is the
   standard way to scale beyond one user's budget, independent of how a single `ServiceClient`
   instance behaves under concurrent load — see
@@ -138,6 +180,15 @@ await using (var lease = await pool.AcquireAsync())
 // disposing the lease returns the ServiceClient to the pool (or recycles it, if unhealthy)
 ```
 
+`MaxSize` is a **local lease/resource limit per application user**, not Dataverse's server limit.
+The values in these examples are illustrative, not recommended production defaults. In particular,
+do not hardcode 52, 80, or the sandbox's measured 100 as a universal ceiling: DataversePool disables
+server affinity, so production traffic may be spread across multiple backend servers, and capacity
+also varies by environment, workload, other processes, and other consumers of the same identity.
+Choose `MaxSize` from the application's resource and latency budget, then tune it from observed
+throughput, latency, waiting leases, and real 429 signals. Multiple processes/pods do not share the
+pool's lease count.
+
 > **`EnableAffinityCookie` is forced to `false` automatically.** Dataverse's server affinity cookie
 > (on by default) pins all requests from one `ServiceClient` to a single backend node - good for a
 > single interactive session, but counter-productive here: A pool exists specifically to spread
@@ -176,8 +227,8 @@ want to hand-roll retry logic yourself.
 
 ## Scaling to multiple application users
 
-Use this when one application (service principal) user's ~52-concurrent-request budget isn't
-enough — register several application users and let the *same* `DataversePool` type round-robin
+Use this when one application (service principal) user's concurrent-request budget isn't enough —
+register several application users and let the *same* `DataversePool` type round-robin
 across them. This is the one behavior change from the single-user quickstart above: More members
 passed to the same constructor, nothing else in your code changes.
 

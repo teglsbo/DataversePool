@@ -1,6 +1,8 @@
 # TODO — DataversePool (Dataverse Connection Pooling)
 
-Last updated: 2026-09-28 (ADR-0024: specified operation-level throughput/latency/error/throttle metrics for `PooledOrganizationService` and `ExecuteWithThrottleRetryAsync`; implementation remains pending)
+Last updated: 2026-09-28 (live tests measured a 100-active-request limit per application user on one
+pinned Dataverse server, demonstrated about 40% higher successful saturated-burst throughput with
+two users, and repeated the >100-success case through real `DataversePool` leases)
 
 ## Name: DataversePool (renamed from XrmPool)
 
@@ -161,20 +163,66 @@ in the entire Dataverse SDK for plain Polly users).
       Rewrote the test to directly instrument real-time in-flight concurrency with an
       `Interlocked` counter (peak, not inferred) and to catch *every* exception shape, not just the
       one `DataverseThrottleDetector` already recognizes, so a rejection taking an unexpected form
-      couldn't silently disappear as a false "success" either. Result with 150 real, directly-
-      verified concurrent in-flight calls (not estimated): **zero rejections of any kind** — no
-      recognized 429, no other exception type either. This is now solid evidence (not an
-      inference) that this tenant/instance's real read-concurrency ceiling is genuinely well above
-      the commonly-cited default of 52 - or that this specific request type (metadata reads) isn't
-      subject to it the same way. Followed up with `ConcurrencyBurst_WithRealWrites_ProducesGenuine429s`
+      couldn't silently disappear as a false "success" either. Result with 150 directly verified
+      locally outstanding SDK calls (not estimated): **zero rejections of any kind** — no
+      recognized 429, no other exception type either. This proves the calls were outstanding in
+      the client concurrently, but not that all 150 were executing inside Dataverse simultaneously;
+      client, transport, or server queues may sit between those two observations. Followed up with
+      `ConcurrencyBurst_WithRealWrites_ProducesGenuine429s`
       (real `Create` calls against the `task` entity, same instrumentation, always cleans up every
       created record in a `finally` and tags each with a per-run GUID) since writes carry real
       server-side cost (plugins/auditing/indexing) that reads don't, and were suspected to be where
-      the ceiling might actually bite. Result: 100 genuinely concurrent in-flight `Create` calls
+      the ceiling might actually bite. Result: 100 locally outstanding `Create` calls
       (peak directly verified, not inferred), **zero rejections of any kind** here either — and a
       separate post-run query confirmed zero orphaned test records (cleanup fully succeeded). The
-      concurrent-request ceiling does not appear to bite harder on writes than on reads for this
-      tenant/instance.
+      concurrent-request ceiling did not surface as an explicit rejection for writes either.
+      Finally added `SustainedConcurrency_WithHeavyMetadataRequests_ExposesTheEffectiveCeiling`,
+      which keeps a configurable number of heavy `RetrieveAllEntities` requests outstanding and
+      immediately replaces completed calls (`DVPOOL_IT_SUSTAINED_WORKERS`, default 80;
+      `DVPOOL_IT_SUSTAINED_SECONDS`, default 20). Live results against one application user:
+      80 workers: 161/161 successes, zero 429/errors, p50 12.2s, p95 24.1s; 160 workers:
+      250/250 successes, zero 429/errors, p50 13.3s, p95 43.7s; 320 workers: 409/410 successes,
+      zero 429s, p50 38.0s, p95 55.7s, with one call eventually failing after 2m41s as an SSL
+      `CommunicationException`. The observable capacity failure on this tenant is therefore severe
+      queueing/latency collapse followed by a transport failure, not the expected 52-request HTTP
+      429 through that SDK/metadata path. Added
+      `LivePinnedWebApiConcurrencyTests.SlowRequests_WithPinnedAffinity_ExposeTheRealConcurrentRequestOutcome`
+      to remove the main sources of ambiguity: it bypasses SDK dispatch, uses one `HttpClient` and
+      one shared `ARRAffinity` cookie to pin every request to the same Dataverse web server, releases
+      all workers through one start gate, calls the previously measured slow
+      `solutioncomponents?$top=5000` Web API endpoint, and performs no retries. At 64 workers all 64
+      requests succeeded; launch spread was 26ms, wall time 20.6s, p50 12.7s, p95 19.8s. At 128
+      workers, also launched within 26ms, **110 succeeded and 18 returned HTTP 429** with code
+      `0x80072326` and the explicit server message `Number of concurrent requests exceeded the
+      limit of 100`; reported `Retry-After` values were 6m03s-7m07s. This directly confirms a real
+      per-application-user, per-server concurrency ceiling of **100 on this tenant** and explains
+      why the commonly cited 52 was never observed. It does not yet prove two application users
+      increase useful throughput: the remaining benchmark must compare one and two identities at
+      the same aggregate offered load and determine whether the second identity bypasses this
+      per-user rejection or merely moves the bottleneck to shared environment/endpoint capacity.
+      Follow-up completed with the same affinity cookie/server and two distinct identities verified
+      through `WhoAmI`: **160 synchronized requests split 80/80 all returned HTTP 200**, with no 429
+      or transport failure. Launch spread was 39ms; wall time 34.0s; p50 21.0s, p95 33.4s. This is
+      directly above the measured one-user limit of 100 and compares with the one-user 128-request
+      burst's 110 successes plus 18 explicit concurrency-limit 429s. It therefore verifies the
+      library's central capacity premise: the concurrent-request budget is independent per
+      application user, and two users can have more than 100 requests accepted concurrently by the
+      same Dataverse server. A two-user ladder then found the offered-load edge for this operation:
+      180 (90/90), 200 (100/100), and 220 (110/110 offered) all succeeded without rejection; 240
+      produced 114 HTTP 200 plus 6 concurrency-limit 429s per identity in the corrected-gate rerun;
+      256 produced 115 HTTP 200 plus 13 429s per identity. The burst edge is therefore between 220
+      and 240 offered requests, not an assertion that 220 were all executing simultaneously:
+      completions and queues allow offered load above the server's explicit 100-active-per-user
+      limit. The symmetry of the 429s confirms both users receive independent equal budgets.
+      Also added and ran
+      `LiveDataversePoolMultiUserTests.TwoRealMembers_ExecuteMoreThanOneUsersConcurrentLimitThroughDataversePool`:
+      160 workers each acquired a real group lease and invoked the same slow query through
+      `lease.Resource.ExecuteWebRequestAsync`; round-robin selected A=80/B=80, every operation
+      returned HTTP 200, and the corrected two-phase start measured 33.7s wall time, p50 19.9s,
+      p95 32.1s. This is DataversePool's normal affinity-disabled production behavior; the pinned
+      harness remains the controlled per-server-limit experiment. Still open: repeated steady-state
+      A/B runs to quantify sustainable throughput and find the next shared bottleneck rather than
+      only proving the per-user limit scales.
 - [x] Consider an integration-test project (opt-in, against a real Dataverse instance) — implemented
       as `LiveServiceClientConcurrencyTests` in the existing `ConnectionPool.Dataverse.Tests` project
       rather than a separate project (simpler, still excluded from CI via `Category!=Integration`).
