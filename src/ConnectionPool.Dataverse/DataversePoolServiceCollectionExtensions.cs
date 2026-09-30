@@ -16,11 +16,24 @@ public static class DataversePoolServiceCollectionExtensions
     /// Registers a named, single-user Dataverse connection pool as a keyed singleton, and a hosted
     /// service that sequentially prewarms it at startup.
     /// </summary>
+    /// <param name="clientOptions">
+    /// Optional <see cref="Microsoft.PowerPlatform.Dataverse.Client.ServiceClient"/> retry overrides
+    /// applied to every pooled connection - see <see cref="DataverseClientOptions"/>. Exposed here
+    /// (not only on <see cref="DataverseUserPool"/>'s constructor) because these are the knobs that
+    /// bound how long a single call can stall inside the SDK's own retry loop before the pool's
+    /// throttle detection ever sees it; leaving DI registrants unable to set them meant the
+    /// recommended onboarding path silently kept the SDK defaults (<c>MaxRetryCount = 10</c>,
+    /// <c>RetryPauseTime = 5s</c>, i.e. up to ~50s of invisible stalling per call, and 429s absorbed
+    /// before <see cref="DataverseThrottleDetector"/> could steer away from the throttled member).
+    /// Pass <c>new DataverseClientOptions { MaxRetryCount = 0 }</c> to fail fast and let this
+    /// library own backoff instead - see docs/adr/0016.
+    /// </param>
     public static IServiceCollection AddDataverseUserPool(
         this IServiceCollection services,
         string name,
         string connectionString,
-        Action<PoolOptions>? configureOptions = null)
+        Action<PoolOptions>? configureOptions = null,
+        DataverseClientOptions? clientOptions = null)
     {
         ArgumentNullException.ThrowIfNull(services);
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
@@ -29,10 +42,14 @@ public static class DataversePoolServiceCollectionExtensions
         var options = new PoolOptions();
         configureOptions?.Invoke(options);
 
+        // Validate eagerly at registration rather than lazily inside the keyed-singleton factory,
+        // so a bad value fails at startup with a clear stack instead of on first acquire.
+        clientOptions?.Validate();
+
         services.AddKeyedSingleton<DataverseUserPool>(name, (sp, key) =>
         {
             var logger = sp.GetService<ILoggerFactory>()?.CreateLogger<DataverseUserPool>();
-            return new DataverseUserPool((string)key!, connectionString, options, logger);
+            return new DataverseUserPool((string)key!, connectionString, options, logger, clientOptions);
         });
 
         services.AddSingleton<IHostedService>(sp =>

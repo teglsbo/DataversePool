@@ -61,7 +61,21 @@ public class AcquireTimeoutTests
             },
         };
         await using var pool = new ResourcePool<FakeResource>(
-            policy, new PoolOptions { MaxSize = 2, AcquireTimeout = TimeSpan.FromMilliseconds(150) });
+            policy,
+            new PoolOptions
+            {
+                MaxSize = 2,
+                AcquireTimeout = TimeSpan.FromMilliseconds(150),
+                // Explicitly unbounded (rather than relying on PoolOptions' default) so this test
+                // keeps exercising the exact scenario it was written for: a CreateAsync that ignores
+                // its cancellation token, where the *first* acquire therefore stays parked inside
+                // creation past its own AcquireTimeout and keeps holding the serial creation gate -
+                // which is what puts the second acquire in the "stuck behind serialized creation"
+                // state being asserted below. With a finite CreateTimeout the first acquire is itself
+                // cancelled at AcquireTimeout (see PoolOptions.CreateTimeout - that is the point of
+                // its finite default), releasing the gate and dismantling the setup under test.
+                CreateTimeout = null,
+            });
 
         var firstAcquireTask = pool.AcquireAsync(); // occupies the serial creation gate
         await creationStarted.WaitAsync(TimeSpan.FromSeconds(5)); // ensure it is inside CreateAsync
@@ -102,11 +116,14 @@ public class AcquireTimeoutTests
     }
 
     [Fact]
-    public async Task AcquireAsync_WaitsIndefinitely_WhenAcquireTimeoutNotConfigured()
+    public async Task AcquireAsync_WaitsIndefinitely_WhenAcquireTimeoutExplicitlyDisabled()
     {
-        // Default (null) preserves pre-ADR-0012 behavior: no bound on the wait.
+        // An explicit null still means "no bound on the wait" (pre-ADR-0012 behavior). It is no
+        // longer the *default* - PoolOptions.AcquireTimeout now defaults to a finite duration - so
+        // this opt-out has to be requested deliberately, which is what this test pins.
         var policy = new FakePolicy();
-        await using var pool = new ResourcePool<FakeResource>(policy, new PoolOptions { MaxSize = 1 });
+        await using var pool = new ResourcePool<FakeResource>(
+            policy, new PoolOptions { MaxSize = 1, AcquireTimeout = null });
 
         var lease = await pool.AcquireAsync();
         var acquireTask = pool.AcquireAsync();

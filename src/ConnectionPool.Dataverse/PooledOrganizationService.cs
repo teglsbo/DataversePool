@@ -41,64 +41,98 @@ namespace ConnectionPool.Dataverse;
 public sealed class PooledOrganizationService : IOrganizationServiceAsync2
 {
     private readonly Func<CancellationToken, Task<DataverseLease>> _acquireLease;
+    private readonly DataverseOperationRecorder _recorder;
+    private readonly string _poolName;
 
     /// <summary>Wraps a multi-member <see cref="DataversePool"/>. Each call acquires a lease from
     /// whichever member the pool's <see cref="ISlotSelectionStrategy"/> selects - see
     /// <see cref="DataversePool.AcquireAsync"/>.</summary>
-    public PooledOrganizationService(DataversePool pool)
+    /// <param name="pool">The pool to lease from.</param>
+    /// <param name="metricsOptions">Optional operation-metrics settings (docs/adr/0024). When
+    /// omitted, the <c>pool.name</c> tag is the one the pool itself was configured with.</param>
+    public PooledOrganizationService(DataversePool pool, DataverseOperationMetricsOptions? metricsOptions = null)
+        : this(pool, metricsOptions, DataverseOperationRecorder.Shared)
+    {
+    }
+
+    internal PooledOrganizationService(DataversePool pool, DataverseOperationMetricsOptions? metricsOptions, DataverseOperationRecorder recorder)
     {
         ArgumentNullException.ThrowIfNull(pool);
+        metricsOptions?.Validate();
         _acquireLease = pool.AcquireAsync;
+        _recorder = recorder;
+        _poolName = metricsOptions?.PoolName ?? pool.MetricsPoolName;
     }
 
     /// <summary>Wraps a single-member <see cref="DataverseUserPool"/> directly, without requiring
     /// the caller to construct a one-member <see cref="DataversePool"/> just to get this facade.
     /// </summary>
-    public PooledOrganizationService(DataverseUserPool pool)
+    /// <param name="pool">The pool to lease from.</param>
+    /// <param name="metricsOptions">Optional operation-metrics settings (docs/adr/0024).</param>
+    public PooledOrganizationService(DataverseUserPool pool, DataverseOperationMetricsOptions? metricsOptions = null)
+        : this(pool, metricsOptions, DataverseOperationRecorder.Shared)
     {
-        ArgumentNullException.ThrowIfNull(pool);
-        _acquireLease = async ct => new DataverseLease(pool, await pool.AcquireAsync(ct).ConfigureAwait(false));
     }
 
-    private Task<TResult> RunAsync<TResult>(Func<ServiceClient, Task<TResult>> operation, CancellationToken cancellationToken) =>
-        LeaseScope.RunAsync(_acquireLease, lease => operation(lease.Resource), cancellationToken, ReportIfThrottled);
+    internal PooledOrganizationService(DataverseUserPool pool, DataverseOperationMetricsOptions? metricsOptions, DataverseOperationRecorder recorder)
+    {
+        ArgumentNullException.ThrowIfNull(pool);
+        metricsOptions?.Validate();
+        _acquireLease = async ct => new DataverseLease(pool, await pool.AcquireAsync(ct).ConfigureAwait(false));
+        _recorder = recorder;
+        _poolName = metricsOptions?.PoolName ?? DataverseOperationMetricsOptions.DefaultPoolName;
+    }
 
-    private Task RunAsync(Func<ServiceClient, Task> operation, CancellationToken cancellationToken) =>
-        LeaseScope.RunAsync(_acquireLease, lease => operation(lease.Resource), cancellationToken, ReportIfThrottled);
+    // Single attempt (this facade never retries), but throttle reporting still steers the pool
+    // away from the member that was just throttled. See docs/adr/0020 and docs/adr/0024.
+    private Task<TResult> RunAsync<TResult>(string operationName, Func<ServiceClient, Task<TResult>> operation, CancellationToken cancellationToken) =>
+        DataverseOperationExecutor.ExecuteAsync(
+            new OperationMetricsScope(_recorder, _poolName, operationName),
+            DataverseLeaseAccessors.Instance,
+            _acquireLease,
+            (lease, _) => operation(lease.Resource),
+            maxAttempts: 1,
+            maxRetryAfter: null,
+            cancellationToken);
 
-    // Best-effort: DataverseThrottleDetector only recognizes a specific Dataverse 429 shape, so this
-    // is a no-op for any other exception (including a plain OperationCanceledException from a
-    // caller-supplied token). See docs/adr/0020.
-    private static void ReportIfThrottled(DataverseLease lease, Exception exception) => lease.ReportIfThrottled(exception);
+    private Task RunAsync(string operationName, Func<ServiceClient, Task> operation, CancellationToken cancellationToken) =>
+        DataverseOperationExecutor.ExecuteAsync(
+            new OperationMetricsScope(_recorder, _poolName, operationName),
+            DataverseLeaseAccessors.Instance,
+            _acquireLease,
+            (lease, _) => operation(lease.Resource),
+            maxAttempts: 1,
+            maxRetryAfter: null,
+            cancellationToken);
 
     // ----- IOrganizationServiceAsync2 (cancellable) -----
 
     public Task<Guid> CreateAsync(Entity entity, CancellationToken cancellationToken) =>
-        RunAsync(svc => svc.CreateAsync(entity, cancellationToken), cancellationToken);
+        RunAsync("create", svc => svc.CreateAsync(entity, cancellationToken), cancellationToken);
 
     public Task<Entity> CreateAndReturnAsync(Entity entity, CancellationToken cancellationToken) =>
-        RunAsync(svc => svc.CreateAndReturnAsync(entity, cancellationToken), cancellationToken);
+        RunAsync("create_and_return", svc => svc.CreateAndReturnAsync(entity, cancellationToken), cancellationToken);
 
     public Task<Entity> RetrieveAsync(string entityName, Guid id, ColumnSet columnSet, CancellationToken cancellationToken) =>
-        RunAsync(svc => svc.RetrieveAsync(entityName, id, columnSet, cancellationToken), cancellationToken);
+        RunAsync("retrieve", svc => svc.RetrieveAsync(entityName, id, columnSet, cancellationToken), cancellationToken);
 
     public Task UpdateAsync(Entity entity, CancellationToken cancellationToken) =>
-        RunAsync(svc => svc.UpdateAsync(entity, cancellationToken), cancellationToken);
+        RunAsync("update", svc => svc.UpdateAsync(entity, cancellationToken), cancellationToken);
 
     public Task DeleteAsync(string entityName, Guid id, CancellationToken cancellationToken) =>
-        RunAsync(svc => svc.DeleteAsync(entityName, id, cancellationToken), cancellationToken);
+        RunAsync("delete", svc => svc.DeleteAsync(entityName, id, cancellationToken), cancellationToken);
 
     public Task<OrganizationResponse> ExecuteAsync(OrganizationRequest request, CancellationToken cancellationToken) =>
-        RunAsync(svc => svc.ExecuteAsync(request, cancellationToken), cancellationToken);
+        RunAsync("execute", svc => svc.ExecuteAsync(request, cancellationToken), cancellationToken);
 
     public Task AssociateAsync(string entityName, Guid entityId, Relationship relationship, EntityReferenceCollection relatedEntities, CancellationToken cancellationToken) =>
-        RunAsync(svc => svc.AssociateAsync(entityName, entityId, relationship, relatedEntities, cancellationToken), cancellationToken);
+        RunAsync("associate", svc => svc.AssociateAsync(entityName, entityId, relationship, relatedEntities, cancellationToken), cancellationToken);
 
     public Task DisassociateAsync(string entityName, Guid entityId, Relationship relationship, EntityReferenceCollection relatedEntities, CancellationToken cancellationToken) =>
-        RunAsync(svc => svc.DisassociateAsync(entityName, entityId, relationship, relatedEntities, cancellationToken), cancellationToken);
+        RunAsync("disassociate", svc => svc.DisassociateAsync(entityName, entityId, relationship, relatedEntities, cancellationToken), cancellationToken);
 
     public Task<EntityCollection> RetrieveMultipleAsync(QueryBase query, CancellationToken cancellationToken) =>
-        RunAsync(svc => svc.RetrieveMultipleAsync(query, cancellationToken), cancellationToken);
+        RunAsync("retrieve_multiple", svc => svc.RetrieveMultipleAsync(query, cancellationToken), cancellationToken);
 
     // ----- IOrganizationServiceAsync (no CancellationToken overload in the SDK's own interface) -----
 

@@ -23,11 +23,20 @@ public sealed class DataversePool : IAsyncDisposable
     private readonly ISlotSelectionStrategy _strategy;
     private readonly AllUnavailableBehavior _allUnavailableBehavior;
 
+    /// <param name="members">The member pools, one per Dataverse application/service user.</param>
+    /// <param name="strategy">Member selection; defaults to <see cref="HealthAwareRoundRobinSlotSelectionStrategy"/>.</param>
+    /// <param name="allUnavailableBehavior">What <see cref="AcquireAsync"/> does when every member is unavailable.</param>
+    /// <param name="metricsOptions">Optional operation-metrics settings (the <c>pool.name</c> tag) for
+    /// <see cref="ExecuteWithThrottleRetryAsync{T}(string, Func{ServiceClient, CancellationToken, Task{T}}, int?, TimeSpan?, CancellationToken)"/>
+    /// and any <see cref="PooledOrganizationService"/> wrapping this pool. See docs/adr/0024.</param>
     public DataversePool(
         IEnumerable<DataverseUserPool> members,
         ISlotSelectionStrategy? strategy = null,
-        AllUnavailableBehavior allUnavailableBehavior = AllUnavailableBehavior.FailOpen)
+        AllUnavailableBehavior allUnavailableBehavior = AllUnavailableBehavior.FailOpen,
+        DataverseOperationMetricsOptions? metricsOptions = null)
     {
+        metricsOptions?.Validate();
+        MetricsPoolName = metricsOptions?.PoolName ?? DataverseOperationMetricsOptions.DefaultPoolName;
         _members = members?.ToArray() ?? throw new ArgumentNullException(nameof(members));
         if (_members.Count == 0)
         {
@@ -45,12 +54,19 @@ public sealed class DataversePool : IAsyncDisposable
     public DataversePool(
         DataverseUserPool member,
         ISlotSelectionStrategy? strategy = null,
-        AllUnavailableBehavior allUnavailableBehavior = AllUnavailableBehavior.FailOpen)
-        : this(new[] { member ?? throw new ArgumentNullException(nameof(member)) }, strategy, allUnavailableBehavior)
+        AllUnavailableBehavior allUnavailableBehavior = AllUnavailableBehavior.FailOpen,
+        DataverseOperationMetricsOptions? metricsOptions = null)
+        : this(new[] { member ?? throw new ArgumentNullException(nameof(member)) }, strategy, allUnavailableBehavior, metricsOptions)
     {
     }
 
     public IReadOnlyList<DataverseUserPool> Members => _members;
+
+    /// <summary>The <c>pool.name</c> tag value for operation metrics. See docs/adr/0024.</summary>
+    internal string MetricsPoolName { get; }
+
+    /// <summary>Test seam: lets tests observe operation metrics on an isolated meter.</summary>
+    internal DataverseOperationRecorder Recorder { get; init; } = DataverseOperationRecorder.Shared;
 
     /// <exception cref="DataversePoolUnavailableException">
     /// Every member is circuit-open/throttled and this pool is configured with
@@ -185,12 +201,38 @@ public sealed class DataversePool : IAsyncDisposable
     /// Propagated to <see cref="AcquireAsync"/>, <paramref name="operation"/>, and the same-member
     /// wait itself.
     /// </param>
-    public async Task<T> ExecuteWithThrottleRetryAsync<T>(
+    /// <remarks>Operation metrics (docs/adr/0024) record this call with
+    /// <c>dataverse.operation.name</c> = <see cref="DataverseOperationMetrics.CustomOperationName"/>;
+    /// use the overload taking an <c>operationName</c> to distinguish workloads.</remarks>
+    public Task<T> ExecuteWithThrottleRetryAsync<T>(
+        Func<ServiceClient, CancellationToken, Task<T>> operation,
+        int? maxAttempts = null,
+        TimeSpan? maxRetryAfter = null,
+        CancellationToken cancellationToken = default) =>
+        ExecuteWithThrottleRetryAsync(DataverseOperationMetrics.CustomOperationName, operation, maxAttempts, maxRetryAfter, cancellationToken);
+
+    /// <summary>
+    /// Same as <see cref="ExecuteWithThrottleRetryAsync{T}(Func{ServiceClient, CancellationToken, Task{T}}, int?, TimeSpan?, CancellationToken)"/>,
+    /// but tags its operation metrics with <paramref name="operationName"/>. See docs/adr/0024.
+    /// </summary>
+    /// <param name="operationName">
+    /// Low-cardinality workload label recorded as <c>dataverse.operation.name</c>, e.g.
+    /// <c>"import_accounts"</c>. Must be a fixed string chosen at the call site - never derived from
+    /// record ids, entity values, user input, or exception text, since every distinct value creates
+    /// a new time series in the metrics backend.
+    /// </param>
+    /// <param name="operation">See the other overload.</param>
+    /// <param name="maxAttempts">See the other overload.</param>
+    /// <param name="maxRetryAfter">See the other overload.</param>
+    /// <param name="cancellationToken">See the other overload.</param>
+    public Task<T> ExecuteWithThrottleRetryAsync<T>(
+        string operationName,
         Func<ServiceClient, CancellationToken, Task<T>> operation,
         int? maxAttempts = null,
         TimeSpan? maxRetryAfter = null,
         CancellationToken cancellationToken = default)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(operationName);
         ArgumentNullException.ThrowIfNull(operation);
 
         var attempts = maxAttempts ?? Math.Max(_members.Count, 3);
@@ -199,41 +241,17 @@ public sealed class DataversePool : IAsyncDisposable
             throw new ArgumentOutOfRangeException(nameof(maxAttempts), maxAttempts, "Must be positive.");
         }
 
-        DataverseUserPool? previouslyThrottledMember = null;
-        var previousRetryAfter = TimeSpan.Zero;
-
-        for (var attempt = 1; ; attempt++)
-        {
-            var lease = await AcquireAsync(cancellationToken).ConfigureAwait(false);
-
-            TimeSpan retryAfter;
-            try
-            {
-                // No better option was available than the very member we just reported as throttled -
-                // wait out the capped window before trying again instead of instantly re-hitting the
-                // same still-over-budget connection. See the method's <remarks> above. Deliberately
-                // inside this try/finally (not before it) - if this delay itself is canceled, the
-                // lease must still be disposed rather than leaked. See docs/adr/0022.
-                if (previouslyThrottledMember is not null && ReferenceEquals(lease.Member, previouslyThrottledMember))
-                {
-                    await Task.Delay(previousRetryAfter, cancellationToken).ConfigureAwait(false);
-                }
-
-                return await operation(lease.Resource, cancellationToken).ConfigureAwait(false);
-            }
-            // ReportIfThrottled always runs (left side of && is unconditionally evaluated first), so
-            // the throttle window is recorded even on the final attempt - only whether we swallow the
-            // exception and loop again depends on attempts remaining.
-            catch (Exception ex) when (lease.ReportIfThrottled(ex, out retryAfter, maxRetryAfter) && attempt < attempts)
-            {
-                previouslyThrottledMember = lease.Member;
-                previousRetryAfter = retryAfter;
-            }
-            finally
-            {
-                await lease.DisposeAsync().ConfigureAwait(false);
-            }
-        }
+        // The loop itself (lease release before any same-member Retry-After wait, throttle
+        // reporting on every failed attempt, exception identity, metrics) lives in the shared
+        // executor so it's unit-testable with fake leases. See docs/adr/0019 and docs/adr/0024.
+        return DataverseOperationExecutor.ExecuteAsync(
+            new OperationMetricsScope(Recorder, MetricsPoolName, operationName),
+            DataverseLeaseAccessors.Instance,
+            AcquireAsync,
+            (lease, ct) => operation(lease.Resource, ct),
+            attempts,
+            maxRetryAfter,
+            cancellationToken);
     }
 
     public async ValueTask DisposeAsync()

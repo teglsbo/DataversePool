@@ -106,7 +106,20 @@ public sealed partial class ResourcePool<T> where T : notnull
             Task completed;
             if (_options.CreateTimeout is { } timeout)
             {
-                completed = await Task.WhenAny(createTask, Task.Delay(timeout, cancellationToken)).ConfigureAwait(false);
+                // The timeout delay is scoped to its own CTS that is cancelled as soon as the race
+                // resolves, so a completed creation doesn't leave a live timer (and a registration
+                // on the caller's token) pending for the full CreateTimeout. This matters now that
+                // CreateTimeout is on by default: without it, every single creation in a
+                // high-churn pool would leak a timer for PoolOptions.DefaultCreateTimeout.
+                using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                try
+                {
+                    completed = await Task.WhenAny(createTask, Task.Delay(timeout, timeoutCts.Token)).ConfigureAwait(false);
+                }
+                finally
+                {
+                    timeoutCts.Cancel();
+                }
             }
             else
             {

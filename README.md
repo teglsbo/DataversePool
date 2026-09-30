@@ -225,6 +225,18 @@ Choose `MaxSize` from the application's resource and latency budget, then tune i
 throughput, latency, waiting leases, and real 429 signals. Multiple processes/pods do not share the
 pool's lease count.
 
+> **`AcquireTimeout` and `CreateTimeout` default to 30 seconds, not "wait forever".** An unbounded
+> default turns a saturated pool or a hung connection attempt into callers blocked indefinitely with
+> no exception and no signal - strictly harder to diagnose than a bounded failure, and the usual
+> root cause behind "the app just got slow". `AcquireTimeout` bounds the *entire* acquire (queue wait
+> plus any inline recycle/creation), and a finite `CreateTimeout` is what makes that bound hold even
+> when the underlying `CreateAsync` ignores its cancellation token - because creation is serialized,
+> one hung create otherwise stalls every other caller. A blown `AcquireTimeout` throws
+> `PoolAcquireTimeoutException`, whose message carries a full `PoolStats` snapshot. Both are
+> deliberately generous (they exist to catch hangs, not to act as a per-operation latency budget -
+> pass your own `CancellationToken` for that); set either explicitly to `null` to restore the
+> previous unbounded behavior.
+
 > **`EnableAffinityCookie` is forced to `false` automatically.** Dataverse's server affinity cookie
 > (on by default) pins all requests from one `ServiceClient` to a single backend node - good for a
 > single interactive session, but counter-productive here: A pool exists specifically to spread
@@ -245,7 +257,8 @@ pool's lease count.
 > real server response header, so it's still correct even with `MaxRetryCount=0` - see ADR-0016 for
 > the reasoning.) Unlike the affinity cookie, there's no single correct value here - it depends on
 > your own timeout budget - so pass a `DataverseClientOptions` to `DataverseUserPool`'s constructor
-> to override any of these; leave them `null` (default) to keep the SDK's defaults. See
+> (or to `AddDataverseUserPool`) to override any of these; leave them `null` (default) to keep the
+> SDK's defaults. See
 > [ADR-0016](docs/adr/0016-affinity-cookie-forced-off-retry-knobs-exposed.md).
 
 ```csharp
@@ -393,7 +406,10 @@ services.AddDataverseUserPool("primary", connectionString, options =>
 {
     options.MaxSize = 8;
     options.PrewarmCount = 2;
-});
+},
+// Same retry knobs as DataverseUserPool's constructor - see the MaxRetryCount note above for why
+// you may want the SDK to fail fast and let this pool own backoff instead.
+clientOptions: new DataverseClientOptions { MaxRetryCount = 0 });
 services.AddDataversePool("primary-pool", new[] { "primary" }); // single member today, add more names later
 
 // resolve later:
