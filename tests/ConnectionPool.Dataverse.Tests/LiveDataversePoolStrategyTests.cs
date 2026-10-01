@@ -35,14 +35,12 @@ public class LiveDataversePoolStrategyTests
     /// documented on <see cref="LeastConnectionsSlotSelectionStrategy"/>: round-robin will keep
     /// piling new acquires onto an already-busy member.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task RoundRobin_AlternatesStrictly_EvenWhenOneMemberAlreadyHasAnExtraLease()
     {
-        if (string.IsNullOrEmpty(ConnectionStringA) || string.IsNullOrEmpty(ConnectionStringB))
-        {
-            _output.WriteLine("Skipped: DVPOOL_IT_CONNECTION_STRING / DVPOOL_IT_CONNECTION_STRING_B not both set.");
-            return;
-        }
+        Skip.If(
+            string.IsNullOrEmpty(ConnectionStringA) || string.IsNullOrEmpty(ConnectionStringB),
+            "Set DVPOOL_IT_CONNECTION_STRING and DVPOOL_IT_CONNECTION_STRING_B.");
 
         await using var poolA = new DataverseUserPool("A", ConnectionStringA, new PoolOptions { MaxSize = 4 });
         await using var poolB = new DataverseUserPool("B", ConnectionStringB, new PoolOptions { MaxSize = 4 });
@@ -80,14 +78,12 @@ public class LiveDataversePoolStrategyTests
     /// Least-connections should steer new acquires toward whichever member has fewer currently
     /// checked-out leases - the opposite of the round-robin behavior above.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task LeastConnections_PrefersTheMemberWithFewerActiveLeases()
     {
-        if (string.IsNullOrEmpty(ConnectionStringA) || string.IsNullOrEmpty(ConnectionStringB))
-        {
-            _output.WriteLine("Skipped: DVPOOL_IT_CONNECTION_STRING / DVPOOL_IT_CONNECTION_STRING_B not both set.");
-            return;
-        }
+        Skip.If(
+            string.IsNullOrEmpty(ConnectionStringA) || string.IsNullOrEmpty(ConnectionStringB),
+            "Set DVPOOL_IT_CONNECTION_STRING and DVPOOL_IT_CONNECTION_STRING_B.");
 
         await using var poolA = new DataverseUserPool("A", ConnectionStringA, new PoolOptions { MaxSize = 4 });
         await using var poolB = new DataverseUserPool("B", ConnectionStringB, new PoolOptions { MaxSize = 4 });
@@ -119,14 +115,12 @@ public class LiveDataversePoolStrategyTests
     /// client secret, so <c>CreateAsync</c> genuinely throws (an MSAL auth failure), not a
     /// simulated/mocked failure.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task HealthAwareRoundRobin_StopsRoutingToAGenuinelyBrokenMember_AfterConsecutiveFailures()
     {
-        if (string.IsNullOrEmpty(ConnectionStringA) || string.IsNullOrEmpty(ConnectionStringB))
-        {
-            _output.WriteLine("Skipped: DVPOOL_IT_CONNECTION_STRING / DVPOOL_IT_CONNECTION_STRING_B not both set.");
-            return;
-        }
+        Skip.If(
+            string.IsNullOrEmpty(ConnectionStringA) || string.IsNullOrEmpty(ConnectionStringB),
+            "Set DVPOOL_IT_CONNECTION_STRING and DVPOOL_IT_CONNECTION_STRING_B.");
 
         var brokenConnectionString = CorruptSecret(ConnectionStringB);
 

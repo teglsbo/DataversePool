@@ -74,6 +74,7 @@ public sealed partial class ResourcePool<T> where T : notnull
         {
             if (recycled)
             {
+                Interlocked.Decrement(ref _createdCount);
                 await SafeDisposeAsync(slot.Resource).ConfigureAwait(false);
             }
         }
@@ -85,7 +86,11 @@ public sealed partial class ResourcePool<T> where T : notnull
         }
         else if (recycled)
         {
-            _idle.Push(slot);
+            if (!TryPushIdle(slot))
+            {
+                Interlocked.Decrement(ref _createdCount);
+                await SafeDisposeAsync(slot.Resource).ConfigureAwait(false);
+            }
         }
 
         // Whether recovery succeeded or the slot's capacity was permanently given up, the permit is
@@ -223,6 +228,14 @@ public sealed partial class ResourcePool<T> where T : notnull
 
     private async ValueTask DisposeAbandonedSlotAsync(Slot<T> slot)
     {
-        await SafeDisposeAsync(slot.Resource).ConfigureAwait(false);
+        try
+        {
+            await SafeDisposeAsync(slot.Resource).ConfigureAwait(false);
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _createdCount);
+            ReleasePermit();
+        }
     }
 }

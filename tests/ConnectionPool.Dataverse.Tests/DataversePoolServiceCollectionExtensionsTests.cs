@@ -54,7 +54,7 @@ public class DataversePoolServiceCollectionExtensionsTests
         services.AddDataverseUserPool(
             "main",
             "dummy-connection-string",
-            clientOptions: new DataverseClientOptions { MaxRetryCount = 0 });
+            clientOptions: new DataverseClientOptions { MaxRetryCount = 0, UseWebApi = true });
 
         await using var provider = services.BuildServiceProvider();
 

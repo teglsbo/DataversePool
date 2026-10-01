@@ -39,14 +39,12 @@ public class LiveImpersonationOverheadTests
     private static int Iterations =>
         int.TryParse(Environment.GetEnvironmentVariable("DVPOOL_IT_OVERHEAD_ITERATIONS"), out var n) ? n : 30;
 
-    [Fact]
+    [SkippableFact]
     public async Task ImpersonatedCalls_OnSameOperation_AreMeasurablyComparedAgainstNonImpersonated()
     {
-        if (string.IsNullOrEmpty(ConnectionString) || string.IsNullOrEmpty(CallerAadObjectId))
-        {
-            _output.WriteLine("Skipped: DVPOOL_IT_CONNECTION_STRING / DVPOOL_IT_CALLER_AAD_OBJECT_ID_A not set.");
-            return;
-        }
+        Skip.If(
+            string.IsNullOrEmpty(ConnectionString) || string.IsNullOrEmpty(CallerAadObjectId),
+            "Set DVPOOL_IT_CONNECTION_STRING and DVPOOL_IT_CALLER_AAD_OBJECT_ID_A.");
 
         var aad = Guid.Parse(CallerAadObjectId);
         var iterations = Iterations;

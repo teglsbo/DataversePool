@@ -35,6 +35,51 @@ public class PoolShutdownTests
     }
 
     [Fact]
+    public async Task LeaseReturnedDuringShutdown_ReleasesPermitAndCompletesShutdown()
+    {
+        var policy = new FakePolicy();
+        var pool = new ResourcePool<FakeResource>(policy, new PoolOptions { MaxSize = 1 });
+        var lease = await pool.AcquireAsync();
+        var resource = lease.Resource;
+
+        var shutdown = pool.DisposeAsync().AsTask();
+        await lease.DisposeAsync();
+        await shutdown.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.True(resource.Disposed);
+        Assert.Equal(0, pool.GetStats().CreatedCount);
+    }
+
+    [Fact]
+    public async Task DisposeAsync_DuringBackgroundRecycle_DisposesReplacementInsteadOfReIdlingIt()
+    {
+        var policy = new FakePolicy();
+        await using var pool = new ResourcePool<FakeResource>(policy, new PoolOptions { MaxSize = 1 });
+
+        var lease = await pool.AcquireAsync();
+        lease.MarkUnhealthy(new InvalidOperationException("recycle this resource"));
+
+        var replacementCreationStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var allowReplacementCreation = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        policy.BeforeCreateDelay = async () =>
+        {
+            replacementCreationStarted.TrySetResult();
+            await allowReplacementCreation.Task;
+        };
+
+        await lease.DisposeAsync();
+        await replacementCreationStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var disposeTask = pool.DisposeAsync().AsTask();
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => pool.AcquireAsync());
+        allowReplacementCreation.SetResult();
+        await disposeTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(2, policy.DisposeCallCount);
+        Assert.Equal(2, policy.CreateCallCount);
+    }
+
+    [Fact]
     public async Task DisposeAsync_DisposesIdleResources()
     {
         var policy = new FakePolicy();

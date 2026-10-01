@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.ServiceModel;
 using ConnectionPool.Core;
 using Microsoft.PowerPlatform.Dataverse.Client;
 using Microsoft.Xrm.Sdk;
@@ -72,14 +73,10 @@ public class LiveConcurrencyThrottleTests
     /// after the burst finishes succeeds right away (proving the limit is a live gauge, not a
     /// multi-minute lockout) rather than waiting anywhere near the reported <c>Retry-After</c>.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task ConcurrencyBurst_AboveTheRealCeiling_ProducesGenuine429s_ThenClearsWithinSeconds()
     {
-        if (string.IsNullOrEmpty(ConnectionStringA))
-        {
-            _output.WriteLine("Skipped: DVPOOL_IT_CONNECTION_STRING not set.");
-            return;
-        }
+        Skip.If(string.IsNullOrEmpty(ConnectionStringA), "Set DVPOOL_IT_CONNECTION_STRING.");
 
         const int BurstSize = 300; // well above the documented 52-concurrent ceiling
 
@@ -173,14 +170,10 @@ public class LiveConcurrencyThrottleTests
     /// on the burst calls - every exception, recognized 429 or not, is caught and classified, so a
     /// misclassified/differently-shaped rejection cannot silently disappear as a false "success".
     /// </remarks>
-    [Fact]
+    [SkippableFact]
     public async Task ConcurrencyBurst_WithAHeavierMetadataQuery_ProducesGenuine429s()
     {
-        if (string.IsNullOrEmpty(ConnectionStringA))
-        {
-            _output.WriteLine("Skipped: DVPOOL_IT_CONNECTION_STRING not set.");
-            return;
-        }
+        Skip.If(string.IsNullOrEmpty(ConnectionStringA), "Set DVPOOL_IT_CONNECTION_STRING.");
 
         const int BurstSize = 150; // comfortably above 52 even accounting for ramp-up/ramp-down at the edges
 
@@ -227,10 +220,10 @@ public class LiveConcurrencyThrottleTests
                 if (DataverseThrottleDetector.TryGetRetryAfter(ex, out var retryAfter))
                 {
                     poolA.ReportThrottled(retryAfter);
-                    return (Outcome: "RecognizedThrottle", RetryAfter: (TimeSpan?)retryAfter, ExceptionType: ex.GetType().Name);
+                    return (Outcome: "RecognizedThrottle", RetryAfter: (TimeSpan?)retryAfter, ExceptionType: DescribeFaultShape(ex));
                 }
 
-                return (Outcome: "OtherException", RetryAfter: (TimeSpan?)null, ExceptionType: $"{ex.GetType().Name}: {ex.Message}");
+                return (Outcome: "OtherException", RetryAfter: (TimeSpan?)null, ExceptionType: DescribeFaultShape(ex));
             }
             finally
             {
@@ -299,14 +292,10 @@ public class LiveConcurrencyThrottleTests
     /// pressure. Each worker immediately starts another full entity-metadata request when its
     /// previous request completes, while every rejection shape remains visible.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task SustainedConcurrency_WithHeavyMetadataRequests_ExposesTheEffectiveCeiling()
     {
-        if (string.IsNullOrEmpty(ConnectionStringA))
-        {
-            _output.WriteLine("Skipped: DVPOOL_IT_CONNECTION_STRING not set.");
-            return;
-        }
+        Skip.If(string.IsNullOrEmpty(ConnectionStringA), "Set DVPOOL_IT_CONNECTION_STRING.");
 
         var workerCount = GetPositiveEnvironmentInteger("DVPOOL_IT_SUSTAINED_WORKERS", 80);
         var measurementDuration = TimeSpan.FromSeconds(
@@ -461,23 +450,20 @@ public class LiveConcurrencyThrottleTests
     /// every record it creates in a <c>finally</c>, tagging each one with a per-run GUID in case
     /// manual cleanup is ever needed.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task ConcurrencyBurst_WithRealWrites_ProducesGenuine429s()
     {
-        if (string.IsNullOrEmpty(ConnectionStringA))
-        {
-            _output.WriteLine("Skipped: DVPOOL_IT_CONNECTION_STRING not set.");
-            return;
-        }
+        Skip.If(string.IsNullOrEmpty(ConnectionStringA), "Set DVPOOL_IT_CONNECTION_STRING.");
 
-        const int BurstSize = 100;
+        var burstSize = GetPositiveEnvironmentInteger("DVPOOL_IT_WRITE_BURST_SIZE", 100);
+        Assert.InRange(burstSize, 1, 300);
         var runTag = Guid.NewGuid().ToString("N");
 
         var clientOptions = new DataverseClientOptions { MaxRetryCount = 0 };
         await using var poolA = new DataverseUserPool(
             "A",
             ConnectionStringA,
-            new PoolOptions { MaxSize = BurstSize, PrewarmCount = BurstSize },
+            new PoolOptions { MaxSize = burstSize, PrewarmCount = burstSize },
             clientOptions: clientOptions);
 
         await poolA.WarmupAsync();
@@ -488,7 +474,7 @@ public class LiveConcurrencyThrottleTests
 
         try
         {
-            var burstTasks = Enumerable.Range(0, BurstSize).Select(async i =>
+            var burstTasks = Enumerable.Range(0, burstSize).Select(async i =>
             {
                 await using var lease = await poolA.AcquireAsync();
                 lease.Resource.DisableCrossThreadSafeties = true;
@@ -509,10 +495,10 @@ public class LiveConcurrencyThrottleTests
                     if (DataverseThrottleDetector.TryGetRetryAfter(ex, out var retryAfter))
                     {
                         poolA.ReportThrottled(retryAfter);
-                        return (Outcome: "RecognizedThrottle", RetryAfter: (TimeSpan?)retryAfter, ExceptionType: ex.GetType().Name);
+                        return (Outcome: "RecognizedThrottle", RetryAfter: (TimeSpan?)retryAfter, ExceptionType: DescribeFaultShape(ex));
                     }
 
-                    return (Outcome: "OtherException", RetryAfter: (TimeSpan?)null, ExceptionType: $"{ex.GetType().Name}: {ex.Message}");
+                    return (Outcome: "OtherException", RetryAfter: (TimeSpan?)null, ExceptionType: DescribeFaultShape(ex));
                 }
                 finally
                 {
@@ -526,7 +512,7 @@ public class LiveConcurrencyThrottleTests
 
             var byOutcome = results.GroupBy(r => r.Outcome).ToDictionary(g => g.Key, g => g.Count());
             _output.WriteLine(
-                $"Burst size: {BurstSize} real Create calls. Peak genuinely-concurrent in-flight calls " +
+                $"Burst size: {burstSize} real Create calls. Peak genuinely-concurrent in-flight calls " +
                 $"observed: {peakInFlight}. Wall clock: {sw.Elapsed}.");
             foreach (var (outcome, count) in byOutcome)
             {
@@ -540,17 +526,15 @@ public class LiveConcurrencyThrottleTests
                 _output.WriteLine($"Observed Retry-After values: min={retryAfters.Min()}, max={retryAfters.Max()}.");
             }
 
-            var otherExceptions = results.Where(r => r.Outcome == "OtherException").Select(r => r.ExceptionType).Distinct().ToList();
-            if (otherExceptions.Count > 0)
+            var exceptionShapes = results.Where(r => r.ExceptionType is not null)
+                .GroupBy(r => r.ExceptionType)
+                .OrderByDescending(group => group.Count());
+            foreach (var shape in exceptionShapes)
             {
-                _output.WriteLine("Unrecognized exception shapes seen:");
-                foreach (var type in otherExceptions)
-                {
-                    _output.WriteLine($"  {type}");
-                }
+                _output.WriteLine($"  Exception shape ({shape.Count()}): {shape.Key}");
             }
 
-            if (recognizedThrottled.Count == 0 && otherExceptions.Count == 0)
+            if (recognizedThrottled.Count == 0 && results.All(r => r.Outcome != "OtherException"))
             {
                 if (peakInFlight > 52)
                 {
@@ -574,6 +558,7 @@ public class LiveConcurrencyThrottleTests
         finally
         {
             // Always clean up every record actually created, regardless of what else happened above.
+            var cleanupFailures = new List<Guid>();
             foreach (var recordId in createdIds)
             {
                 try
@@ -583,11 +568,39 @@ public class LiveConcurrencyThrottleTests
                 }
                 catch
                 {
-                    // Leave it - it's tagged with runTag in its subject and can be found/cleaned up
-                    // manually if a delete itself failed (e.g. also throttled).
+                    cleanupFailures.Add(recordId);
                 }
             }
+
+            Assert.True(cleanupFailures.Count == 0,
+                $"{cleanupFailures.Count} probe task(s) could not be deleted; search task subjects for DataversePool-IT-{runTag} to clean up.");
         }
+    }
+
+    private static string DescribeFaultShape(Exception exception)
+    {
+        var parts = new List<string>();
+        for (var current = exception; current is not null; current = current.InnerException)
+        {
+            if (current is FaultException<OrganizationServiceFault> fault)
+            {
+                var details = fault.Detail.ErrorDetails is { } errorDetails
+                    ? string.Join(", ", errorDetails
+                        .OrderBy(entry => entry.Key, StringComparer.Ordinal)
+                        .Select(entry => $"{entry.Key}:{entry.Value?.GetType().Name}" +
+                            (entry.Key.Equals("Retry-After", StringComparison.OrdinalIgnoreCase)
+                                ? $"={entry.Value}"
+                                : string.Empty)))
+                    : "<absent>";
+                parts.Add($"{current.GetType().FullName} code={fault.Detail.ErrorCode} details=[{details}]");
+            }
+            else
+            {
+                parts.Add(current.GetType().FullName ?? current.GetType().Name);
+            }
+        }
+
+        return string.Join(" -> ", parts);
     }
 
     /// <summary>
@@ -597,14 +610,12 @@ public class LiveConcurrencyThrottleTests
     /// least-connections and health-aware round-robin both steer new acquires to the untouched B
     /// for as long as A's real, reported throttle window lasts.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task AfterARealThrottleOnOneMember_StrategiesDivergeExactlyAsDesigned()
     {
-        if (string.IsNullOrEmpty(ConnectionStringA) || string.IsNullOrEmpty(ConnectionStringB))
-        {
-            _output.WriteLine("Skipped: DVPOOL_IT_CONNECTION_STRING / DVPOOL_IT_CONNECTION_STRING_B not both set.");
-            return;
-        }
+        Skip.If(
+            string.IsNullOrEmpty(ConnectionStringA) || string.IsNullOrEmpty(ConnectionStringB),
+            "Set DVPOOL_IT_CONNECTION_STRING and DVPOOL_IT_CONNECTION_STRING_B.");
 
         const int BurstSize = 300;
         var clientOptions = new DataverseClientOptions { MaxRetryCount = 0 };
@@ -640,11 +651,9 @@ public class LiveConcurrencyThrottleTests
 
         if (!poolA.IsThrottled)
         {
-            _output.WriteLine(
-                "Skipped divergence assertions: the burst did not produce a real, still-active " +
-                "throttle on A (this tenant may have a higher concurrency ceiling than the " +
-                "documented default, or A's window already expired by the time we checked).");
-            return;
+            Skip.If(
+                true,
+                "The burst did not produce a real, still-active throttle on A; the tenant's limit or throttle window may differ.");
         }
 
         // Plain round-robin: no concept of throttle at all - keeps alternating onto A regardless.

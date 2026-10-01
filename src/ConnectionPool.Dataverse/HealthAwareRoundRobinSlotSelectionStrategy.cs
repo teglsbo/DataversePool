@@ -16,7 +16,9 @@ namespace ConnectionPool.Dataverse;
 /// budget at once), <see cref="SlotSelection.AllMembersUnavailable"/> is reported so
 /// <see cref="DataversePool"/> can decide - per its configured
 /// <see cref="AllUnavailableBehavior"/> - whether to fail open (pick one anyway, the default,
-/// preserving docs/adr/0007 #6) or fail fast.
+/// preserving docs/adr/0007 #6) or fail fast. The operational-failure count it consumes is
+/// pool-wide, not per slot: under mixed traffic, successful returns from other slots can reset the
+/// count and mask one persistently failing clone. See docs/adr/0013.
 /// </summary>
 public sealed class HealthAwareRoundRobinSlotSelectionStrategy : ISlotSelectionStrategy
 {

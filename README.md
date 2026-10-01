@@ -16,19 +16,19 @@ members and per-member circuit breaking + throttle-awareness) and an optional Po
 pool decides is best, use it, and return/dispose it, instead of managing
 construction/cloning/round-robin/health yourself.
 
-It's also useful with just a **single** application user, for two smaller reasons: cloning a new
-`ServiceClient` is expensive enough (hundreds of ms to seconds — see
-[ADR-0002](docs/adr/0002-serial-creation-gate.md)) that constructing one per request/thread is a
-real bottleneck, and a `ServiceClient` carries per-instance mutable state (e.g. `CallerId`) that
-isn't safe to share across concurrent callers using different identities. But the multi-application-user
-case — raising your effective throughput ceiling — is the main reason this library exists.
+It's also useful with just a **single** application user: constructing a new `ServiceClient` per
+request pays the cold authentication/discovery cost (hundreds of ms to seconds), while cloning
+sequentially from a warmed base costs about 1ms ([ADR-0002](docs/adr/0002-serial-creation-gate-no-parallel-cloning.md)).
+A `ServiceClient` also carries per-instance mutable state (e.g. `CallerId`) that isn't safe to share
+across concurrent callers using different identities. But the multi-application-user case — raising
+your effective throughput ceiling — is the main reason this library exists.
 
-> **Verified against a real Dataverse environment:** one pinned application user completed 110
+> **Direct pinned raw-`HttpClient` experiment against a real Dataverse environment:** one application user completed 110
 > slow requests and rejected 18 with an explicit concurrency-limit HTTP 429 in 32.7 seconds. Two
 > distinct application users on the same server completed all 160 requests in 34.0 seconds. That is
-> about **40% more successful operations per second** in this saturated burst, not merely simulated
-> routing behavior. The same 160-operation workload also completed through real `DataversePool`
-> leases with an exact 80/80 member split and no rejection.
+> about **40% more successful operations per second** in this saturated raw-HTTP burst. This is a
+> controlled experiment, not a `DataversePool` throughput benchmark. Separately, the same 160-operation
+> workload completed through real `DataversePool` leases with an exact 80/80 member split and no rejection.
 >
 > A separate practical write benchmark inserted 1,000 independent rows into the purpose-built
 > `new_loadthin` standard table. One user with 32 leases averaged **333.8 rows/s**; two users with
@@ -146,7 +146,9 @@ throughput and determine where a shared environment or endpoint bottleneck event
 - **A dead pool member shouldn't take down the group.** The default group-pool strategy is
   health-aware: It circuit-opens a consistently-failing member, retries it after a cooldown, and
   fails open (keeps serving) rather than locking the whole pool out — see
-  [ADR-0007](docs/adr/0007-race-conditions-timeouts-and-failure-scenarios.md).
+  [ADR-0007](docs/adr/0007-race-conditions-timeouts-and-failure-scenarios.md). Its operational
+  failure count is pool-wide, not per clone; successful returns from other slots can mask one
+  persistently failing clone under mixed traffic.
 
 > **`UseWebApi` is not a substitute for pooling on read-heavy workloads.** In the current SDK,
 > `RetrieveMultiple` (and reads generally) never route through the Web API/HTTP translation path —
@@ -258,15 +260,21 @@ member.SetMaxSize(lease.Resource.RecommendedDegreesOfParallelism);
 > [Microsoft's docs](https://learn.microsoft.com/en-us/dotnet/api/microsoft.powerplatform.dataverse.client.serviceclient.enableaffinitycookie)
 > for details.
 
+> **`UseWebApi` is a pool-wide option.** Set it in the connection string or via
+> `DataverseClientOptions.UseWebApi`; the configured baseline is restored when each lease returns,
+> so callers must not toggle it per lease. The SDK routes only eligible operations through Web API
+> (including `Create`, `Update`, and `Delete`); reads such as `RetrieveMultiple` still use the legacy
+> proxy path. See the Web API note above for the effect on read-heavy workloads.
+
 > **`MaxRetryCount`/`RetryPauseTime`/`UseExponentialRetryDelayForConcurrencyThrottle` are optional
 > overrides, not forced.** The SDK's own defaults (10 retries, 5s pause) mean a single call hitting a
 > transient error can silently block a leased client for up to ~50 seconds before an exception ever
 > reaches this pool's throttle detection or a circuit breaker built on top of it. `MaxRetryCount`
 > also governs HTTP 429 (service-protection/throttling) retries, not just other transient errors -
-> set it to `0` to make the SDK fail fast on either and let this pool's own throttle
-> detection/circuit breaker drive backoff instead. (The `Retry-After` value the pool reads is the
-> real server response header, so it's still correct even with `MaxRetryCount=0` - see ADR-0016 for
-> the reasoning.) Unlike the affinity cookie, there's no single correct value here - it depends on
+> set it to `0` to make the SDK fail fast. The pool currently detects HTTP 429s, but SOAP-fault
+> throttles have not been confirmed or classified; do not assume that the pool can honor their
+> `Retry-After` when SDK retries are disabled. Unlike the affinity cookie, there's no single correct
+> value here - it depends on
 > your own timeout budget - so pass a `DataverseClientOptions` to `DataverseUserPool`'s constructor
 > (or to `AddDataverseUserPool`) to override any of these; leave them `null` (default) to keep the
 > SDK's defaults. See
@@ -276,7 +284,7 @@ member.SetMaxSize(lease.Resource.RecommendedDegreesOfParallelism);
 var member = new DataverseUserPool(
     "sample-user",
     connectionString,
-    clientOptions: new DataverseClientOptions { MaxRetryCount = 0 }); // fail fast, let the pool own backoff
+    clientOptions: new DataverseClientOptions { MaxRetryCount = 0, UseWebApi = true }); // fail fast; enable Web API where supported
 ```
 
 **Never going to scale beyond one user, and want to skip the selection-strategy layer entirely?**
@@ -444,15 +452,20 @@ If you want a failing/opening resilience pipeline to also mark the pooled resour
 it gets recycled instead of handed out again), add `DataversePool.Polly`:
 
 ```csharp
+using ConnectionPool.Dataverse;
 using ConnectionPool.Dataverse.Polly;
 using Polly;
 
 var pipeline = new ResiliencePipelineBuilder<WhoAmIResponse>()
-    .AddRetryWithPoolHealthSignal(lease, new RetryStrategyOptions<WhoAmIResponse>
-    {
-        ShouldHandle = new PredicateBuilder<WhoAmIResponse>().Handle<Exception>(),
-        MaxRetryAttempts = 3,
-    })
+    .AddRetryWithPoolHealthSignal(
+        lease,
+        new RetryStrategyOptions<WhoAmIResponse>
+        {
+            ShouldHandle = new PredicateBuilder<WhoAmIResponse>().Handle<Exception>(),
+            MaxRetryAttempts = 3,
+        },
+        shouldMarkUnhealthy: exception =>
+            !DataverseThrottleDetector.TryGetRetryAfter(exception, out _))
     .Build();
 
 var response = await pipeline.ExecuteAsync(async _ => (WhoAmIResponse)lease.Resource.Execute(new WhoAmIRequest()));
@@ -460,7 +473,10 @@ var response = await pipeline.ExecuteAsync(async _ => (WhoAmIResponse)lease.Reso
 
 Any `OnRetry`/`OnOpened` callback you already had on `RetryStrategyOptions`/`CircuitBreakerStrategyOptions`
 keeps firing — `AddRetryWithPoolHealthSignal`/`AddCircuitBreakerWithPoolHealthSignal` only adds the
-`lease.MarkUnhealthy(...)` call, it doesn't replace your callback.
+`lease.MarkUnhealthy(...)` call, it doesn't replace your callback. By default every exception marks
+the resource unhealthy; the optional `shouldMarkUnhealthy` predicate lets Dataverse callers exclude
+recognized throttles, which affect the application user's request budget rather than the connection's
+health. The detector currently recognizes HTTP 429s; SOAP-fault detection remains pending confirmation.
 
 ## Optional: Metrics (OpenTelemetry-compatible)
 

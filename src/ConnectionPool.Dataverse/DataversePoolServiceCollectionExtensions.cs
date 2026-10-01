@@ -25,8 +25,8 @@ public static class DataversePoolServiceCollectionExtensions
     /// recommended onboarding path silently kept the SDK defaults (<c>MaxRetryCount = 10</c>,
     /// <c>RetryPauseTime = 5s</c>, i.e. up to ~50s of invisible stalling per call, and 429s absorbed
     /// before <see cref="DataverseThrottleDetector"/> could steer away from the throttled member).
-    /// Pass <c>new DataverseClientOptions { MaxRetryCount = 0 }</c> to fail fast and let this
-    /// library own backoff instead - see docs/adr/0016.
+    /// Pass <c>new DataverseClientOptions { MaxRetryCount = 0 }</c> to fail fast; pool-owned
+    /// backoff currently recognizes HTTP 429s, not unverified SOAP faults - see docs/adr/0016.
     /// </param>
     public static IServiceCollection AddDataverseUserPool(
         this IServiceCollection services,

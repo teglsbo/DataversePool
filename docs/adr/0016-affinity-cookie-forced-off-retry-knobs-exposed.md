@@ -56,24 +56,19 @@ assumed from docs), so both are fixable without reflecting into private SDK inte
 - Callers with a tight end-to-end timeout budget (e.g. driven by `PoolOptions.AcquireTimeout` or
   their own operation timeout) can now lower `MaxRetryCount`/`RetryPauseTime` so SDK-internal retries
   don't silently eat most of that budget before the pool/circuit breaker ever sees a failure.
-- **Does `MaxRetryCount=0` still give the pool a usable backoff signal on 429?** Yes, by reasoning
-  (not directly verified against a live connection - see the testing note below):
-  `DataverseThrottleDetector` reads `Retry-After` from `HttpOperationException.Response.Headers`,
-  which mirrors the actual server response Dataverse sent back. That header reflects what the
-  server returned on the very first 429, not something synthesized only once the SDK's retry budget
-  is exhausted. So `MaxRetryCount=0` only changes *whether the SDK retries before throwing* - not
-  what's attached to the resulting exception - and the throttle signal is preserved. This is the
-  same exception path already verified via reflection for the exhausted-retry case in docs/adr/0008,
-  applied here by analogy to the immediate/zero-retry case.
+- **Does `MaxRetryCount=0` still give the pool a usable backoff signal on 429?** On the Web API
+  path, the detector reads `Retry-After` from `HttpOperationException.Response.Headers` (inferred
+  for the zero-retry case, not live-verified). SOAP calls may instead throw a different fault that
+  the current detector cannot classify. The previous blanket "yes" was too strong: a SOAP
+  `Retry-After` signal must be observed and verified before relying on pool-owned backoff.
 - Not solved: proactively reading Dataverse's `x-ms-ratelimit-*`/`x-ms-dop-hint` response headers
   before a call fails - still not possible, per docs/adr/0008, because `ServiceClient` does not
   surface headers for successful calls.
 - Testing: `ServiceClient` cannot be constructed without a live Dataverse connection (its
   parameterless constructor is private, `IsReady` is non-virtual, so it can't be subclassed/faked),
-  so the actual override *application* to a real client, and the `MaxRetryCount=0` 429 reasoning
-  above, are not unit-testable. What is tested: `DataverseClientOptions.Validate()` range checks,
-  and that `DataverseServiceClientPolicy`'s constructor runs that validation eagerly (throws
-  `ArgumentOutOfRangeException` before any network attempt) - see `DataverseClientOptionsTests`.
+  so zero-retry throttling cannot be unit-tested. `DataverseClientOptionsTests` covers validation,
+  and its opt-in integration test verifies option application and return scrubbing against a real
+  client. A live SOAP throttle has not been observed; see `PLAN-2026-09-30.md`.
 
 > **Addendum (applies to the 'Not solved' bullet above) (2026-10-01):** `x-ms-dop-hint` is *not* out of reach. `ServiceClient.RecommendedDegreesOfParallelism`
 > (public) is fed by that header on both the SOAP and Web API transports (verified against SDK 1.2.27). It is a

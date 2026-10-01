@@ -43,6 +43,7 @@ public sealed partial class ResourcePool<T> : IAsyncDisposable where T : notnull
     private readonly SemaphoreSlim _warmupGate = new(1, 1);
 
     private readonly ConcurrentStack<Slot<T>> _idle = new();
+    private readonly object _idlePushLock = new();
     private int _createdCount;
     private int _waitingCount;
     private int _unhealthyOrRecyclingCount;
@@ -234,7 +235,12 @@ public sealed partial class ResourcePool<T> : IAsyncDisposable where T : notnull
                     }
 
                     var slot = await CreateNewSlotAsync(cancellationToken).ConfigureAwait(false);
-                    _idle.Push(slot);
+                    if (!TryPushIdle(slot))
+                    {
+                        Interlocked.Decrement(ref _createdCount);
+                        await SafeDisposeAsync(slot.Resource).ConfigureAwait(false);
+                        throw new ObjectDisposedException(nameof(ResourcePool<T>));
+                    }
                 }
                 finally
                 {
@@ -409,10 +415,28 @@ public sealed partial class ResourcePool<T> : IAsyncDisposable where T : notnull
             return SafeDisposeAsync(slot.Resource);
         }
 
+        try
+        {
+            _policy.OnReturned(slot.Resource!); // scrub any per-lease state before next caller (ADR-0009)
+        }
+        catch (Exception exception)
+        {
+            slot.State = SlotState.Unhealthy;
+            slot.LastIncidentException = exception;
+            slot.LastIncidentAt = DateTimeOffset.UtcNow;
+            slot.LastIncidentWasLeak = false;
+            PublishHealthChanged(SlotHealthState.MarkedUnhealthy, slot.LastIncident);
+            _ = RecycleInBackgroundAsync(slot);
+            return ValueTask.CompletedTask;
+        }
+
         slot.State = SlotState.Idle;
         slot.BecameIdleAt = DateTimeOffset.UtcNow;
-        _policy.OnReturned(slot.Resource!); // scrub any per-lease state before next caller (ADR-0009)
-        _idle.Push(slot);
+        if (!TryPushIdle(slot))
+        {
+            return DisposeAbandonedSlotAsync(slot);
+        }
+
         ReleasePermit();
         return ValueTask.CompletedTask;
     }
@@ -525,7 +549,16 @@ public sealed partial class ResourcePool<T> : IAsyncDisposable where T : notnull
         // Drain _idle while still holding every permit collected above, so a concurrent
         // AcquireAsync cannot win one of these permits (once released, below) and pop/create a
         // slot while this loop is in the middle of disposing idle resources. See docs/adr/0022.
-        while (_idle.TryPop(out var slot))
+        List<Slot<T>> idleSlots = new();
+        lock (_idlePushLock)
+        {
+            while (_idle.TryPop(out var slot))
+            {
+                idleSlots.Add(slot);
+            }
+        }
+
+        foreach (var slot in idleSlots)
         {
             await SafeDisposeAsync(slot.Resource).ConfigureAwait(false);
         }
@@ -545,6 +578,20 @@ public sealed partial class ResourcePool<T> : IAsyncDisposable where T : notnull
         foreach (var observer in observersSnapshot)
         {
             observer.OnCompleted();
+        }
+    }
+
+    private bool TryPushIdle(Slot<T> slot)
+    {
+        lock (_idlePushLock)
+        {
+            if (Volatile.Read(ref _poolDisposed) == 1)
+            {
+                return false;
+            }
+
+            _idle.Push(slot);
+            return true;
         }
     }
 

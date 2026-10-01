@@ -59,14 +59,12 @@ public class LiveServiceClientConcurrencyTests
     /// latency, the same as sequential. If it does not serialize, concurrent time should be much
     /// closer to a single call's latency.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task ConcurrentRequests_OnSameInstance_AreNotSerializedByTheSdk()
     {
-        if (string.IsNullOrEmpty(ConnectionString))
-        {
-            _output.WriteLine("Skipped: DVPOOL_IT_CONNECTION_STRING not set.");
-            return;
-        }
+        Skip.If(
+            string.IsNullOrEmpty(ConnectionString),
+            "Set DVPOOL_IT_CONNECTION_STRING.");
 
         var requestCount = int.TryParse(
             Environment.GetEnvironmentVariable("DVPOOL_IT_REQUEST_COUNT"),
@@ -121,17 +119,14 @@ public class LiveServiceClientConcurrencyTests
     /// as a fallback for records whose ownership ended up mixed up by a race.
     /// </para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task ConcurrentRequests_WithDifferentCallerAadObjectIds_OnSameInstance_DoNotMixUpIdentity()
     {
-        if (string.IsNullOrEmpty(ConnectionString) ||
+        Skip.If(
+            string.IsNullOrEmpty(ConnectionString) ||
             string.IsNullOrEmpty(CallerAadObjectIdA) ||
-            string.IsNullOrEmpty(CallerAadObjectIdB))
-        {
-            _output.WriteLine("Skipped: DVPOOL_IT_CONNECTION_STRING / DVPOOL_IT_CALLER_AAD_OBJECT_ID_A / " +
-                               "DVPOOL_IT_CALLER_AAD_OBJECT_ID_B not all set.");
-            return;
-        }
+            string.IsNullOrEmpty(CallerAadObjectIdB),
+            "Set DVPOOL_IT_CONNECTION_STRING, DVPOOL_IT_CALLER_AAD_OBJECT_ID_A, and DVPOOL_IT_CALLER_AAD_OBJECT_ID_B.");
 
         var aadA = Guid.Parse(CallerAadObjectIdA);
         var aadB = Guid.Parse(CallerAadObjectIdB);

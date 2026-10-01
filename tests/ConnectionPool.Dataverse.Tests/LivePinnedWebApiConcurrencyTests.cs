@@ -32,17 +32,13 @@ public class LivePinnedWebApiConcurrencyTests
     /// <c>DVPOOL_IT_PINNED_CONCURRENCY</c>. Each worker sends exactly one request; there are no
     /// retries, so every 429 and every other HTTP or transport failure remains visible.
     /// </remarks>
-    [Fact]
+    [SkippableFact]
     public async Task SlowRequests_WithPinnedAffinity_ExposeTheRealConcurrentRequestOutcome()
     {
         var connectionString = GetConnectionString();
-        if (connectionString is null)
-        {
-            _output.WriteLine(
-                "Skipped: set DVPOOL_IT_CONNECTION_STRING or DVPOOL_IT_URL, " +
-                "DVPOOL_IT_TENANT_ID, DVPOOL_IT_CLIENT_ID, and DVPOOL_IT_CLIENT_SECRET.");
-            return;
-        }
+        Skip.If(
+            connectionString is null,
+            "Set DVPOOL_IT_CONNECTION_STRING or DVPOOL_IT_URL, DVPOOL_IT_TENANT_ID, DVPOOL_IT_CLIENT_ID, and DVPOOL_IT_CLIENT_SECRET.");
 
         var concurrency = GetPositiveEnvironmentInteger("DVPOOL_IT_PINNED_CONCURRENCY", 128);
 
@@ -225,18 +221,14 @@ public class LivePinnedWebApiConcurrencyTests
     /// affinity cookie and Dataverse web server. The default is 160 aggregate requests, split 80/80:
     /// above the measured single-user limit of 100, but below it for each identity independently.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task SlowRequests_WithTwoAppUsers_SustainMoreThanOneUsersConcurrentLimit()
     {
         var connectionStringA = GetConnectionString();
         var connectionStringB = GetConnectionString("_B");
-        if (connectionStringA is null || connectionStringB is null)
-        {
-            _output.WriteLine(
-                "Skipped: both application users require connection strings or URL, tenant, " +
-                "client ID, and client secret environment variables (second user uses suffix _B).");
-            return;
-        }
+        Skip.If(
+            connectionStringA is null || connectionStringB is null,
+            "Set credentials for both application users; the second user's variables use suffix _B.");
 
         var aggregateConcurrency = GetPositiveEnvironmentInteger(
             "DVPOOL_IT_PINNED_TWO_USER_CONCURRENCY",

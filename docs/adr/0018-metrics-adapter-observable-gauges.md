@@ -6,10 +6,10 @@ Accepted
 ## Context
 The library already exposes pool health three ways: a pull-based snapshot (`ResourcePool<T>.GetStats()`
 / `PoolStats`, also surfaced by `DataverseUserPool.GetStats()`), a push event
-(`ResourcePool<T>.HealthChanges`), and a push callback (`PoolOptions.OnLeakDetected`), plus routine
-`ILogger` logging throughout. None of these plug into a metrics backend (Prometheus, OTLP, Azure
-Monitor, etc.) without the caller writing glue code themselves. The user asked whether the library
-should ship that glue.
+(`ResourcePool<T>.HealthChanges`), and a push callback (`PoolOptions.OnLeakDetected`). The optional
+`ILogger` is forwarded to the Dataverse SDK; the library itself currently emits no log statements.
+None of these plug into a metrics backend (Prometheus, OTLP, Azure Monitor, etc.) without the caller
+writing glue code themselves. The user asked whether the library should ship that glue.
 
 `System.Diagnostics.Metrics` (the `Meter`/`Instrument` API introduced in .NET 6) is the standard,
 vendor-neutral way to publish metrics from a .NET library: any OpenTelemetry-compatible exporter can

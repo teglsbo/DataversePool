@@ -27,16 +27,14 @@ public class LiveInsertThroughputBenchmarkTests
     /// through a real <see cref="DataversePool"/> lease; no bulk message or retry can hide the
     /// operation-level behavior being compared.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task IndependentCreates_CompareOneAndTwoApplicationUsers()
     {
         var connectionStringA = GetConnectionString();
         var connectionStringB = GetConnectionString("_B");
-        if (connectionStringA is null || connectionStringB is null)
-        {
-            _output.WriteLine("Skipped: credentials for both application users are not set.");
-            return;
-        }
+        Skip.If(
+            connectionStringA is null || connectionStringB is null,
+            "Set credentials for both application users.");
 
         var rowCount = GetPositiveEnvironmentInteger("DVPOOL_IT_INSERT_ROWS", 1_000);
         var concurrencyPerUser =
