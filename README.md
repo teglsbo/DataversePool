@@ -479,6 +479,46 @@ Scope is deliberately generic (the `ConnectionPool.Core` `PoolStats` fields only
 signals like per-member circuit breaker state aren't covered yet. See
 [ADR-0018](docs/adr/0018-metrics-adapter-observable-gauges.md).
 
+### Operation latency, retries and throttles (built in)
+
+Gauges show *how full* the pool is, not *how long calls take*. `ConnectionPool.Dataverse` itself
+(no extra package) also publishes push-based histograms and counters on the same `"DataversePool"`
+meter for every call through `PooledOrganizationService` and `ExecuteWithThrottleRetryAsync`. The
+same `AddMeter("DataversePool")` line above picks them up. With no listener attached, they cost
+one flag check per call.
+
+| Instrument | Type | Tells you |
+|---|---|---|
+| `dataversepool.operation.acquire.duration` (s) | histogram | Time waiting for a lease — pool saturation or slow client creation |
+| `dataversepool.operation.duration` (s) | histogram | Time inside `ServiceClient` per attempt, including the SDK's own internal retries |
+| `dataversepool.operation.total.duration` (s) | histogram | End-to-end call latency across all attempts and `Retry-After` waits |
+| `dataversepool.operation.active` / `.waiting` | up-down counter | Calls executing now / queued for a lease now |
+| `dataversepool.operation.attempts` / `.calls` | counter | Attempts vs caller-visible calls |
+| `dataversepool.operation.retries` | counter | Retries scheduled after a recognized throttle |
+| `dataversepool.operation.retry_after` (s) | histogram | Capped `Retry-After` per recognized throttle |
+
+Tags: `pool.name`, `pool.member.name`, `dataverse.operation.name`, `outcome`
+(`success`/`error`/`throttled`/`canceled`) and `error.type` (exception type name only — never
+messages, IDs or URLs). The facade uses fixed operation names (`create`, `retrieve`,
+`retrieve_multiple`, `execute`, …). For the retry helper, pass a fixed low-cardinality name:
+
+```csharp
+await pool.ExecuteWithThrottleRetryAsync("import_accounts", (client, ct) => client.CreateAsync(entity, ct));
+```
+
+`pool.name` defaults to `"default"`. Set it with `new DataverseOperationMetricsOptions { PoolName = "orders" }`
+on the `DataversePool`/`PooledOrganizationService` constructor. `AddDataversePool` uses its pool name
+automatically.
+
+Two limits to know:
+- Calls made directly on `lease.Resource` are **not** measured. The library can't see inside your
+  own `ServiceClient` usage, so instrument it yourself if you need it.
+- A long `operation.duration` with few `retries` usually means the SDK is absorbing 429s internally
+  before this library ever sees them. Lower `DataverseClientOptions.MaxRetryCount` if you want those
+  stalls bounded and visible here.
+
+See [ADR-0024](docs/adr/0024-operation-level-metrics-on-instrumented-execution-paths.md).
+
 ## Optional: Drop-in `IOrganizationServiceAsync` facade
 
 If your codebase already has code built around a constructor-injected `IOrganizationServiceAsync`/
@@ -581,7 +621,7 @@ Every non-obvious choice is written up as an ADR in [`docs/adr/`](docs/adr/):
 21. [Base-client factory constructor for `DataverseServiceClientPolicy`/`DataverseUserPool`](docs/adr/0021-base-client-factory-constructor.md)
 22. [Shutdown disposal race, throttle-retry lease leak, probe-claim leak fixes](docs/adr/0022-shutdown-and-probe-claim-leak-fixes.md)
 23. [Corrected premise: A `ServiceClient` does not serialize concurrent async requests](docs/adr/0023-serviceclient-async-concurrency-corrected-premise.md)
-24. [Proposed operation-level metrics on instrumented execution paths](docs/adr/0024-operation-level-metrics-on-instrumented-execution-paths.md)
+24. [Operation-level metrics on instrumented execution paths](docs/adr/0024-operation-level-metrics-on-instrumented-execution-paths.md)
 
 ## Status / open items
 

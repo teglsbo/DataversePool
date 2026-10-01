@@ -98,3 +98,10 @@ instance can issue.)
   README's facade section so a caller relying on cancellation-based timeouts around read-heavy
   workloads - this ADR's own motivating scenario - knows this up front rather than discovering it
   under a stuck timeout.
+
+## Addendum (2026-10-01)
+
+`LeaseScope` was replaced by the generic `DataverseOperationExecutor`, which is shared with
+`ExecuteWithThrottleRetryAsync` and adds the ADR-0024 metrics. The guarantees above are unchanged:
+the lease is released exactly once, the exception instance is preserved, and the throttle is
+reported before release. Their tests moved to `DataverseOperationExecutorTests`.

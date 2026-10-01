@@ -20,7 +20,7 @@ namespace ConnectionPool.Dataverse;
 /// This is a convenience bridge, not a replacement for the full pool API: it does not retry a
 /// throttled call. It does, however, report a recognized Dataverse throttling signal (HTTP 429)
 /// back to whichever member served the failing call, via the same
-/// <see cref="DataverseLease.ReportIfThrottled"/> mechanism <see cref="DataversePool.ExecuteWithThrottleRetryAsync{T}"/>
+/// <see cref="DataverseLease.ReportIfThrottled"/> mechanism <see cref="DataversePool.ExecuteWithThrottleRetryAsync{T}(string, Func{ServiceClient, CancellationToken, Task{T}}, int?, TimeSpan?, CancellationToken)"/>
 /// uses - so a multi-member <see cref="DataversePool"/> consumed only through this facade still
 /// steers future acquires away from a member that Dataverse just throttled, not just plain
 /// round-robin distribution with no throttle-awareness. Exceptions from the underlying

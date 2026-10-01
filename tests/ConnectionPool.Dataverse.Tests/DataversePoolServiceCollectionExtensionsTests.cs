@@ -39,6 +39,7 @@ public class DataversePoolServiceCollectionExtensionsTests
 
         await using var provider = services.BuildServiceProvider();
         var group = provider.GetRequiredKeyedService<DataversePool>("group-1");
+        Assert.Equal("group-1", group.MetricsPoolName); // DI key doubles as the metrics pool.name
 
         Assert.Equal(new[] { "user-a", "user-b" }, group.Members.Select(m => m.Name));
     }

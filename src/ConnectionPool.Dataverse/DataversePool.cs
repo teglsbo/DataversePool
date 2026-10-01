@@ -225,7 +225,7 @@ public sealed class DataversePool : IAsyncDisposable
     /// <param name="maxAttempts">See the other overload.</param>
     /// <param name="maxRetryAfter">See the other overload.</param>
     /// <param name="cancellationToken">See the other overload.</param>
-    public Task<T> ExecuteWithThrottleRetryAsync<T>(
+    public async Task<T> ExecuteWithThrottleRetryAsync<T>(
         string operationName,
         Func<ServiceClient, CancellationToken, Task<T>> operation,
         int? maxAttempts = null,
@@ -244,14 +244,14 @@ public sealed class DataversePool : IAsyncDisposable
         // The loop itself (lease release before any same-member Retry-After wait, throttle
         // reporting on every failed attempt, exception identity, metrics) lives in the shared
         // executor so it's unit-testable with fake leases. See docs/adr/0019 and docs/adr/0024.
-        return DataverseOperationExecutor.ExecuteAsync(
+        return await DataverseOperationExecutor.ExecuteAsync(
             new OperationMetricsScope(Recorder, MetricsPoolName, operationName),
             DataverseLeaseAccessors.Instance,
             AcquireAsync,
             (lease, ct) => operation(lease.Resource, ct),
             attempts,
             maxRetryAfter,
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
     }
 
     public async ValueTask DisposeAsync()

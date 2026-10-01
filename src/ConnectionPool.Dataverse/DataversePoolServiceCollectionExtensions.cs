@@ -83,7 +83,12 @@ public static class DataversePoolServiceCollectionExtensions
         {
             var members = memberPoolNames.Select(sp.GetRequiredKeyedService<DataverseUserPool>);
             var strategy = strategyFactory?.Invoke(sp);
-            return new DataversePool(members, strategy, allUnavailableBehavior);
+            // The DI key doubles as the operation-metrics pool.name tag (docs/adr/0024).
+            return new DataversePool(
+                members,
+                strategy,
+                allUnavailableBehavior,
+                new DataverseOperationMetricsOptions { PoolName = poolName });
         });
 
         return services;
