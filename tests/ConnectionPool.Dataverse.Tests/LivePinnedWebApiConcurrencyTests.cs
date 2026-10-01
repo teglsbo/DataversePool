@@ -71,7 +71,7 @@ public class LivePinnedWebApiConcurrencyTests
         http.DefaultRequestHeaders.Add("OData-MaxVersion", "4.0");
         http.DefaultRequestHeaders.Add("OData-Version", "4.0");
 
-        var whoAmIUri = new Uri(environmentUri, "api/data/v9.2/WhoAmI");
+        var whoAmIUri = new Uri(environmentUri, "api/data/v9.2/WhoAmI()");
         using (var warmup = await http.GetAsync(whoAmIUri))
         {
             Assert.True(
@@ -266,7 +266,7 @@ public class LivePinnedWebApiConcurrencyTests
         http.DefaultRequestHeaders.Add("OData-MaxVersion", "4.0");
         http.DefaultRequestHeaders.Add("OData-Version", "4.0");
 
-        var whoAmIUri = new Uri(environmentUri, "api/data/v9.2/WhoAmI");
+        var whoAmIUri = new Uri(environmentUri, "api/data/v9.2/WhoAmI()");
         var userIdA = await WarmupAndGetUserIdAsync(http, whoAmIUri, accessTokenA);
         var affinityAfterA = GetAffinityCookie(cookies, environmentUri);
         var userIdB = await WarmupAndGetUserIdAsync(http, whoAmIUri, accessTokenB);
