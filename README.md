@@ -360,6 +360,11 @@ needs.
 > opt back into Dataverse's raw value. See
 > [ADR-0017](docs/adr/0017-group-throttle-retry-helper-and-capped-retry-after.md).
 
+> **Scaling and telemetry notes.** Pool size is static (`MaxSize`, no autoscaling or idle eviction); throughput scales
+> by adding application users to a `DataversePool` (round-robin group). `ServiceClient.RecommendedDegreesOfParallelism` exposes
+> Dataverse's `x-ms-dop-hint` but is not yet consumed by the pool. Capturing `x-ms-*` headers on successful calls
+> needs an HTTP-level observer outside `ServiceClient`; see `REVIEW-2026-09-30.md` Part 2.
+
 Why 429/exception-based rather than proactively reading Dataverse's `x-ms-ratelimit-*` response
 headers on every call: Headers are the theoretically better (leading, not lagging) signal, but
 `ServiceClient` doesn't surface response headers for *successful* calls anywhere in its public API

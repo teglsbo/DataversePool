@@ -73,3 +73,7 @@ the recommended default starting point changed. `DataverseUserPool` remains avai
 the narrowest "never scaling, want zero selection-strategy overhead" case this ADR originally
 described.
 
+> **Addendum (2026-10-01):** `x-ms-dop-hint` is *not* out of reach. `ServiceClient.RecommendedDegreesOfParallelism`
+> (public) is fed by that header on both the SOAP and Web API transports (verified against SDK 1.2.27). It is a
+> server-supplied per-client hint usable for throttle-aware selection without any response capture. Not yet wired
+> into the pool. `x-ms-ratelimit-*` remains unreachable through `ServiceClient`. See `REVIEW-2026-09-30.md`.
