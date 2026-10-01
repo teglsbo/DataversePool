@@ -46,6 +46,19 @@ public sealed class DataverseUserPool : IAsyncDisposable
 
     public PoolStats GetStats() => _pool.GetStats();
 
+    /// <summary>This member's current concurrency limit (its maximum concurrently leased
+    /// <c>ServiceClient</c>s). See <see cref="SetMaxSize"/>.</summary>
+    public int MaxSize => _pool.MaxSize;
+
+    /// <summary>
+    /// Changes this member's concurrency limit at runtime - for example to follow
+    /// <c>ServiceClient.RecommendedDegreesOfParallelism</c>, or an operator's decision, without a
+    /// restart. Growing takes effect immediately. Shrinking never cancels in-flight calls; the excess
+    /// leases are retired as they are returned. See <see cref="ResourcePool{T}.SetMaxSize"/> and
+    /// docs/adr/0025.
+    /// </summary>
+    public void SetMaxSize(int maxSize) => _pool.SetMaxSize(maxSize);
+
     /// <summary>
     /// UTC instant this member is throttled until, or <c>null</c> if not currently throttled.
     /// Set via <see cref="ReportThrottled"/> in response to a Dataverse 429/service-protection

@@ -21,6 +21,12 @@ public sealed partial class ResourcePool<T> where T : notnull
         PublishHealthChanged(SlotHealthState.RecyclingStarted, slot.LastIncident);
         await SafeDisposeAsync(slot.Resource).ConfigureAwait(false);
 
+        // The old resource is gone; CreateThroughGateAsync counts the replacement back in on
+        // success. (Previously the decrement happened only on failure, so every successful recycle
+        // inflated CreatedCount by one - harmless until SetMaxSize started comparing it against the
+        // limit. See docs/adr/0025.)
+        Interlocked.Decrement(ref _createdCount);
+
         try
         {
             slot.Resource = await CreateThroughGateAsync(cancellationToken).ConfigureAwait(false);
@@ -44,16 +50,14 @@ public sealed partial class ResourcePool<T> where T : notnull
             // unhealthy, so it must NOT be counted as a create failure (that would incorrectly help
             // trip the circuit breaker for what was really just a caller giving up waiting). The old
             // resource was already disposed above and no replacement was created, so the slot's
-            // capacity genuinely is gone; reflect that in _createdCount without touching the
-            // create-failure counter or publishing a health incident. See docs/adr/0014.
-            Interlocked.Decrement(ref _createdCount);
+            // capacity genuinely is gone (already reflected in _createdCount above) - don't touch the
+            // create-failure counter or publish a health incident. See docs/adr/0014.
             throw;
         }
         catch (Exception ex)
         {
             Interlocked.Increment(ref _consecutiveCreateFailures);
             PublishHealthChanged(SlotHealthState.RecoveryFailed, new PoolIncidentInfo(ex, DateTimeOffset.UtcNow));
-            Interlocked.Decrement(ref _createdCount);
             return false;
         }
         finally
@@ -73,6 +77,12 @@ public sealed partial class ResourcePool<T> where T : notnull
                 await SafeDisposeAsync(slot.Resource).ConfigureAwait(false);
             }
         }
+        else if (recycled && IsOverSize)
+        {
+            // Shrunk by SetMaxSize during the recycle: retire the fresh resource. See docs/adr/0025.
+            Interlocked.Decrement(ref _createdCount);
+            await SafeDisposeAsync(slot.Resource).ConfigureAwait(false);
+        }
         else if (recycled)
         {
             _idle.Push(slot);
@@ -80,7 +90,7 @@ public sealed partial class ResourcePool<T> where T : notnull
 
         // Whether recovery succeeded or the slot's capacity was permanently given up, the permit is
         // released so waiters can proceed (either using the recycled slot, or creating a new one).
-        _capacityGate.Release();
+        ReleasePermit();
     }
 
     private async Task<Slot<T>> CreateNewSlotAsync(CancellationToken cancellationToken)

@@ -21,8 +21,9 @@ public sealed class PoolOptions
     public static readonly TimeSpan DefaultCreateTimeout = TimeSpan.FromSeconds(30);
 
     /// <summary>
-    /// Maximum number of resources concurrently created/leased by this pool. Acquire calls beyond
-    /// this size will wait for a resource to be returned.
+    /// Initial maximum number of resources concurrently created/leased by this pool. Acquire calls
+    /// beyond this size will wait for a resource to be returned. Can be changed at runtime with
+    /// <see cref="ResourcePool{T}.SetMaxSize"/> (docs/adr/0025).
     /// </summary>
     public int MaxSize { get; init; } = 8;
 

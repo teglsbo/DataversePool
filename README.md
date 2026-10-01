@@ -225,6 +225,17 @@ Choose `MaxSize` from the application's resource and latency budget, then tune i
 throughput, latency, waiting leases, and real 429 signals. Multiple processes/pods do not share the
 pool's lease count.
 
+You can change it at runtime without a restart. Growing takes effect immediately. Shrinking never
+cancels in-flight calls: the excess leases are retired as they are returned. See
+[ADR-0025](docs/adr/0025-runtime-adjustable-pool-size.md).
+
+```csharp
+member.SetMaxSize(16);              // DataverseUserPool (or ResourcePool<T>)
+var current = member.MaxSize;       // also reported as PoolStats.MaxSize
+// e.g. follow Dataverse's hint, read from any leased client:
+member.SetMaxSize(lease.Resource.RecommendedDegreesOfParallelism);
+```
+
 > **`AcquireTimeout` and `CreateTimeout` default to 30 seconds, not "wait forever".** An unbounded
 > default turns a saturated pool or a hung connection attempt into callers blocked indefinitely with
 > no exception and no signal - strictly harder to diagnose than a bounded failure, and the usual
@@ -360,9 +371,10 @@ needs.
 > opt back into Dataverse's raw value. See
 > [ADR-0017](docs/adr/0017-group-throttle-retry-helper-and-capped-retry-after.md).
 
-> **Scaling and telemetry notes.** Pool size is static (`MaxSize`, no autoscaling or idle eviction); throughput scales
-> by adding application users to a `DataversePool` (round-robin group). `ServiceClient.RecommendedDegreesOfParallelism` exposes
-> Dataverse's `x-ms-dop-hint` but is not yet consumed by the pool. Capturing `x-ms-*` headers on successful calls
+> **Scaling and telemetry notes.** Pool size does not adjust itself (no autoscaling or idle eviction), but you can
+> change it at runtime with `SetMaxSize` (ADR-0025). Throughput scales by adding application users to a `DataversePool`
+> (round-robin group). `ServiceClient.RecommendedDegreesOfParallelism` exposes Dataverse's `x-ms-dop-hint`, but the pool
+> does not read it automatically yet; automatic DOP needs its own spec (ADR-0025, "Open questions"). Capturing `x-ms-*` headers on successful calls
 > needs an HTTP-level observer outside `ServiceClient`; see `REVIEW-2026-09-30.md` Part 2.
 
 Why 429/exception-based rather than proactively reading Dataverse's `x-ms-ratelimit-*` response
@@ -622,6 +634,7 @@ Every non-obvious choice is written up as an ADR in [`docs/adr/`](docs/adr/):
 22. [Shutdown disposal race, throttle-retry lease leak, probe-claim leak fixes](docs/adr/0022-shutdown-and-probe-claim-leak-fixes.md)
 23. [Corrected premise: A `ServiceClient` does not serialize concurrent async requests](docs/adr/0023-serviceclient-async-concurrency-corrected-premise.md)
 24. [Operation-level metrics on instrumented execution paths](docs/adr/0024-operation-level-metrics-on-instrumented-execution-paths.md)
+25. [Runtime-adjustable pool size, as the first step toward automatic DOP](docs/adr/0025-runtime-adjustable-pool-size.md)
 
 ## Status / open items
 
