@@ -198,7 +198,15 @@ Two further boundary facts, both **[MS]**, matter for a controller:
   ceilings already diverge from the 52 default — but a 5x-over-nominal-budget run with zero
   rejections is at minimum strong evidence against relying on the literal default value for this
   tenant. This bound should therefore be read as "the right order of magnitude to worry about, not
-  a verified hard ceiling" (§12) — now doubly so.
+  a verified hard ceiling" (§12) — now doubly so. **Third attempt, 2026-10-02:** per the batching
+  guidance below (§2.1), a large-batch `ExecuteMultipleRequest` probe (4 workers, 200 `CreateRequest`
+  sub-operations per call, 3 minutes) was run specifically to shift pressure toward execution-time
+  and away from request-count/concurrency: 124 calls, 24,800 items, all succeeded, 732,566 ms of
+  cumulative client-observed busy time (61% of the 1,200,000 ms/300 s budget) — again **zero**
+  `ExecutionTime` rejections. Three independent attempts (sustained reads at 2x and 5x budget;
+  batched writes at 0.6x budget) have now failed to trip this facet on this tenant, strengthening
+  the "tenant budget configured above default" explanation over the "execution time tracked
+  loosely vs. wall-clock" explanation, though the latter remains unfalsified.
 - **Correct reaction:** reduce the *cost* of work (smaller batches, cheaper queries, fewer
   plugins triggered) and/or reduce sustained concurrency on expensive operation types
   specifically; a generic per-member concurrency cut helps but may be insufficient if individual
@@ -1424,10 +1432,14 @@ follow-up implementation work, consistent with ADR-0025's own listed open item #
    constraint in practice, or whether the concurrency facet always dominates in this tenant's
    observed regime. **Result:** at deliberately low concurrency (10-20, far under the ceiling),
    `NumberOfRequests` (`0x80072322`) was trivially and repeatedly tripped by a cheap-call,
-   high-rate workload; `ExecutionTime` (`0x80072321`) was **not** tripped even at 5x the
-   documented budget (§2.2's caveat is now partially measured, not purely inferred). Not yet
-   repeated under genuinely "realistic mixed" load (this was still two synthetic, single-facet
-   probes) — a true mixed-workload run remains open.
+   high-rate workload; `ExecutionTime` (`0x80072321`) was **not** tripped across three distinct
+   attempts — sustained heavy reads at 2x and 5x the documented budget, and a large-batch
+   `ExecuteMultipleRequest` probe at 0.6x the budget (§2.2's caveat is now partially measured, not
+   purely inferred). Not yet repeated under genuinely "realistic mixed" load (all three were
+   still synthetic, single-facet probes) — a true mixed-workload run remains open. Web API
+   (raw HTTP) coverage of `NumberOfRequests`/`ExecutionTime` also remains untested — only
+   `ConcurrentRequests` has been confirmed over that transport (pre-existing
+   `LivePinnedWebApiConcurrencyTests`).
 4. **[Done, pre-2026-10-02] Verify the SOAP-path 429 detection gap is fixed**
    (`REVIEW-2026-09-30.md:201-223`) before trusting *any* throttle-driven signal from that
    transport — currently it reads zero and would silently blind a controller running on SOAP

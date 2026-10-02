@@ -446,6 +446,12 @@ public class LiveConcurrencyThrottleTests
         return int.TryParse(rawValue, out var value) && value > 0 ? value : defaultValue;
     }
 
+    private static bool GetBooleanEnvironmentFlag(string name)
+    {
+        var rawValue = Environment.GetEnvironmentVariable(name);
+        return rawValue is "1" or "true" or "True" or "TRUE";
+    }
+
     private static string DescribeException(Exception exception)
     {
         var chain = new List<string>();
@@ -1039,6 +1045,291 @@ public class LiveConcurrencyThrottleTests
 
         // Exploratory, like the sustained-concurrency test above: no hard assertion on which facet
         // (if any) actually tripped, since that is tenant- and timing-dependent.
+    }
+
+    /// <summary>
+    /// The sustained-concurrency execution-time probe above kept per-call cost moderate (one
+    /// <c>RetrieveAllEntities</c> call each) and relied on many *overlapping* calls to accumulate
+    /// execution time - and never tripped the limit even at 5x the documented budget. Microsoft's
+    /// own guidance (§2.1 of the research doc) is that <see cref="ExecuteMultipleRequest"/> -
+    /// bundling many sub-operations into one client-visible request/response round trip -
+    /// specifically shifts pressure onto the execution-time facet, not request-count or
+    /// concurrency: a single "slow request with a big internal batch" does a correspondingly large
+    /// amount of real server-side work per request, so here concurrency and request *count* both
+    /// stay tiny while each individual request's real server-side cost is large - a more direct
+    /// test of whether the execution-time facet can be tripped at all on this tenant than many
+    /// small, independently-cheap calls.
+    /// </summary>
+    /// <remarks>
+    /// Creates real <c>task</c> records (cheap, dependency-free) in large batches via
+    /// <see cref="ExecuteMultipleRequest"/> with <c>ContinueOnError</c> so a mid-batch throttle
+    /// does not abort the rest of that batch. Classifies both call-level exceptions (the whole
+    /// ExecuteMultiple request itself rejected) and item-level faults inside
+    /// <see cref="ExecuteMultipleResponse.Responses"/> (individual sub-requests inside an
+    /// otherwise-accepted batch rejected) - Microsoft's docs do not say which shape a mid-batch
+    /// throttle takes, so neither is assumed; item-level faults are re-wrapped and run through the
+    /// same <see cref="DataverseThrottleDetector.TryGetRetryAfter(Exception?, out TimeSpan)"/> used
+    /// everywhere else, rather than re-implementing the `Retry-After` extraction. Records created are
+    /// tagged with a per-run GUID in their subject. Cleanup is <b>skipped by default</b> (this probe
+    /// can create thousands of records, and serial single-record deletes are far slower than the load
+    /// phase itself) - set <c>DVPOOL_IT_EXECMULTI_CLEANUP=1</c> to opt in, in which case cleanup is
+    /// batched via <see cref="ExecuteMultipleRequest"/> of <see cref="DeleteRequest"/>s rather than one
+    /// delete per record.
+    /// </remarks>
+    [SkippableFact]
+    public async Task Sustained_WithBatchedExecuteMultipleCreates_TriesToTripTheExecutionTimeLimit()
+    {
+        Skip.If(string.IsNullOrEmpty(ConnectionStringA), "Set DVPOOL_IT_CONNECTION_STRING.");
+
+        var workerCount = GetPositiveEnvironmentInteger("DVPOOL_IT_EXECMULTI_WORKERS", 4);
+        var batchSize = GetPositiveEnvironmentInteger("DVPOOL_IT_EXECMULTI_BATCH_SIZE", 200);
+        var measurementDuration = TimeSpan.FromSeconds(
+            GetPositiveEnvironmentInteger("DVPOOL_IT_EXECMULTI_SECONDS", 180));
+        var runTag = Guid.NewGuid().ToString("N");
+
+        var clientOptions = new DataverseClientOptions { MaxRetryCount = 0 };
+        await using var poolA = new DataverseUserPool(
+            "A",
+            ConnectionStringA,
+            new PoolOptions { MaxSize = workerCount, PrewarmCount = workerCount },
+            clientOptions: clientOptions);
+
+        await poolA.WarmupAsync();
+
+        var createdIds = new ConcurrentBag<Guid>();
+        var readyWorkers = 0;
+        var startGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var currentInFlight = 0;
+        var peakInFlight = 0;
+        var batchesSent = 0;
+        var itemsSent = 0;
+        var itemSuccesses = 0;
+        var callLevelErrorCodes = new ConcurrentDictionary<int, int>();
+        var itemLevelErrorCodes = new ConcurrentDictionary<int, int>();
+        var otherExceptions = new ConcurrentDictionary<string, int>();
+        var retryAfters = new ConcurrentBag<TimeSpan>();
+        var busyTime = TimeSpan.Zero;
+        var busyTimeLock = new object();
+
+        try
+        {
+            var workers = Enumerable.Range(0, workerCount).Select(async workerIndex =>
+            {
+                await using var lease = await poolA.AcquireAsync();
+                lease.Resource.DisableCrossThreadSafeties = true;
+
+                if (Interlocked.Increment(ref readyWorkers) == workerCount)
+                {
+                    startGate.SetResult();
+                }
+
+                await startGate.Task;
+                var deadline = Stopwatch.GetTimestamp() + (long)(measurementDuration.TotalSeconds * Stopwatch.Frequency);
+                var batchIndex = 0;
+
+                while (Stopwatch.GetTimestamp() < deadline)
+                {
+                    var requests = new OrganizationRequestCollection();
+                    for (var i = 0; i < batchSize; i++)
+                    {
+                        requests.Add(new CreateRequest
+                        {
+                            Target = new Entity("task")
+                            {
+                                ["subject"] = $"DataversePool-IT-{runTag}-{workerIndex}-{batchIndex}-{i}",
+                            },
+                        });
+                    }
+
+                    var executeMultiple = new ExecuteMultipleRequest
+                    {
+                        Requests = requests,
+                        Settings = new ExecuteMultipleSettings { ContinueOnError = true, ReturnResponses = true },
+                    };
+
+                    Interlocked.Increment(ref batchesSent);
+                    Interlocked.Add(ref itemsSent, requests.Count);
+                    var nowInFlight = Interlocked.Increment(ref currentInFlight);
+                    InterlockedMax(ref peakInFlight, nowInFlight);
+                    var callSw = Stopwatch.StartNew();
+                    try
+                    {
+                        var response = (ExecuteMultipleResponse)await lease.Resource.ExecuteAsync(executeMultiple);
+                        foreach (var item in response.Responses)
+                        {
+                            if (item.Fault is null)
+                            {
+                                Interlocked.Increment(ref itemSuccesses);
+                                if (item.Response?.Results.TryGetValue("id", out var idValue) == true && idValue is Guid id)
+                                {
+                                    createdIds.Add(id);
+                                }
+                            }
+                            else
+                            {
+                                itemLevelErrorCodes.AddOrUpdate(item.Fault.ErrorCode, 1, static (_, count) => count + 1);
+
+                                // Reuse the real detector instead of re-implementing Retry-After
+                                // extraction for the item-fault shape.
+                                var wrapped = new FaultException<OrganizationServiceFault>(item.Fault);
+                                if (DataverseThrottleDetector.TryGetRetryAfter(wrapped, out var itemRetryAfter))
+                                {
+                                    retryAfters.Add(itemRetryAfter);
+                                }
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        var soapFault = UnwrapOrganizationServiceFault(ex);
+                        if (soapFault is not null)
+                        {
+                            callLevelErrorCodes.AddOrUpdate(soapFault.ErrorCode, 1, static (_, count) => count + 1);
+                        }
+
+                        if (DataverseThrottleDetector.TryGetRetryAfter(ex, out var retryAfter))
+                        {
+                            retryAfters.Add(retryAfter);
+                        }
+                        else if (soapFault is null)
+                        {
+                            otherExceptions.AddOrUpdate(DescribeException(ex), 1, static (_, count) => count + 1);
+                        }
+                    }
+                    finally
+                    {
+                        callSw.Stop();
+                        lock (busyTimeLock)
+                        {
+                            busyTime += callSw.Elapsed;
+                        }
+
+                        Interlocked.Decrement(ref currentInFlight);
+                    }
+
+                    batchIndex++;
+                }
+            }).ToArray();
+
+            var sw = Stopwatch.StartNew();
+            await Task.WhenAll(workers);
+            sw.Stop();
+
+            _output.WriteLine(
+                $"Batched ExecuteMultiple execution-time probe: workers={workerCount}, batch size={batchSize}, " +
+                $"target duration={measurementDuration}, actual duration={sw.Elapsed}, batches sent={batchesSent}, " +
+                $"items sent={itemsSent}, item successes={itemSuccesses}, peak concurrent in-flight batches=" +
+                $"{peakInFlight}, cumulative client-observed busy time={busyTime} ({busyTime.TotalMilliseconds:F0} " +
+                "ms, vs the documented 1,200,000 ms/300s budget).");
+
+            foreach (var (errorCode, count) in callLevelErrorCodes.OrderBy(pair => pair.Key))
+            {
+                var label = errorCode switch
+                {
+                    -2147015902 => "NumberOfRequests",
+                    -2147015903 => "ExecutionTime",
+                    -2147015898 => "ConcurrentRequests",
+                    _ => "unrecognized",
+                };
+                _output.WriteLine($"  Call-level ErrorCode {errorCode} ({label}): {count}x");
+            }
+
+            foreach (var (errorCode, count) in itemLevelErrorCodes.OrderBy(pair => pair.Key))
+            {
+                var label = errorCode switch
+                {
+                    -2147015902 => "NumberOfRequests",
+                    -2147015903 => "ExecutionTime",
+                    -2147015898 => "ConcurrentRequests",
+                    _ => "unrecognized",
+                };
+                _output.WriteLine($"  Item-level ErrorCode {errorCode} ({label}): {count}x");
+            }
+
+            foreach (var (exception, count) in otherExceptions.OrderBy(pair => pair.Key))
+            {
+                _output.WriteLine($"Other exception ({count}x): {exception}");
+            }
+
+            if (!retryAfters.IsEmpty)
+            {
+                _output.WriteLine($"Observed Retry-After values: min={retryAfters.Min()}, max={retryAfters.Max()}.");
+            }
+
+            Assert.True(
+                peakInFlight <= workerCount,
+                $"Peak in-flight ({peakInFlight}) exceeded the configured worker count ({workerCount}) - this " +
+                "test's low-concurrency premise would be violated.");
+
+            if (callLevelErrorCodes.ContainsKey(-2147015903) || itemLevelErrorCodes.ContainsKey(-2147015903))
+            {
+                _output.WriteLine(
+                    "Confirmed live: a genuine ExecutionTime (-2147015903) throttle was observed from large " +
+                    "batched ExecuteMultiple requests, exactly as Microsoft's own guidance (§2.1) predicts - " +
+                    "batching shifts pressure from request-count onto execution-time.");
+            }
+            else if (callLevelErrorCodes.ContainsKey(-2147015898))
+            {
+                _output.WriteLine(
+                    "Note: only ConcurrentRequests 429s were observed even at low configured concurrency.");
+            }
+            else
+            {
+                _output.WriteLine(
+                    $"Note: no throttle of any kind observed in {measurementDuration} ({itemsSent} items across " +
+                    $"{batchesSent} batches, {busyTime.TotalMilliseconds:F0} ms of cumulative client-observed " +
+                    "busy time). Increase DVPOOL_IT_EXECMULTI_BATCH_SIZE, DVPOOL_IT_EXECMULTI_WORKERS and/or " +
+                    "DVPOOL_IT_EXECMULTI_SECONDS - or this tenant's execution-time budget may simply be " +
+                    "configured well above the documented default.");
+            }
+
+            // Exploratory, like the probes above: no hard assertion on which facet (if any)
+            // actually tripped, since that is tenant- and timing-dependent.
+        }
+        finally
+        {
+            if (!GetBooleanEnvironmentFlag("DVPOOL_IT_EXECMULTI_CLEANUP"))
+            {
+                _output.WriteLine(
+                    $"Cleanup skipped (set DVPOOL_IT_EXECMULTI_CLEANUP=1 to opt in). {createdIds.Count} probe " +
+                    $"task(s) left in the tenant, tagged DataversePool-IT-{runTag} in their subject.");
+            }
+            else
+            {
+                // Batched via ExecuteMultiple (DeleteRequest per record) rather than one delete call
+                // per record - with potentially thousands of records, serial deletes would dwarf the
+                // load phase itself.
+                var cleanupFailures = 0;
+                foreach (var chunk in createdIds.Chunk(batchSize))
+                {
+                    var deletes = new OrganizationRequestCollection();
+                    foreach (var recordId in chunk)
+                    {
+                        deletes.Add(new DeleteRequest { Target = new EntityReference("task", recordId) });
+                    }
+
+                    try
+                    {
+                        await using var cleanupLease = await poolA.AcquireAsync();
+                        var cleanupResponse = (ExecuteMultipleResponse)await cleanupLease.Resource.ExecuteAsync(
+                            new ExecuteMultipleRequest
+                            {
+                                Requests = deletes,
+                                Settings = new ExecuteMultipleSettings { ContinueOnError = true, ReturnResponses = true },
+                            });
+                        cleanupFailures += cleanupResponse.Responses.Count(item => item.Fault is not null);
+                    }
+                    catch
+                    {
+                        cleanupFailures += chunk.Length;
+                    }
+                }
+
+                _output.WriteLine(
+                    $"Cleanup: {createdIds.Count - cleanupFailures}/{createdIds.Count} probe task(s) deleted " +
+                    $"({cleanupFailures} failures; search task subjects for DataversePool-IT-{runTag} if any remain).");
+            }
+        }
     }
 
     private static OrganizationServiceFault? UnwrapOrganizationServiceFault(Exception exception)
