@@ -186,6 +186,14 @@ public class LiveConcurrencyThrottleTests
 
         await poolA.WarmupAsync();
 
+        string organizationHost;
+        await using (var hostLease = await poolA.AcquireAsync())
+        {
+            organizationHost = hostLease.Resource.ConnectedOrgUriActual?.Host
+                ?? throw new InvalidOperationException("Authenticated client has no organization URI.");
+        }
+        using var httpProbe = new HttpRequestProbe(organizationHost);
+
         // Gauge single-call cost first, purely for the test's own diagnostic output.
         var probeSw = Stopwatch.StartNew();
         await using (var probeLease = await poolA.AcquireAsync())
@@ -196,6 +204,10 @@ public class LiveConcurrencyThrottleTests
 
         probeSw.Stop();
         _output.WriteLine($"Single RetrieveAllEntitiesRequest(Entity) call took {probeSw.Elapsed}.");
+        _output.WriteLine($"SOAP warm-up observed {httpProbe.Started} HTTP starts and {httpProbe.Completed} completions.");
+        Assert.True(httpProbe.Completed > 0,
+            "System.Net.Http EventSource did not observe the SOAP warm-up; HTTP timing cannot diagnose this transport.");
+        httpProbe.Reset();
 
         var currentInFlight = 0;
         var peakInFlight = 0;
@@ -235,6 +247,13 @@ public class LiveConcurrencyThrottleTests
         var results = await Task.WhenAll(burstTasks);
         sw.Stop();
 
+        _output.WriteLine(
+            $"HTTP diagnostics: started={httpProbe.Started}, completed={httpProbe.Completed}, " +
+            $"peak in flight={httpProbe.PeakInFlight}, 429s={httpProbe.Throttles}, " +
+            $"other statuses={httpProbe.OtherStatuses}, unmatched events={httpProbe.UnmatchedEvents}, " +
+            $"shared activity IDs={httpProbe.DuplicateIds}, pending={httpProbe.Pending}, active={httpProbe.Active}, " +
+            $"launch spread={httpProbe.LaunchSpread}. " +
+            "Stops are paired by shared activity ID in arrival order; statuses may include another host's traffic.");
         var byOutcome = results.GroupBy(r => r.Outcome).ToDictionary(g => g.Key, g => g.Count());
         _output.WriteLine(
             $"Burst size: {BurstSize}. Peak genuinely-concurrent in-flight calls observed: {peakInFlight}. " +
