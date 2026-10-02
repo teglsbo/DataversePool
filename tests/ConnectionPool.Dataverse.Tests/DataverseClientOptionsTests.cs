@@ -88,7 +88,7 @@ public class DataverseClientOptionsTests
     [Trait("Category", "Integration")]
     public async Task ReturnedClient_RestoresConfiguredBaseline()
     {
-        var connectionString = Environment.GetEnvironmentVariable("DVPOOL_IT_CONNECTION_STRING");
+        var connectionString = LiveDataverseCredentials.GetConnectionString(0);
         Skip.If(string.IsNullOrWhiteSpace(connectionString), "Set DVPOOL_IT_CONNECTION_STRING.");
 
         var trackingId = Guid.NewGuid();

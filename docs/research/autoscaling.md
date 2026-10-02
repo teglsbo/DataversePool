@@ -185,12 +185,20 @@ Two further boundary facts, both **[MS]**, matter for a controller:
   tripping — *if* server execution time tracks wall-clock request duration 1:1. This is
   dramatically lower than the 52-default (or 100/40 measured) concurrency limit, which is exactly
   why the maintainer's hypothesis (duration matters, and matters differently from raw concurrency)
-  is directionally correct. **Caveat [Inferred, needs live verification]:** Dataverse's internal
+  is directionally correct. **Caveat [now partially measured, 2026-10-02]:** Dataverse's internal
   "execution time" metric is unlikely to equal full client-observed latency 1:1 — network
   transit, client-side queueing, and any server-side queueing-before-execution plausibly are not
   charged as "execution time." If a large fraction of observed duration is such overhead, the
-  *true* sustainable `c_max` is higher than 4. This bound should therefore be read as "the right
-  order of magnitude to worry about, not a verified hard ceiling" until measured (§12).
+  *true* sustainable `c_max` is higher than 4. **Live result:** a sustained 10-worker, then
+  20-worker, `RetrieveAllEntitiesRequest(Entity)` probe at concurrency far below the ceiling
+  accrued 2.4M ms then 6.1M ms of cumulative client-observed busy time (2x, then 5x, the
+  documented 1,200,000 ms/300 s budget) with **zero** `ExecutionTime` rejections on this tenant
+  (`PLAN-2026-09-30.md`, Phase 2 follow-up). This does not yet prove the 1:1 assumption wrong — the
+  tenant's budget could simply be configured higher, exactly as its measured 100/40 concurrency
+  ceilings already diverge from the 52 default — but a 5x-over-nominal-budget run with zero
+  rejections is at minimum strong evidence against relying on the literal default value for this
+  tenant. This bound should therefore be read as "the right order of magnitude to worry about, not
+  a verified hard ceiling" (§12) — now doubly so.
 - **Correct reaction:** reduce the *cost* of work (smaller batches, cheaper queries, fewer
   plugins triggered) and/or reduce sustained concurrency on expensive operation types
   specifically; a generic per-member concurrency cut helps but may be insufficient if individual
@@ -1407,16 +1415,25 @@ follow-up implementation work, consistent with ADR-0025's own listed open item #
    Microsoft support directly, since the docs state server count is a managed-service factor
    partly driven by licensed-user count, which support can presumably state outright for a given
    tenant.
-3. **Record the 429 error-code distribution under realistic mixed load**, not just synthetic
-   bursts — run the existing burst-ladder-style tests but classify every rejection by its specific
-   error code (`0x80072322`/`0x80072321`/`0x80072326`) rather than a generic "throttled" boolean,
-   to confirm which facet actually bites first for realistic (not adversarial) workloads, and
-   whether the derived execution-time bound (§2.2, `c_max ≈ 4`) is anywhere close to being the
-   binding constraint in practice, or whether the concurrency facet always dominates in this
-   tenant's observed regime.
-4. **Verify the SOAP-path 429 detection gap is fixed** (`REVIEW-2026-09-30.md:201-223`) before
-   trusting *any* throttle-driven signal from that transport — currently it reads zero and would
-   silently blind a controller running on SOAP traffic.
+3. **[Done, 2026-10-02 — see `PLAN-2026-09-30.md` Phase 2 follow-up] Record the 429 error-code
+   distribution under realistic mixed load**, not just synthetic bursts — run the existing
+   burst-ladder-style tests but classify every rejection by its specific error code
+   (`0x80072322`/`0x80072321`/`0x80072326`) rather than a generic "throttled" boolean, to confirm
+   which facet actually bites first for realistic (not adversarial) workloads, and whether the
+   derived execution-time bound (§2.2, `c_max ≈ 4`) is anywhere close to being the binding
+   constraint in practice, or whether the concurrency facet always dominates in this tenant's
+   observed regime. **Result:** at deliberately low concurrency (10-20, far under the ceiling),
+   `NumberOfRequests` (`0x80072322`) was trivially and repeatedly tripped by a cheap-call,
+   high-rate workload; `ExecutionTime` (`0x80072321`) was **not** tripped even at 5x the
+   documented budget (§2.2's caveat is now partially measured, not purely inferred). Not yet
+   repeated under genuinely "realistic mixed" load (this was still two synthetic, single-facet
+   probes) — a true mixed-workload run remains open.
+4. **[Done, pre-2026-10-02] Verify the SOAP-path 429 detection gap is fixed**
+   (`REVIEW-2026-09-30.md:201-223`) before trusting *any* throttle-driven signal from that
+   transport — currently it reads zero and would silently blind a controller running on SOAP
+   traffic. **Result:** fixed and live-confirmed; `DataverseThrottleDetector` now recognizes
+   `FaultException<OrganizationServiceFault>` on all three documented codes (`PLAN-2026-09-30.md`
+   Phase 2).
 5. **Confirm `RecommendedDegreesOfParallelism` actually varies** across environments/times of day
    as Microsoft's "resources... might vary over time" wording implies, by sampling it over an
    extended period against the test tenant, rather than assuming it is static — this affects

@@ -23,11 +23,9 @@ public class LiveDataversePoolStrategyTests
 
     public LiveDataversePoolStrategyTests(ITestOutputHelper output) => _output = output;
 
-    private static string? ConnectionStringA =>
-        Environment.GetEnvironmentVariable("DVPOOL_IT_CONNECTION_STRING");
+    private static string? ConnectionStringA => LiveDataverseCredentials.GetConnectionString(0);
 
-    private static string? ConnectionStringB =>
-        Environment.GetEnvironmentVariable("DVPOOL_IT_CONNECTION_STRING_B");
+    private static string? ConnectionStringB => LiveDataverseCredentials.GetConnectionString(1);
 
     /// <summary>
     /// Plain round-robin has no concept of load at all - it should keep alternating strictly 1/N

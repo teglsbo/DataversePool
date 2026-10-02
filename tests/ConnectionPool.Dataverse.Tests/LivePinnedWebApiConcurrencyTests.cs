@@ -35,7 +35,7 @@ public class LivePinnedWebApiConcurrencyTests
     [SkippableFact]
     public async Task SlowRequests_WithPinnedAffinity_ExposeTheRealConcurrentRequestOutcome()
     {
-        var connectionString = GetConnectionString();
+        var connectionString = LiveDataverseCredentials.GetConnectionString(0);
         Skip.If(
             connectionString is null,
             "Set DVPOOL_IT_CONNECTION_STRING or DVPOOL_IT_URL, DVPOOL_IT_TENANT_ID, DVPOOL_IT_CLIENT_ID, and DVPOOL_IT_CLIENT_SECRET.");
@@ -224,8 +224,8 @@ public class LivePinnedWebApiConcurrencyTests
     [SkippableFact]
     public async Task SlowRequests_WithTwoAppUsers_SustainMoreThanOneUsersConcurrentLimit()
     {
-        var connectionStringA = GetConnectionString();
-        var connectionStringB = GetConnectionString("_B");
+        var connectionStringA = LiveDataverseCredentials.GetConnectionString(0);
+        var connectionStringB = LiveDataverseCredentials.GetConnectionString(1);
         Skip.If(
             connectionStringA is null || connectionStringB is null,
             "Set credentials for both application users; the second user's variables use suffix _B.");
@@ -449,25 +449,6 @@ public class LivePinnedWebApiConcurrencyTests
                 cookie.Name.Equals("ARRAffinity", StringComparison.OrdinalIgnoreCase));
         Assert.NotNull(affinityCookie);
         return affinityCookie;
-    }
-
-    private static string? GetConnectionString(string suffix = "")
-    {
-        var connectionString =
-            Environment.GetEnvironmentVariable($"DVPOOL_IT_CONNECTION_STRING{suffix}");
-        if (!string.IsNullOrWhiteSpace(connectionString))
-        {
-            return connectionString;
-        }
-
-        var url = Environment.GetEnvironmentVariable("DVPOOL_IT_URL");
-        var tenantId = Environment.GetEnvironmentVariable($"DVPOOL_IT_TENANT_ID{suffix}");
-        var clientId = Environment.GetEnvironmentVariable($"DVPOOL_IT_CLIENT_ID{suffix}");
-        var clientSecret = Environment.GetEnvironmentVariable($"DVPOOL_IT_CLIENT_SECRET{suffix}");
-
-        return new[] { url, tenantId, clientId, clientSecret }.All(value => !string.IsNullOrWhiteSpace(value))
-            ? $"AuthType=ClientSecret;Url={url};TenantId={tenantId};ClientId={clientId};ClientSecret={clientSecret};"
-            : null;
     }
 
     private static Uri GetEnvironmentRoot(Uri connectedOrgUri)

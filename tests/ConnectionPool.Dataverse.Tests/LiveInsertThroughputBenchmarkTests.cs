@@ -30,8 +30,8 @@ public class LiveInsertThroughputBenchmarkTests
     [SkippableFact]
     public async Task IndependentCreates_CompareOneAndTwoApplicationUsers()
     {
-        var connectionStringA = GetConnectionString();
-        var connectionStringB = GetConnectionString("_B");
+        var connectionStringA = LiveDataverseCredentials.GetConnectionString(0);
+        var connectionStringB = LiveDataverseCredentials.GetConnectionString(1);
         Skip.If(
             connectionStringA is null || connectionStringB is null,
             "Set credentials for both application users.");
@@ -378,26 +378,6 @@ public class LiveInsertThroughputBenchmarkTests
         BitConverter.GetBytes(runNumber).CopyTo(bytes, 8);
         BitConverter.GetBytes(rowIndex).CopyTo(bytes, 12);
         return new Guid(bytes);
-    }
-
-    private static string? GetConnectionString(string suffix = "")
-    {
-        var connectionString =
-            Environment.GetEnvironmentVariable($"DVPOOL_IT_CONNECTION_STRING{suffix}");
-        if (!string.IsNullOrWhiteSpace(connectionString))
-        {
-            return connectionString;
-        }
-
-        var url = Environment.GetEnvironmentVariable("DVPOOL_IT_URL");
-        var tenantId = Environment.GetEnvironmentVariable($"DVPOOL_IT_TENANT_ID{suffix}");
-        var clientId = Environment.GetEnvironmentVariable($"DVPOOL_IT_CLIENT_ID{suffix}");
-        var clientSecret = Environment.GetEnvironmentVariable($"DVPOOL_IT_CLIENT_SECRET{suffix}");
-
-        return new[] { url, tenantId, clientId, clientSecret }
-            .All(value => !string.IsNullOrWhiteSpace(value))
-            ? $"AuthType=ClientSecret;Url={url};TenantId={tenantId};ClientId={clientId};ClientSecret={clientSecret};"
-            : null;
     }
 
     private static int GetPositiveEnvironmentInteger(string name, int defaultValue)

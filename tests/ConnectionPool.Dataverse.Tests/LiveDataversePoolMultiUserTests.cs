@@ -26,11 +26,9 @@ public class LiveDataversePoolMultiUserTests
 
     public LiveDataversePoolMultiUserTests(ITestOutputHelper output) => _output = output;
 
-    private static string? ConnectionStringA =>
-        Environment.GetEnvironmentVariable("DVPOOL_IT_CONNECTION_STRING");
+    private static string? ConnectionStringA => LiveDataverseCredentials.GetConnectionString(0);
 
-    private static string? ConnectionStringB =>
-        Environment.GetEnvironmentVariable("DVPOOL_IT_CONNECTION_STRING_B");
+    private static string? ConnectionStringB => LiveDataverseCredentials.GetConnectionString(1);
 
     [SkippableFact]
     public async Task AcquireAsync_RoundRobinsAcrossBothRealMembers_AndBothAuthenticateAsDistinctUsers()

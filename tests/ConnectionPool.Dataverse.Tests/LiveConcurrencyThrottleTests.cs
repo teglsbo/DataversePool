@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.ServiceModel;
 using ConnectionPool.Core;
+using Microsoft.Crm.Sdk.Messages;
 using Microsoft.PowerPlatform.Dataverse.Client;
 using Microsoft.Xrm.Sdk;
 using Microsoft.Xrm.Sdk.Messages;
@@ -60,11 +61,9 @@ public class LiveConcurrencyThrottleTests
 
     public LiveConcurrencyThrottleTests(ITestOutputHelper output) => _output = output;
 
-    private static string? ConnectionStringA =>
-        Environment.GetEnvironmentVariable("DVPOOL_IT_CONNECTION_STRING");
+    private static string? ConnectionStringA => LiveDataverseCredentials.GetConnectionString(0);
 
-    private static string? ConnectionStringB =>
-        Environment.GetEnvironmentVariable("DVPOOL_IT_CONNECTION_STRING_B");
+    private static string? ConnectionStringB => LiveDataverseCredentials.GetConnectionString(1);
 
     /// <summary>
     /// Fires a burst well above the documented 52-concurrent-request ceiling against a single real
@@ -716,5 +715,342 @@ public class LiveConcurrencyThrottleTests
             _output.WriteLine("HealthAwareRoundRobin picks while A is throttled: " + string.Join(", ", picks));
             Assert.All(picks, name => Assert.Equal("B", name));
         }
+    }
+
+    /// <summary>
+    /// The two bursts above both deliberately exceed the 52-concurrent ceiling, so every real 429
+    /// they produce is <c>ConcurrentRequests</c> (<c>-2147015898</c>). This test instead holds
+    /// concurrency deliberately low (well under 52) while maximizing request *rate* - many cheap,
+    /// near-instantaneous <see cref="WhoAmIRequest"/> calls fired back-to-back per worker - to try
+    /// to trip the sliding-window <b>request-count</b> facet (default 6,000 requests / 300 s,
+    /// <c>-2147015902</c>) instead, per the research doc's §2.1 model.
+    /// </summary>
+    /// <remarks>
+    /// Unlike the concurrency ceiling (a live, instantaneous gauge), the request-count window is
+    /// documented as a trailing 300 s sum, so this worker loop keeps running - well past any single
+    /// 429 - for the full configured duration, to show the window either keeps rejecting (sliding,
+    /// not a one-shot trip) or clears once enough of the burst ages out of the trailing window.
+    /// </remarks>
+    [SkippableFact]
+    public async Task SustainedLowConcurrencyHighRate_WithCheapCalls_TriesToTripTheRequestCountLimit()
+    {
+        Skip.If(string.IsNullOrEmpty(ConnectionStringA), "Set DVPOOL_IT_CONNECTION_STRING.");
+
+        // Deliberately far below the documented 52 (and this tenant's measured 40/100) concurrency
+        // ceilings, so any genuine throttle here cannot be misattributed to ConcurrentRequests.
+        var workerCount = GetPositiveEnvironmentInteger("DVPOOL_IT_RATE_WORKERS", 10);
+        var measurementDuration = TimeSpan.FromSeconds(
+            GetPositiveEnvironmentInteger("DVPOOL_IT_RATE_SECONDS", 120));
+
+        var clientOptions = new DataverseClientOptions { MaxRetryCount = 0 };
+        await using var poolA = new DataverseUserPool(
+            "A",
+            ConnectionStringA,
+            new PoolOptions { MaxSize = workerCount, PrewarmCount = workerCount },
+            clientOptions: clientOptions);
+
+        await poolA.WarmupAsync();
+
+        var readyWorkers = 0;
+        var startGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var currentInFlight = 0;
+        var peakInFlight = 0;
+        var attempts = 0;
+        var successes = 0;
+        var errorCodeCounts = new ConcurrentDictionary<int, int>();
+        var otherExceptions = new ConcurrentDictionary<string, int>();
+        var retryAfters = new ConcurrentBag<TimeSpan>();
+
+        var workers = Enumerable.Range(0, workerCount).Select(async _ =>
+        {
+            await using var lease = await poolA.AcquireAsync();
+            lease.Resource.DisableCrossThreadSafeties = true;
+
+            if (Interlocked.Increment(ref readyWorkers) == workerCount)
+            {
+                startGate.SetResult();
+            }
+
+            await startGate.Task;
+            var deadline = Stopwatch.GetTimestamp() + (long)(measurementDuration.TotalSeconds * Stopwatch.Frequency);
+
+            while (Stopwatch.GetTimestamp() < deadline)
+            {
+                Interlocked.Increment(ref attempts);
+                var nowInFlight = Interlocked.Increment(ref currentInFlight);
+                InterlockedMax(ref peakInFlight, nowInFlight);
+                try
+                {
+                    await lease.Resource.ExecuteAsync(new WhoAmIRequest());
+                    Interlocked.Increment(ref successes);
+                }
+                catch (Exception ex)
+                {
+                    var soapFault = UnwrapOrganizationServiceFault(ex);
+                    if (soapFault is not null)
+                    {
+                        errorCodeCounts.AddOrUpdate(soapFault.ErrorCode, 1, static (_, count) => count + 1);
+                    }
+
+                    if (DataverseThrottleDetector.TryGetRetryAfter(ex, out var retryAfter))
+                    {
+                        retryAfters.Add(retryAfter);
+                    }
+                    else if (soapFault is null)
+                    {
+                        otherExceptions.AddOrUpdate(
+                            DescribeException(ex),
+                            1,
+                            static (_, count) => count + 1);
+                    }
+                }
+                finally
+                {
+                    Interlocked.Decrement(ref currentInFlight);
+                }
+            }
+        }).ToArray();
+
+        var sw = Stopwatch.StartNew();
+        await Task.WhenAll(workers);
+        sw.Stop();
+
+        _output.WriteLine(
+            $"Rate-limit probe: workers={workerCount}, target duration={measurementDuration}, " +
+            $"actual duration={sw.Elapsed}, attempts={attempts}, successes={successes}, " +
+            $"peak concurrent in-flight={peakInFlight}, implied average rate={attempts / sw.Elapsed.TotalSeconds:F1} req/s.");
+
+        foreach (var (errorCode, count) in errorCodeCounts.OrderBy(pair => pair.Key))
+        {
+            var label = errorCode switch
+            {
+                -2147015902 => "NumberOfRequests",
+                -2147015903 => "ExecutionTime",
+                -2147015898 => "ConcurrentRequests",
+                _ => "unrecognized",
+            };
+            _output.WriteLine($"  ErrorCode {errorCode} ({label}): {count}x");
+        }
+
+        foreach (var (exception, count) in otherExceptions.OrderBy(pair => pair.Key))
+        {
+            _output.WriteLine($"Other exception ({count}x): {exception}");
+        }
+
+        if (!retryAfters.IsEmpty)
+        {
+            _output.WriteLine($"Observed Retry-After values: min={retryAfters.Min()}, max={retryAfters.Max()}.");
+        }
+
+        Assert.True(
+            peakInFlight <= workerCount,
+            $"Peak in-flight ({peakInFlight}) exceeded the configured worker count ({workerCount}) - this test's " +
+            "low-concurrency premise would be violated.");
+
+        if (errorCodeCounts.ContainsKey(-2147015902))
+        {
+            _output.WriteLine(
+                "Confirmed live: a genuine NumberOfRequests (-2147015902) throttle was observed at low " +
+                "concurrency, exactly as the research doc's §2.1 model predicts.");
+        }
+        else if (errorCodeCounts.ContainsKey(-2147015898))
+        {
+            _output.WriteLine(
+                "Note: only ConcurrentRequests 429s were observed even at low configured concurrency - " +
+                "something (pool, SDK, or transport) is queueing/serializing more than expected; the " +
+                $"request-count limit was never reached in {measurementDuration} at this rate.");
+        }
+        else
+        {
+            _output.WriteLine(
+                $"Note: no throttle of any kind observed in {measurementDuration} ({attempts} requests, " +
+                $"{attempts / sw.Elapsed.TotalSeconds:F1} req/s average). Increase DVPOOL_IT_RATE_WORKERS " +
+                "and/or DVPOOL_IT_RATE_SECONDS to raise sustained rate or duration - this tenant's actual " +
+                "request-count limit may exceed the documented 6,000/300s default.");
+        }
+
+        // Exploratory, like the sustained-concurrency test above: no hard assertion on which facet
+        // (if any) actually tripped, since that is tenant- and timing-dependent.
+    }
+
+    /// <summary>
+    /// Mirrors the request-count probe above but swaps in a per-call <i>expensive</i> operation
+    /// (<see cref="RetrieveAllEntitiesRequest"/>) instead of a cheap one, at the same deliberately
+    /// low concurrency, to try to trip the sliding-window <b>execution-time</b> facet (default
+    /// 1,200,000 ms / 300 s, <c>-2147015903</c>) per the research doc's §2.2 model instead of either
+    /// of the other two facets.
+    /// </summary>
+    /// <remarks>
+    /// §2.2's derivation: at <c>workerCount</c> sustained concurrent heavy calls, execution time
+    /// accrues at roughly <c>workerCount</c> seconds per wall-clock second (if server execution time
+    /// tracks call duration ~1:1 - itself an open question this test also sheds light on). At the
+    /// default <c>workerCount=10</c> that is a worst case of ~120 s of wall-clock time to accumulate
+    /// the full 1,200,000 ms budget; the default duration below gives headroom for per-call overhead
+    /// not counting 1:1 toward the server-side execution-time charge.
+    /// </remarks>
+    [SkippableFact]
+    public async Task SustainedLowConcurrencyHeavyCalls_TriesToTripTheExecutionTimeLimit()
+    {
+        Skip.If(string.IsNullOrEmpty(ConnectionStringA), "Set DVPOOL_IT_CONNECTION_STRING.");
+
+        var workerCount = GetPositiveEnvironmentInteger("DVPOOL_IT_EXECTIME_WORKERS", 10);
+        var measurementDuration = TimeSpan.FromSeconds(
+            GetPositiveEnvironmentInteger("DVPOOL_IT_EXECTIME_SECONDS", 240));
+
+        var clientOptions = new DataverseClientOptions { MaxRetryCount = 0 };
+        await using var poolA = new DataverseUserPool(
+            "A",
+            ConnectionStringA,
+            new PoolOptions { MaxSize = workerCount, PrewarmCount = workerCount },
+            clientOptions: clientOptions);
+
+        await poolA.WarmupAsync();
+
+        var readyWorkers = 0;
+        var startGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var currentInFlight = 0;
+        var peakInFlight = 0;
+        var attempts = 0;
+        var successes = 0;
+        var errorCodeCounts = new ConcurrentDictionary<int, int>();
+        var otherExceptions = new ConcurrentDictionary<string, int>();
+        var retryAfters = new ConcurrentBag<TimeSpan>();
+        var busyTime = TimeSpan.Zero;
+        var busyTimeLock = new object();
+
+        var workers = Enumerable.Range(0, workerCount).Select(async _ =>
+        {
+            await using var lease = await poolA.AcquireAsync();
+            lease.Resource.DisableCrossThreadSafeties = true;
+
+            if (Interlocked.Increment(ref readyWorkers) == workerCount)
+            {
+                startGate.SetResult();
+            }
+
+            await startGate.Task;
+            var deadline = Stopwatch.GetTimestamp() + (long)(measurementDuration.TotalSeconds * Stopwatch.Frequency);
+
+            while (Stopwatch.GetTimestamp() < deadline)
+            {
+                Interlocked.Increment(ref attempts);
+                var nowInFlight = Interlocked.Increment(ref currentInFlight);
+                InterlockedMax(ref peakInFlight, nowInFlight);
+                var callSw = Stopwatch.StartNew();
+                try
+                {
+                    await lease.Resource.ExecuteAsync(new RetrieveAllEntitiesRequest { EntityFilters = EntityFilters.Entity });
+                    Interlocked.Increment(ref successes);
+                }
+                catch (Exception ex)
+                {
+                    var soapFault = UnwrapOrganizationServiceFault(ex);
+                    if (soapFault is not null)
+                    {
+                        errorCodeCounts.AddOrUpdate(soapFault.ErrorCode, 1, static (_, count) => count + 1);
+                    }
+
+                    if (DataverseThrottleDetector.TryGetRetryAfter(ex, out var retryAfter))
+                    {
+                        retryAfters.Add(retryAfter);
+                    }
+                    else if (soapFault is null)
+                    {
+                        otherExceptions.AddOrUpdate(
+                            DescribeException(ex),
+                            1,
+                            static (_, count) => count + 1);
+                    }
+                }
+                finally
+                {
+                    callSw.Stop();
+                    lock (busyTimeLock)
+                    {
+                        busyTime += callSw.Elapsed;
+                    }
+
+                    Interlocked.Decrement(ref currentInFlight);
+                }
+            }
+        }).ToArray();
+
+        var sw = Stopwatch.StartNew();
+        await Task.WhenAll(workers);
+        sw.Stop();
+
+        _output.WriteLine(
+            $"Execution-time probe: workers={workerCount}, target duration={measurementDuration}, " +
+            $"actual duration={sw.Elapsed}, attempts={attempts}, successes={successes}, " +
+            $"peak concurrent in-flight={peakInFlight}, cumulative client-observed busy time={busyTime} " +
+            $"({busyTime.TotalMilliseconds:F0} ms, vs the documented 1,200,000 ms/300s budget).");
+
+        foreach (var (errorCode, count) in errorCodeCounts.OrderBy(pair => pair.Key))
+        {
+            var label = errorCode switch
+            {
+                -2147015902 => "NumberOfRequests",
+                -2147015903 => "ExecutionTime",
+                -2147015898 => "ConcurrentRequests",
+                _ => "unrecognized",
+            };
+            _output.WriteLine($"  ErrorCode {errorCode} ({label}): {count}x");
+        }
+
+        foreach (var (exception, count) in otherExceptions.OrderBy(pair => pair.Key))
+        {
+            _output.WriteLine($"Other exception ({count}x): {exception}");
+        }
+
+        if (!retryAfters.IsEmpty)
+        {
+            _output.WriteLine($"Observed Retry-After values: min={retryAfters.Min()}, max={retryAfters.Max()}.");
+        }
+
+        Assert.True(
+            peakInFlight <= workerCount,
+            $"Peak in-flight ({peakInFlight}) exceeded the configured worker count ({workerCount}) - this test's " +
+            "low-concurrency premise would be violated.");
+
+        if (errorCodeCounts.ContainsKey(-2147015903))
+        {
+            _output.WriteLine(
+                "Confirmed live: a genuine ExecutionTime (-2147015903) throttle was observed at low " +
+                "concurrency with heavy calls, exactly as the research doc's §2.2 model predicts. " +
+                $"Ratio of client-observed busy time to the 1,200,000 ms budget at onset gives a rough " +
+                "calibration of §2.2's 'execution time ≈ client duration' assumption (see §13 caveat).");
+        }
+        else if (errorCodeCounts.ContainsKey(-2147015898))
+        {
+            _output.WriteLine(
+                "Note: only ConcurrentRequests 429s were observed even at low configured concurrency - " +
+                "something (pool, SDK, or transport) is queueing/serializing more than expected; the " +
+                $"execution-time limit was never reached in {measurementDuration} at this concurrency.");
+        }
+        else
+        {
+            _output.WriteLine(
+                $"Note: no throttle of any kind observed in {measurementDuration} ({busyTime.TotalMilliseconds:F0} ms " +
+                "of cumulative client-observed busy time accrued). Increase DVPOOL_IT_EXECTIME_WORKERS and/or " +
+                "DVPOOL_IT_EXECTIME_SECONDS - this tenant's actual execution-time limit may exceed the documented " +
+                "1,200,000 ms/300s default, or server-side execution time may track client duration well below " +
+                "1:1 (§2.2's open caveat).");
+        }
+
+        // Exploratory, like the sustained-concurrency test above: no hard assertion on which facet
+        // (if any) actually tripped, since that is tenant- and timing-dependent.
+    }
+
+    private static OrganizationServiceFault? UnwrapOrganizationServiceFault(Exception exception)
+    {
+        for (var current = exception; current is not null; current = current.InnerException)
+        {
+            if (current is FaultException<OrganizationServiceFault> fault)
+            {
+                return fault.Detail;
+            }
+        }
+
+        return null;
     }
 }

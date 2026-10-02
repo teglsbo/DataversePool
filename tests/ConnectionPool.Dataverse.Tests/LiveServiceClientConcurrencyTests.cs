@@ -33,8 +33,7 @@ public class LiveServiceClientConcurrencyTests
     public LiveServiceClientConcurrencyTests(ITestOutputHelper output) => _output = output;
 
     // Single connection string for the "does it serialize?" timing test.
-    private static string? ConnectionString =>
-        Environment.GetEnvironmentVariable("DVPOOL_IT_CONNECTION_STRING");
+    private static string? ConnectionString => LiveDataverseCredentials.GetConnectionString(0);
 
     // Two distinct users' Entra (Azure AD) object ids - *not* systemuserids - for the
     // impersonation-race test. Impersonation for an OAuth/client-secret-authenticated

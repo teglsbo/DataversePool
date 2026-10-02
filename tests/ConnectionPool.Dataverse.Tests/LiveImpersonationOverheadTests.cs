@@ -30,8 +30,7 @@ public class LiveImpersonationOverheadTests
 
     public LiveImpersonationOverheadTests(ITestOutputHelper output) => _output = output;
 
-    private static string? ConnectionString =>
-        Environment.GetEnvironmentVariable("DVPOOL_IT_CONNECTION_STRING");
+    private static string? ConnectionString => LiveDataverseCredentials.GetConnectionString(0);
 
     private static string? CallerAadObjectId =>
         Environment.GetEnvironmentVariable("DVPOOL_IT_CALLER_AAD_OBJECT_ID_A");
