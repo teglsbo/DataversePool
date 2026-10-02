@@ -195,13 +195,13 @@ public class LiveInsertThroughputBenchmarkTests
                     }
                     catch (Exception exception)
                     {
-                        var isThrottle =
-                            DataverseThrottleDetector.TryGetRetryAfter(
-                                exception,
-                                out var retryAfter) ||
-                            DescribeException(exception).Contains(
-                                "Number of concurrent requests exceeded the limit",
-                                StringComparison.OrdinalIgnoreCase);
+                        // The string-match fallback this used to have is gone: PLAN-2026-09-30.md's
+                        // Phase 2 confirmed live that DataverseThrottleDetector now recognizes the
+                        // SOAP-path FaultException<OrganizationServiceFault> throttle shape directly,
+                        // so no inference from the exception's message text is needed any more.
+                        var isThrottle = DataverseThrottleDetector.TryGetRetryAfter(
+                            exception,
+                            out var retryAfter);
                         outcomes.Add(new InsertOutcome(
                             lease.Member.Name,
                             isThrottle ? "throttled" : "error",

@@ -1,11 +1,16 @@
+using System.ServiceModel;
 using Microsoft.PowerPlatform.Dataverse.Client.Exceptions;
+using Microsoft.Xrm.Sdk;
 
 namespace ConnectionPool.Dataverse;
 
 /// <summary>
-/// Detects Dataverse's HTTP 429 / service-protection throttling signal from an exception thrown
-/// while using a leased <see cref="Microsoft.PowerPlatform.Dataverse.Client.ServiceClient"/>, and
-/// extracts the <c>Retry-After</c> duration Dataverse told the caller to back off for.
+/// Detects Dataverse's service-protection throttling signal from an exception thrown while using a
+/// leased <see cref="Microsoft.PowerPlatform.Dataverse.Client.ServiceClient"/>, and extracts the
+/// <c>Retry-After</c> duration Dataverse told the caller to back off for. Covers both transports the
+/// SDK can use under the hood: the Web API's HTTP 429 (<see cref="HttpOperationException"/>) and the
+/// SOAP path's fault (<see cref="FaultException{T}">FaultException&lt;OrganizationServiceFault&gt;</see>,
+/// confirmed live - see <see cref="ThrottlingFaultErrorCodes"/>'s remarks).
 ///
 /// Why the 429/exception path, not the proactive <c>x-ms-ratelimit-*</c> response headers:
 /// Dataverse's Web API returns proactive budget headers
@@ -30,6 +35,23 @@ public static class DataverseThrottleDetector
     private static readonly TimeSpan DefaultRetryAfterWhenUnspecified = TimeSpan.FromSeconds(5);
 
     /// <summary>
+    /// The three documented Dataverse service-protection-limit SOAP fault codes, confirmed live
+    /// against a real tenant (see PLAN-2026-09-30.md, Phase 2): <c>NumberOfRequests</c>
+    /// (-2147015902), <c>ExecutionTime</c> (-2147015903), and <c>ConcurrentRequests</c>
+    /// (-2147015898, the one actually observed in that run - a 150-call real-write burst produced
+    /// 63 <see cref="FaultException{T}">FaultException&lt;OrganizationServiceFault&gt;</see>s with this code and <c>Retry-After</c>
+    /// values from ~5 to ~13 minutes). These are the SOAP-path counterpart to the Web API's HTTP 429;
+    /// unlike the Web API path, there is no HTTP status code to key off - the fault's
+    /// <c>ErrorCode</c> is the only signal.
+    /// </summary>
+    private static readonly int[] ThrottlingFaultErrorCodes =
+    [
+        unchecked((int)0x80072322), // -2147015902: NumberOfRequests
+        unchecked((int)0x80072321), // -2147015903: ExecutionTime
+        unchecked((int)0x80072326), // -2147015898: ConcurrentRequests
+    ];
+
+    /// <summary>
     /// Upper bound applied to whatever <c>Retry-After</c> Dataverse reports, unless a caller passes
     /// an explicit override. Dataverse's service-protection limits document execution-time budgets
     /// up to 20 minutes per 5-minute sliding window, and real-world 429 responses have been observed
@@ -44,8 +66,9 @@ public static class DataverseThrottleDetector
 
     /// <summary>
     /// Walks <paramref name="exception"/> and its <see cref="Exception.InnerException"/> chain
-    /// looking for a Dataverse 429 (service-protection limit exceeded). Returns <c>true</c> and
-    /// sets <paramref name="retryAfter"/> if found, capped at <see cref="DefaultMaxRetryAfter"/>.
+    /// looking for a Dataverse service-protection-limit rejection - a Web API 429 or a SOAP fault
+    /// with one of <see cref="ThrottlingFaultErrorCodes"/>. Returns <c>true</c> and sets
+    /// <paramref name="retryAfter"/> if found, capped at <see cref="DefaultMaxRetryAfter"/>.
     /// </summary>
     public static bool TryGetRetryAfter(Exception? exception, out TimeSpan retryAfter) =>
         TryGetRetryAfter(exception, DefaultMaxRetryAfter, out retryAfter);
@@ -73,6 +96,16 @@ public static class DataverseThrottleDetector
                 retryAfter = reported > maxRetryAfter ? maxRetryAfter : reported;
                 return true;
             }
+
+            if (ex is FaultException<OrganizationServiceFault> faultEx &&
+                ThrottlingFaultErrorCodes.Contains(faultEx.Detail.ErrorCode))
+            {
+                var reported = TryReadRetryAfterErrorDetail(faultEx.Detail.ErrorDetails, out var parsed)
+                    ? parsed
+                    : DefaultRetryAfterWhenUnspecified;
+                retryAfter = reported > maxRetryAfter ? maxRetryAfter : reported;
+                return true;
+            }
         }
 
         retryAfter = default;
@@ -81,6 +114,36 @@ public static class DataverseThrottleDetector
 
     private static bool IsThrottlingStatusCode(System.Net.HttpStatusCode? statusCode) =>
         statusCode.HasValue && (int)statusCode.Value == 429;
+
+    /// <summary>
+    /// Reads the SOAP fault's <c>Retry-After</c> <see cref="ErrorDetailCollection"/> entry. Observed
+    /// live as a boxed <see cref="TimeSpan"/> (see <see cref="ThrottlingFaultErrorCodes"/>'s remarks);
+    /// also accepts a numeric seconds value defensively, in case a different fault path ever reports
+    /// it differently.
+    /// </summary>
+    private static bool TryReadRetryAfterErrorDetail(ErrorDetailCollection? errorDetails, out TimeSpan retryAfter)
+    {
+        retryAfter = default;
+        if (errorDetails is null || !errorDetails.TryGetValue(RetryAfterHeaderName, out var value))
+        {
+            return false;
+        }
+
+        switch (value)
+        {
+            case TimeSpan span:
+                retryAfter = span;
+                return true;
+            case int seconds:
+                retryAfter = TimeSpan.FromSeconds(Math.Max(0, seconds));
+                return true;
+            case string raw when int.TryParse(raw, out var parsedSeconds):
+                retryAfter = TimeSpan.FromSeconds(Math.Max(0, parsedSeconds));
+                return true;
+            default:
+                return false;
+        }
+    }
 
     private static bool TryReadRetryAfterHeader(
         IDictionary<string, IEnumerable<string>>? headers,

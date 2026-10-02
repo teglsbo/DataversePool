@@ -476,7 +476,9 @@ keeps firing — `AddRetryWithPoolHealthSignal`/`AddCircuitBreakerWithPoolHealth
 `lease.MarkUnhealthy(...)` call, it doesn't replace your callback. By default every exception marks
 the resource unhealthy; the optional `shouldMarkUnhealthy` predicate lets Dataverse callers exclude
 recognized throttles, which affect the application user's request budget rather than the connection's
-health. The detector currently recognizes HTTP 429s; SOAP-fault detection remains pending confirmation.
+health. The detector recognizes both the Web API's HTTP 429 and the SOAP path's
+`FaultException<OrganizationServiceFault>` service-protection-limit faults (confirmed live against
+a real tenant - see `PLAN-2026-09-30.md`).
 
 ## Optional: Metrics (OpenTelemetry-compatible)
 
