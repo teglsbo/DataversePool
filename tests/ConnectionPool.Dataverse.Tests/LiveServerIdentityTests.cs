@@ -154,11 +154,6 @@ public class LiveServerIdentityTests
             }
         }
     
-        foreach (var e in events.Where(e => e.Headers.ContainsKey("_xsource")).Take(3))
-        {
-            _output.WriteLine("XSOURCE " + e.Headers["_xsource"] + " burst=" + e.Headers["x-ms-ratelimit-burst-remaining-xrm-requests"]);
-        }
-
         foreach (var part in new[] { 0, 1 })
         {
             _output.WriteLine($"=== budget by X-Source part {part} ===");
