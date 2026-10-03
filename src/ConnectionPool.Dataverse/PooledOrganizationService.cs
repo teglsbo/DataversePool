@@ -122,8 +122,15 @@ public sealed class PooledOrganizationService : IOrganizationServiceAsync2
     public Task DeleteAsync(string entityName, Guid id, CancellationToken cancellationToken) =>
         RunAsync("delete", svc => svc.DeleteAsync(entityName, id, cancellationToken), cancellationToken);
 
-    public Task<OrganizationResponse> ExecuteAsync(OrganizationRequest request, CancellationToken cancellationToken) =>
-        RunAsync("execute", svc => svc.ExecuteAsync(request, cancellationToken), cancellationToken);
+    public Task<OrganizationResponse> ExecuteAsync(OrganizationRequest request, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
+        // Stamp a request id (kept if the caller already set one) so this call can be matched against
+        // Dataverse's server-side telemetry; the caller can read it back from the request they hold.
+        request.RequestId ??= Guid.NewGuid();
+        return RunAsync("execute", svc => svc.ExecuteAsync(request, cancellationToken), cancellationToken);
+    }
 
     public Task AssociateAsync(string entityName, Guid entityId, Relationship relationship, EntityReferenceCollection relatedEntities, CancellationToken cancellationToken) =>
         RunAsync("associate", svc => svc.AssociateAsync(entityName, entityId, relationship, relatedEntities, cancellationToken), cancellationToken);

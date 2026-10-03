@@ -100,6 +100,13 @@ public sealed class DataverseServiceClientPolicy : IPooledResourcePolicy<Service
             throw new InvalidOperationException($"Failed to clone Dataverse ServiceClient: {error}");
         }
 
+        if (_clientOptions?.PerConnectionSessionTrackingId == true)
+        {
+            // Set before the baseline is captured so OnReturned restores this id, not the base client's.
+            clone.SessionTrackingId = Guid.NewGuid();
+            _logger?.LogDebug("Created pooled Dataverse connection with SessionTrackingId {SessionTrackingId}", clone.SessionTrackingId);
+        }
+
         _clientBaselines.Add(clone, ClientBaseline.Capture(clone));
         return clone;
     }

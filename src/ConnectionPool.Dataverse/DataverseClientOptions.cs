@@ -66,6 +66,17 @@ public sealed class DataverseClientOptions
     public Guid? SessionTrackingId { get; init; }
 
     /// <summary>
+    /// Gives every pooled connection (clone) its own freshly generated
+    /// <see cref="Microsoft.PowerPlatform.Dataverse.Client.ServiceClient.SessionTrackingId"/>, kept
+    /// for that connection's lifetime and restored on return. Lets Dataverse's server-side telemetry
+    /// (and Microsoft support) separate one pooled connection's calls from another's; the id is
+    /// logged at debug level when the connection is created. Mutually exclusive with
+    /// <see cref="SessionTrackingId"/>, which sets one shared id for the whole pool. Default
+    /// <c>false</c>: clones keep whatever the base client carries.
+    /// </summary>
+    public bool PerConnectionSessionTrackingId { get; init; }
+
+    /// <summary>
     /// Overrides <see cref="Microsoft.PowerPlatform.Dataverse.Client.ServiceClient.MaxRetryCount"/>
     /// (SDK default: 10) if set. Must be zero or greater. Governs retries for both generic
     /// transient errors and HTTP 429 (service-protection/throttling) - set to <c>0</c> to disable
@@ -93,6 +104,12 @@ public sealed class DataverseClientOptions
     /// <summary>Throws if any set value is out of range.</summary>
     public void Validate()
     {
+        if (PerConnectionSessionTrackingId && SessionTrackingId is not null)
+        {
+            throw new ArgumentException(
+                $"{nameof(PerConnectionSessionTrackingId)} and {nameof(SessionTrackingId)} are mutually exclusive.");
+        }
+
         if (MaxRetryCount is < 0)
         {
             throw new ArgumentOutOfRangeException(nameof(MaxRetryCount), MaxRetryCount, "Must be zero or greater.");

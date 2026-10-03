@@ -287,6 +287,12 @@ var member = new DataverseUserPool(
     clientOptions: new DataverseClientOptions { MaxRetryCount = 0, UseWebApi = true }); // fail fast; enable Web API where supported
 ```
 
+**Correlating with Dataverse server-side telemetry.** Set
+`DataverseClientOptions.PerConnectionSessionTrackingId = true` to give each pooled connection its own
+`SessionTrackingId` (logged at debug level on creation; restored on return). `PooledOrganizationService`
+also stamps `OrganizationRequest.RequestId` on `ExecuteAsync` when you haven't set one, so you can read
+it back from your request object and quote it to Microsoft support.
+
 **Never going to scale beyond one user, and want to skip the selection-strategy layer entirely?**
 Use `DataverseUserPool` directly instead of wrapping it in a `DataversePool` - see ADR-0006 for
 the zero-overhead rationale. You lose `ExecuteWithThrottleRetryAsync` and `DataverseLease`, but

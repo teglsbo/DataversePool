@@ -21,6 +21,17 @@ public class DataverseClientOptionsTests
     }
 
     [Fact]
+    public void Validate_ThrowsWhenPerConnectionAndSharedSessionIdBothSet()
+    {
+        var options = new DataverseClientOptions { PerConnectionSessionTrackingId = true, SessionTrackingId = Guid.NewGuid() };
+        Assert.Throws<ArgumentException>(options.Validate);
+    }
+
+    [Fact]
+    public void Validate_AllowsPerConnectionSessionIdAlone() =>
+        new DataverseClientOptions { PerConnectionSessionTrackingId = true }.Validate();
+
+    [Fact]
     public void Validate_AllowsZero()
     {
         var options = new DataverseClientOptions { MaxRetryCount = 0, RetryPauseTime = TimeSpan.Zero };
