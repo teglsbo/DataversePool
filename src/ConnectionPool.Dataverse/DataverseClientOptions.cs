@@ -1,9 +1,8 @@
 namespace ConnectionPool.Dataverse;
 
 /// <summary>
-/// Optional overrides for <see cref="Microsoft.PowerPlatform.Dataverse.Client.ServiceClient"/>
-/// settings that affect perceived latency and failure-detection speed, applied by
-/// <see cref="DataverseServiceClientPolicy"/> to both the base client and every clone it produces.
+/// Optional <see cref="Microsoft.PowerPlatform.Dataverse.Client.ServiceClient"/> settings applied
+/// by <see cref="DataverseServiceClientPolicy"/> to both the base client and every clone it produces.
 ///
 /// <para>
 /// Unlike <see cref="Microsoft.PowerPlatform.Dataverse.Client.ServiceClient.EnableAffinityCookie"/>
@@ -11,6 +10,12 @@ namespace ConnectionPool.Dataverse;
 /// single correct value for these settings: the right choice depends on how long your callers are
 /// willing to block per operation. Left <c>null</c> (default), the SDK's own defaults apply
 /// (<c>MaxRetryCount = 10</c>, <c>RetryPauseTime = 5s</c>).
+/// </para>
+///
+/// <para>
+/// <see cref="UseWebApi"/> and <see cref="SessionTrackingId"/> are also applied to every client and
+/// restored when a lease is returned. Leaving either unset preserves the base client's configured
+/// value.
 /// </para>
 ///
 /// <para>
@@ -28,30 +33,49 @@ namespace ConnectionPool.Dataverse;
 /// <para>
 /// <b><see cref="MaxRetryCount"/> also governs HTTP 429 (service-protection/throttling) retries</b>,
 /// not just other transient errors - it is not limited to the latter. Set it to <c>0</c> to make
-/// the SDK never retry internally on a 429; the exception surfaces immediately, letting this
-/// library's own <see cref="DataverseThrottleDetector"/>/circuit breaker (see docs/adr/0008) drive
-/// backoff instead of the SDK silently absorbing it. Note <see cref="RetryPauseTime"/> does *not*
+/// the SDK never retry internally on a 429; the exception surfaces immediately. This library's
+/// <see cref="DataverseThrottleDetector"/> can drive backoff only for recognized HTTP 429s
+/// (see docs/adr/0008). Note <see cref="RetryPauseTime"/> does *not*
 /// govern the wait between 429 retries when the SDK does retry them - Dataverse's own
 /// <c>Retry-After</c> response header is used for that instead; <see cref="RetryPauseTime"/> only
 /// applies to other transient errors.
 /// </para>
 ///
 /// <para>
-/// <b>Does <c>MaxRetryCount=0</c> still give the pool a usable backoff signal?</b> Yes, by
-/// reasoning (not directly verified against a live connection - <see cref="Microsoft.PowerPlatform.Dataverse.Client.ServiceClient"/>
-/// cannot be constructed/mocked without one): <see cref="DataverseThrottleDetector"/> reads
-/// <c>Retry-After</c> from <c>HttpOperationException.Response.Headers</c>, which mirrors the actual
-/// server response Dataverse sent back - that header is populated based on what the server
-/// returned, not synthesized only after the SDK's retry budget is exhausted. Setting
-/// <c>MaxRetryCount=0</c> only changes *whether the SDK retries before throwing*, not what's
-/// attached to the resulting exception - the very first 429 already carries the real
-/// <c>Retry-After</c> value, so the pool's throttle detection still gets a correct signal even with
-/// retrying disabled entirely. This is the same exception path already verified via reflection for
-/// the exhausted-retry case in docs/adr/0008, applied by analogy to the zero-retry case.
+/// <b>Does <c>MaxRetryCount=0</c> preserve a usable backoff signal?</b> On the Web API path,
+/// <see cref="DataverseThrottleDetector"/> can read <c>Retry-After</c> from the HTTP 429 response
+/// even when SDK retries are disabled (inferred, not live-verified). On SOAP requests, the
+/// exception and its retry detail have not been confirmed in a live throttle; the current detector
+/// only matches HTTP 429 exceptions. Until SOAP detection is verified, disabling SDK retries may
+/// expose a throttle that the pool cannot classify or back off from.
 /// </para>
 /// </summary>
 public sealed class DataverseClientOptions
 {
+    /// <summary>
+    /// Overrides <see cref="Microsoft.PowerPlatform.Dataverse.Client.ServiceClient.UseWebApi"/> if
+    /// set. This is a per-pool setting, not a per-lease switch; the configured value is restored
+    /// when a client is returned.
+    /// </summary>
+    public bool? UseWebApi { get; init; }
+
+    /// <summary>
+    /// Overrides <see cref="Microsoft.PowerPlatform.Dataverse.Client.ServiceClient.SessionTrackingId"/>
+    /// if set. The configured value is restored when a client is returned to the pool.
+    /// </summary>
+    public Guid? SessionTrackingId { get; init; }
+
+    /// <summary>
+    /// Gives every pooled connection (clone) its own freshly generated
+    /// <see cref="Microsoft.PowerPlatform.Dataverse.Client.ServiceClient.SessionTrackingId"/>, kept
+    /// for that connection's lifetime and restored on return. Lets Dataverse's server-side telemetry
+    /// (and Microsoft support) separate one pooled connection's calls from another's; the id is
+    /// logged at debug level when the connection is created. Mutually exclusive with
+    /// <see cref="SessionTrackingId"/>, which sets one shared id for the whole pool. Default
+    /// <c>false</c>: clones keep whatever the base client carries.
+    /// </summary>
+    public bool PerConnectionSessionTrackingId { get; init; }
+
     /// <summary>
     /// Overrides <see cref="Microsoft.PowerPlatform.Dataverse.Client.ServiceClient.MaxRetryCount"/>
     /// (SDK default: 10) if set. Must be zero or greater. Governs retries for both generic
@@ -80,6 +104,12 @@ public sealed class DataverseClientOptions
     /// <summary>Throws if any set value is out of range.</summary>
     public void Validate()
     {
+        if (PerConnectionSessionTrackingId && SessionTrackingId is not null)
+        {
+            throw new ArgumentException(
+                $"{nameof(PerConnectionSessionTrackingId)} and {nameof(SessionTrackingId)} are mutually exclusive.");
+        }
+
         if (MaxRetryCount is < 0)
         {
             throw new ArgumentOutOfRangeException(nameof(MaxRetryCount), MaxRetryCount, "Must be zero or greater.");

@@ -13,8 +13,8 @@ namespace ConnectionPool.Dataverse.Tests;
 /// an acquire, and really does propagate whatever the pool throws, unchanged) using the same
 /// "dummy connection string fails inside DataverseServiceClientPolicy.CreateAsync" technique already
 /// used by <see cref="DataversePoolTests"/>. The lease-release/exception-identity guarantees
-/// themselves are unit-tested directly, independent of Dataverse, in <see cref="LeaseScopeTests"/> -
-/// see docs/adr/0020.
+/// themselves, and the operation metrics, are unit-tested directly, independent of Dataverse, in
+/// <see cref="DataverseOperationExecutorTests"/> - see docs/adr/0020 and docs/adr/0024.
 /// </summary>
 public class PooledOrganizationServiceTests
 {
@@ -107,5 +107,89 @@ public class PooledOrganizationServiceTests
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
             () => facade.ExecuteAsync(new Microsoft.Xrm.Sdk.OrganizationRequest("WhoAmI"), cts.Token));
+    }
+
+    // ----- Operation metrics (docs/adr/0024) -----
+
+    private static (DataverseOperationRecorder Recorder, MetricCollector Collector) IsolatedMetrics()
+    {
+        var meterName = $"test.{Guid.NewGuid():N}";
+        return (new DataverseOperationRecorder(meterName), new MetricCollector(meterName));
+    }
+
+    [Fact]
+    public void SyncMethod_RecordsExactlyOneCall_WithFixedOperationName_AndConfiguredPoolName()
+    {
+        var (recorder, collector) = IsolatedMetrics();
+        using var _r = recorder;
+        using var _c = collector;
+        var member = new DataverseUserPool("user-a", "dummy-a");
+        var facade = new PooledOrganizationService(member, new DataverseOperationMetricsOptions { PoolName = "orders" }, recorder);
+
+        Assert.ThrowsAny<Exception>(() => facade.Retrieve("account", Guid.NewGuid(), null!));
+
+        var call = Assert.Single(collector.Of(DataverseOperationMetrics.Calls));
+        Assert.Equal("retrieve", call.Tags[DataverseOperationMetrics.OperationNameTag]);
+        Assert.Equal("orders", call.Tags[DataverseOperationMetrics.PoolNameTag]);
+        Assert.Equal(DataverseOperationMetrics.OutcomeError, call.Tags[DataverseOperationMetrics.OutcomeTag]);
+        Assert.Empty(collector.Of(DataverseOperationMetrics.Attempts)); // acquire failed: no attempt ran
+        Assert.Equal(0, collector.Sum(DataverseOperationMetrics.Waiting));
+    }
+
+    [Fact]
+    public async Task WrappingDataversePool_InheritsThePoolsMetricsPoolName()
+    {
+        var (recorder, collector) = IsolatedMetrics();
+        using var _r = recorder;
+        using var _c = collector;
+        await using var pool = new DataversePool(
+            new DataverseUserPool("user-a", "dummy-a"),
+            metricsOptions: new DataverseOperationMetricsOptions { PoolName = "imports" });
+        var facade = new PooledOrganizationService(pool, metricsOptions: null, recorder);
+
+        await Assert.ThrowsAnyAsync<Exception>(() => facade.DeleteAsync("account", Guid.NewGuid()));
+
+        var call = Assert.Single(collector.Of(DataverseOperationMetrics.Calls));
+        Assert.Equal("imports", call.Tags[DataverseOperationMetrics.PoolNameTag]);
+        Assert.Equal("delete", call.Tags[DataverseOperationMetrics.OperationNameTag]);
+    }
+
+    [Fact]
+    public async Task RawAcquire_RecordsNothing_ButExecuteWithThrottleRetry_RecordsNamedOperation()
+    {
+        var (recorder, collector) = IsolatedMetrics();
+        using var _r = recorder;
+        using var _c = collector;
+        await using var pool = new DataversePool(new DataverseUserPool("user-a", "dummy-a")) { Recorder = recorder };
+
+        await Assert.ThrowsAnyAsync<Exception>(() => pool.AcquireAsync());
+        Assert.Empty(collector.Measurements); // the raw lease API is deliberately uninstrumented
+
+        await Assert.ThrowsAnyAsync<Exception>(
+            () => pool.ExecuteWithThrottleRetryAsync("import_accounts", (_, _) => Task.FromResult(1)));
+        await Assert.ThrowsAnyAsync<Exception>(
+            () => pool.ExecuteWithThrottleRetryAsync((_, _) => Task.FromResult(1)));
+
+        var names = collector.Of(DataverseOperationMetrics.Calls)
+            .Select(m => m.Tags[DataverseOperationMetrics.OperationNameTag]).ToList();
+        Assert.Equal(new object?[] { "import_accounts", DataverseOperationMetrics.CustomOperationName }, names);
+        Assert.All(collector.Of(DataverseOperationMetrics.Calls),
+            m => Assert.Equal(DataverseOperationMetricsOptions.DefaultPoolName, m.Tags[DataverseOperationMetrics.PoolNameTag]));
+    }
+
+    [Fact]
+    public async Task ExecuteWithThrottleRetry_RejectsBlankOperationName()
+    {
+        await using var pool = new DataversePool(new DataverseUserPool("user-a", "dummy-a"));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => pool.ExecuteWithThrottleRetryAsync(" ", (_, _) => Task.FromResult(1)));
+    }
+
+    [Fact]
+    public void MetricsOptions_RejectBlankPoolName()
+    {
+        var options = new DataverseOperationMetricsOptions { PoolName = "" };
+        Assert.Throws<ArgumentException>(() => new PooledOrganizationService(new DataverseUserPool("user-a", "dummy-a"), options));
+        Assert.Throws<ArgumentException>(() => new DataversePool(new DataverseUserPool("user-b", "dummy-b"), metricsOptions: options));
     }
 }

@@ -108,6 +108,35 @@ public class PollyPoolHealthSignalExtensionsTests
     }
 
     [Fact]
+    public async Task RetryPipeline_RespectsHealthPredicate()
+    {
+        var policy = new FakePolicy();
+        await using var pool = new ResourcePool<FakeResource>(policy, new PoolOptions { MaxSize = 1 });
+        var lease = await pool.AcquireAsync();
+        var original = lease.Resource;
+
+        var pipeline = new ResiliencePipelineBuilder<string>()
+            .AddRetryWithPoolHealthSignal(
+                lease,
+                new RetryStrategyOptions<string>
+                {
+                    ShouldHandle = new PredicateBuilder<string>().Handle<InvalidOperationException>(),
+                    MaxRetryAttempts = 1,
+                    Delay = TimeSpan.Zero,
+                },
+                shouldMarkUnhealthy: _ => false)
+            .Build();
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            async () => await pipeline.ExecuteAsync<string>(_ => throw new InvalidOperationException("throttled")));
+        await lease.DisposeAsync();
+
+        await using var nextLease = await pool.AcquireAsync();
+        Assert.Same(original, nextLease.Resource);
+        Assert.False(original.Disposed);
+    }
+
+    [Fact]
     public async Task CircuitBreakerPipeline_MarksLeaseUnhealthy_WhenCircuitOpens()
     {
         var policy = new FakePolicy();
@@ -154,5 +183,42 @@ public class PollyPoolHealthSignalExtensionsTests
 
         Assert.NotNull(replacement);
         Assert.True(originalResource.Disposed);
+    }
+
+    [Fact]
+    public async Task CircuitBreakerPipeline_RespectsHealthPredicate()
+    {
+        var policy = new FakePolicy();
+        await using var pool = new ResourcePool<FakeResource>(policy, new PoolOptions { MaxSize = 1 });
+        var lease = await pool.AcquireAsync();
+        var original = lease.Resource;
+
+        var pipeline = new ResiliencePipelineBuilder<string>()
+            .AddCircuitBreakerWithPoolHealthSignal(
+                lease,
+                new CircuitBreakerStrategyOptions<string>
+                {
+                    ShouldHandle = new PredicateBuilder<string>().Handle<InvalidOperationException>(),
+                    FailureRatio = 0.1,
+                    MinimumThroughput = 2,
+                    SamplingDuration = TimeSpan.FromSeconds(10),
+                    BreakDuration = TimeSpan.FromSeconds(30),
+                },
+                shouldMarkUnhealthy: _ => false)
+            .Build();
+
+        for (var i = 0; i < 2; i++)
+        {
+            await Assert.ThrowsAsync<InvalidOperationException>(
+                async () => await pipeline.ExecuteAsync<string>(_ => throw new InvalidOperationException("throttled")));
+        }
+
+        await Assert.ThrowsAsync<BrokenCircuitException>(
+            async () => await pipeline.ExecuteAsync<string>(_ => ValueTask.FromResult("unreachable")));
+        await lease.DisposeAsync();
+
+        await using var nextLease = await pool.AcquireAsync();
+        Assert.Same(original, nextLease.Resource);
+        Assert.False(original.Disposed);
     }
 }

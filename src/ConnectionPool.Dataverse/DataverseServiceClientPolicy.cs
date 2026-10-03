@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using ConnectionPool.Core;
 using Microsoft.Extensions.Logging;
 using Microsoft.PowerPlatform.Dataverse.Client;
@@ -23,11 +24,9 @@ namespace ConnectionPool.Dataverse;
 /// </para>
 ///
 /// <para>
-/// Optionally, <see cref="DataverseClientOptions"/> passed to the constructor overrides
-/// <see cref="ServiceClient.MaxRetryCount"/>/<see cref="ServiceClient.RetryPauseTime"/>/
-/// <see cref="ServiceClient.UseExponentialRetryDelayForConcurrencyThrottle"/> on both the base
-/// client and every clone - see that type's docs for why this (unlike affinity cookies) is left to
-/// the caller rather than forced to a fixed value.
+/// Optionally, <see cref="DataverseClientOptions"/> passed to the constructor overrides settings
+/// on both the base client and every clone. The policy snapshots each clone's baseline and restores
+/// its mutable settings on return, in addition to clearing impersonation state.
 /// </para>
 /// </summary>
 public sealed class DataverseServiceClientPolicy : IPooledResourcePolicy<ServiceClient>, IAsyncDisposable
@@ -36,8 +35,15 @@ public sealed class DataverseServiceClientPolicy : IPooledResourcePolicy<Service
     private readonly Func<CancellationToken, Task<ServiceClient>>? _baseClientFactory;
     private readonly ILogger? _logger;
     private readonly DataverseClientOptions? _clientOptions;
+    private readonly ConditionalWeakTable<ServiceClient, ClientBaseline> _clientBaselines = new();
     private readonly SemaphoreSlim _baseInitGate = new(1, 1);
     private ServiceClient? _baseClient;
+
+    // -1 sentinel = "never observed yet"; ServiceClient.RecommendedDegreesOfParallelism is a plain
+    // int (not nullable), so this field distinguishes "genuinely 0" from "no response has fed it
+    // yet" without needing a lock just to read/write a nullable value. See
+    // LastRecommendedDegreesOfParallelism below.
+    private int _lastRecommendedDegreesOfParallelism = -1;
 
     public DataverseServiceClientPolicy(string connectionString, ILogger? logger = null, DataverseClientOptions? clientOptions = null)
     {
@@ -86,7 +92,7 @@ public sealed class DataverseServiceClientPolicy : IPooledResourcePolicy<Service
         var baseClient = await GetOrCreateBaseClientAsync(cancellationToken).ConfigureAwait(false);
         var clone = baseClient.Clone(_logger);
         clone.EnableAffinityCookie = false;
-        ApplyRetryOverrides(clone);
+        ApplyClientOptions(clone);
         if (!clone.IsReady)
         {
             var error = clone.LastError;
@@ -94,6 +100,14 @@ public sealed class DataverseServiceClientPolicy : IPooledResourcePolicy<Service
             throw new InvalidOperationException($"Failed to clone Dataverse ServiceClient: {error}");
         }
 
+        if (_clientOptions?.PerConnectionSessionTrackingId == true)
+        {
+            // Set before the baseline is captured so OnReturned restores this id, not the base client's.
+            clone.SessionTrackingId = Guid.NewGuid();
+            _logger?.LogDebug("Created pooled Dataverse connection with SessionTrackingId {SessionTrackingId}", clone.SessionTrackingId);
+        }
+
+        _clientBaselines.Add(clone, ClientBaseline.Capture(clone));
         return clone;
     }
 
@@ -101,12 +115,10 @@ public sealed class DataverseServiceClientPolicy : IPooledResourcePolicy<Service
         => lastIncident is null && resource.IsReady;
 
     /// <summary>
-    /// Clears both <see cref="ServiceClient.CallerId"/> and
-    /// <see cref="ServiceClient.CallerAADObjectId"/> (Dataverse's two "act as another user"
-    /// impersonation fields) before a returned client goes back on the idle stack. Without this, a
-    /// caller that impersonates a user and disposes its lease without resetting these would leave
-    /// the exact same <see cref="ServiceClient"/> instance impersonating that user for whichever
-    /// unrelated caller acquires it next - a real cross-caller identity leak. See
+    /// Restores the mutable settings captured for this clone and clears both
+    /// <see cref="ServiceClient.CallerId"/> and <see cref="ServiceClient.CallerAADObjectId"/>
+    /// (Dataverse's two "act as another user" impersonation fields) before a returned client goes
+    /// back on the idle stack. Without this, per-lease changes could leak to the next caller. See
     /// docs/adr/0009-return-scrubbing-hook-caller-id-leak.md.
     /// </summary>
     /// <remarks>
@@ -120,8 +132,33 @@ public sealed class DataverseServiceClientPolicy : IPooledResourcePolicy<Service
     /// </remarks>
     public void OnReturned(ServiceClient resource)
     {
-        resource.CallerId = Guid.Empty;
-        resource.CallerAADObjectId = null;
+        if (!_clientBaselines.TryGetValue(resource, out var baseline))
+        {
+            throw new InvalidOperationException("Cannot restore settings for a ServiceClient not created by this policy.");
+        }
+
+        baseline.Apply(resource);
+
+        // Sample x-ms-dop-hint (ADR-0025, PLAN-2026-09-30.md Phase 3 item 1) on every return, not
+        // just at creation - the hint can change over a connection's lifetime as Dataverse's own
+        // capacity view evolves (§3, docs/research/autoscaling.md), and OnReturned is called after
+        // every operation regardless of outcome, making it a cheap, already-invoked hook rather
+        // than a new polling loop.
+        Volatile.Write(ref _lastRecommendedDegreesOfParallelism, resource.RecommendedDegreesOfParallelism);
+    }
+
+    /// <summary>
+    /// Most recently observed <see cref="ServiceClient.RecommendedDegreesOfParallelism"/> across
+    /// every clone this policy has produced, sampled in <see cref="OnReturned"/>. Null until at
+    /// least one connection has been returned at least once.
+    /// </summary>
+    public int? LastRecommendedDegreesOfParallelism
+    {
+        get
+        {
+            var value = Volatile.Read(ref _lastRecommendedDegreesOfParallelism);
+            return value < 0 ? null : value;
+        }
     }
 
     public ValueTask DisposeResourceAsync(ServiceClient resource)
@@ -168,18 +205,21 @@ public sealed class DataverseServiceClientPolicy : IPooledResourcePolicy<Service
             if (_baseClient is null || !_baseClient.IsReady)
             {
                 var error = _baseClient?.LastError;
+                var lastException = _baseClient?.LastException;
                 // Don't leave a non-ready client (e.g. one the factory returned but that failed to
                 // authenticate) sitting in _baseClient - nothing else will ever dispose it if this
                 // policy is never retried or explicitly disposed. See docs/adr/0022.
                 _baseClient?.Dispose();
                 _baseClient = null;
-                throw new InvalidOperationException($"Failed to establish base Dataverse connection: {error}");
+                // Keep the SDK's own exception as InnerException so DataverseFailureClassifier can
+                // see the original auth error (AADSTS code, HTTP status) behind the message.
+                throw new InvalidOperationException($"Failed to establish base Dataverse connection: {error}", lastException);
             }
 
             // See docs/adr/0002 - this base client is never leased out directly, only cloned, but
             // Clone() may copy session-level settings from it, so keep it consistent with clones.
             _baseClient.EnableAffinityCookie = false;
-            ApplyRetryOverrides(_baseClient);
+            ApplyClientOptions(_baseClient);
 
             return _baseClient;
         }
@@ -190,16 +230,14 @@ public sealed class DataverseServiceClientPolicy : IPooledResourcePolicy<Service
     }
 
     /// <summary>
-    /// Applies any configured <see cref="DataverseClientOptions.MaxRetryCount"/>/
-    /// <see cref="DataverseClientOptions.RetryPauseTime"/>/
-    /// <see cref="DataverseClientOptions.UseExponentialRetryDelayForConcurrencyThrottle"/>
-    /// overrides to <paramref name="client"/>.
+    /// Applies any configured <see cref="DataverseClientOptions"/> overrides to
+    /// <paramref name="client"/>.
     /// Applied to both the base client and every clone (same defensive redundancy as
     /// <see cref="ServiceClient.EnableAffinityCookie"/> above) since it is not guaranteed that
     /// <see cref="ServiceClient.Clone(ILogger)"/> copies these settings from its source.
     /// No-op (SDK defaults apply) when <see cref="_clientOptions"/> is null or a given value is unset.
     /// </summary>
-    private void ApplyRetryOverrides(ServiceClient client)
+    private void ApplyClientOptions(ServiceClient client)
     {
         if (_clientOptions?.MaxRetryCount is { } maxRetryCount)
         {
@@ -214,6 +252,49 @@ public sealed class DataverseServiceClientPolicy : IPooledResourcePolicy<Service
         if (_clientOptions?.UseExponentialRetryDelayForConcurrencyThrottle is { } useExponentialRetryDelay)
         {
             client.UseExponentialRetryDelayForConcurrencyThrottle = useExponentialRetryDelay;
+        }
+
+        if (_clientOptions?.UseWebApi is { } useWebApi)
+        {
+            client.UseWebApi = useWebApi;
+        }
+
+        if (_clientOptions?.SessionTrackingId is { } sessionTrackingId)
+        {
+            client.SessionTrackingId = sessionTrackingId;
+        }
+    }
+
+    private sealed record ClientBaseline(
+        bool DisableCrossThreadSafeties,
+        bool ForceServerMetadataCacheConsistency,
+        int MaxRetryCount,
+        TimeSpan RetryPauseTime,
+        bool UseExponentialRetryDelayForConcurrencyThrottle,
+        Guid? SessionTrackingId,
+        bool UseWebApi)
+    {
+        public static ClientBaseline Capture(ServiceClient client) => new(
+            client.DisableCrossThreadSafeties,
+            client.ForceServerMetadataCacheConsistency,
+            client.MaxRetryCount,
+            client.RetryPauseTime,
+            client.UseExponentialRetryDelayForConcurrencyThrottle,
+            client.SessionTrackingId,
+            client.UseWebApi);
+
+        public void Apply(ServiceClient client)
+        {
+            client.CallerId = Guid.Empty;
+            client.CallerAADObjectId = null;
+            client.DisableCrossThreadSafeties = DisableCrossThreadSafeties;
+            client.EnableAffinityCookie = false;
+            client.ForceServerMetadataCacheConsistency = ForceServerMetadataCacheConsistency;
+            client.MaxRetryCount = MaxRetryCount;
+            client.RetryPauseTime = RetryPauseTime;
+            client.UseExponentialRetryDelayForConcurrencyThrottle = UseExponentialRetryDelayForConcurrencyThrottle;
+            client.SessionTrackingId = SessionTrackingId;
+            client.UseWebApi = UseWebApi;
         }
     }
 }

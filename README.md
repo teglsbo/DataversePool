@@ -16,19 +16,19 @@ members and per-member circuit breaking + throttle-awareness) and an optional Po
 pool decides is best, use it, and return/dispose it, instead of managing
 construction/cloning/round-robin/health yourself.
 
-It's also useful with just a **single** application user, for two smaller reasons: cloning a new
-`ServiceClient` is expensive enough (hundreds of ms to seconds — see
-[ADR-0002](docs/adr/0002-serial-creation-gate.md)) that constructing one per request/thread is a
-real bottleneck, and a `ServiceClient` carries per-instance mutable state (e.g. `CallerId`) that
-isn't safe to share across concurrent callers using different identities. But the multi-application-user
-case — raising your effective throughput ceiling — is the main reason this library exists.
+It's also useful with just a **single** application user: constructing a new `ServiceClient` per
+request pays the cold authentication/discovery cost (hundreds of ms to seconds), while cloning
+sequentially from a warmed base costs about 1ms ([ADR-0002](docs/adr/0002-serial-creation-gate-no-parallel-cloning.md)).
+A `ServiceClient` also carries per-instance mutable state (e.g. `CallerId`) that isn't safe to share
+across concurrent callers using different identities. But the multi-application-user case — raising
+your effective throughput ceiling — is the main reason this library exists.
 
-> **Verified against a real Dataverse environment:** one pinned application user completed 110
+> **Direct pinned raw-`HttpClient` experiment against a real Dataverse environment:** one application user completed 110
 > slow requests and rejected 18 with an explicit concurrency-limit HTTP 429 in 32.7 seconds. Two
 > distinct application users on the same server completed all 160 requests in 34.0 seconds. That is
-> about **40% more successful operations per second** in this saturated burst, not merely simulated
-> routing behavior. The same 160-operation workload also completed through real `DataversePool`
-> leases with an exact 80/80 member split and no rejection.
+> about **40% more successful operations per second** in this saturated raw-HTTP burst. This is a
+> controlled experiment, not a `DataversePool` throughput benchmark. Separately, the same 160-operation
+> workload completed through real `DataversePool` leases with an exact 80/80 member split and no rejection.
 >
 > A separate practical write benchmark inserted 1,000 independent rows into the purpose-built
 > `new_loadthin` standard table. One user with 32 leases averaged **333.8 rows/s**; two users with
@@ -146,7 +146,9 @@ throughput and determine where a shared environment or endpoint bottleneck event
 - **A dead pool member shouldn't take down the group.** The default group-pool strategy is
   health-aware: It circuit-opens a consistently-failing member, retries it after a cooldown, and
   fails open (keeps serving) rather than locking the whole pool out — see
-  [ADR-0007](docs/adr/0007-race-conditions-timeouts-and-failure-scenarios.md).
+  [ADR-0007](docs/adr/0007-race-conditions-timeouts-and-failure-scenarios.md). Its operational
+  failure count is pool-wide, not per clone; successful returns from other slots can mask one
+  persistently failing clone under mixed traffic.
 
 > **`UseWebApi` is not a substitute for pooling on read-heavy workloads.** In the current SDK,
 > `RetrieveMultiple` (and reads generally) never route through the Web API/HTTP translation path —
@@ -225,6 +227,29 @@ Choose `MaxSize` from the application's resource and latency budget, then tune i
 throughput, latency, waiting leases, and real 429 signals. Multiple processes/pods do not share the
 pool's lease count.
 
+You can change it at runtime without a restart. Growing takes effect immediately. Shrinking never
+cancels in-flight calls: the excess leases are retired as they are returned. See
+[ADR-0025](docs/adr/0025-runtime-adjustable-pool-size.md).
+
+```csharp
+member.SetMaxSize(16);              // DataverseUserPool (or ResourcePool<T>)
+var current = member.MaxSize;       // also reported as PoolStats.MaxSize
+// e.g. follow Dataverse's hint, read from any leased client:
+member.SetMaxSize(lease.Resource.RecommendedDegreesOfParallelism);
+```
+
+> **`AcquireTimeout` and `CreateTimeout` default to 30 seconds, not "wait forever".** An unbounded
+> default turns a saturated pool or a hung connection attempt into callers blocked indefinitely with
+> no exception and no signal - strictly harder to diagnose than a bounded failure, and the usual
+> root cause behind "the app just got slow". `AcquireTimeout` bounds the *entire* acquire (queue wait
+> plus any inline recycle/creation), and a finite `CreateTimeout` is what makes that bound hold even
+> when the underlying `CreateAsync` ignores its cancellation token - because creation is serialized,
+> one hung create otherwise stalls every other caller. A blown `AcquireTimeout` throws
+> `PoolAcquireTimeoutException`, whose message carries a full `PoolStats` snapshot. Both are
+> deliberately generous (they exist to catch hangs, not to act as a per-operation latency budget -
+> pass your own `CancellationToken` for that); set either explicitly to `null` to restore the
+> previous unbounded behavior.
+
 > **`EnableAffinityCookie` is forced to `false` automatically.** Dataverse's server affinity cookie
 > (on by default) pins all requests from one `ServiceClient` to a single backend node - good for a
 > single interactive session, but counter-productive here: A pool exists specifically to spread
@@ -235,25 +260,38 @@ pool's lease count.
 > [Microsoft's docs](https://learn.microsoft.com/en-us/dotnet/api/microsoft.powerplatform.dataverse.client.serviceclient.enableaffinitycookie)
 > for details.
 
+> **`UseWebApi` is a pool-wide option.** Set it in the connection string or via
+> `DataverseClientOptions.UseWebApi`; the configured baseline is restored when each lease returns,
+> so callers must not toggle it per lease. The SDK routes only eligible operations through Web API
+> (including `Create`, `Update`, and `Delete`); reads such as `RetrieveMultiple` still use the legacy
+> proxy path. See the Web API note above for the effect on read-heavy workloads.
+
 > **`MaxRetryCount`/`RetryPauseTime`/`UseExponentialRetryDelayForConcurrencyThrottle` are optional
 > overrides, not forced.** The SDK's own defaults (10 retries, 5s pause) mean a single call hitting a
 > transient error can silently block a leased client for up to ~50 seconds before an exception ever
 > reaches this pool's throttle detection or a circuit breaker built on top of it. `MaxRetryCount`
 > also governs HTTP 429 (service-protection/throttling) retries, not just other transient errors -
-> set it to `0` to make the SDK fail fast on either and let this pool's own throttle
-> detection/circuit breaker drive backoff instead. (The `Retry-After` value the pool reads is the
-> real server response header, so it's still correct even with `MaxRetryCount=0` - see ADR-0016 for
-> the reasoning.) Unlike the affinity cookie, there's no single correct value here - it depends on
+> set it to `0` to make the SDK fail fast. The pool currently detects HTTP 429s, but SOAP-fault
+> throttles have not been confirmed or classified; do not assume that the pool can honor their
+> `Retry-After` when SDK retries are disabled. Unlike the affinity cookie, there's no single correct
+> value here - it depends on
 > your own timeout budget - so pass a `DataverseClientOptions` to `DataverseUserPool`'s constructor
-> to override any of these; leave them `null` (default) to keep the SDK's defaults. See
+> (or to `AddDataverseUserPool`) to override any of these; leave them `null` (default) to keep the
+> SDK's defaults. See
 > [ADR-0016](docs/adr/0016-affinity-cookie-forced-off-retry-knobs-exposed.md).
 
 ```csharp
 var member = new DataverseUserPool(
     "sample-user",
     connectionString,
-    clientOptions: new DataverseClientOptions { MaxRetryCount = 0 }); // fail fast, let the pool own backoff
+    clientOptions: new DataverseClientOptions { MaxRetryCount = 0, UseWebApi = true }); // fail fast; enable Web API where supported
 ```
+
+**Correlating with Dataverse server-side telemetry.** Set
+`DataverseClientOptions.PerConnectionSessionTrackingId = true` to give each pooled connection its own
+`SessionTrackingId` (logged at debug level on creation; restored on return). `PooledOrganizationService`
+also stamps `OrganizationRequest.RequestId` on `ExecuteAsync` when you haven't set one, so you can read
+it back from your request object and quote it to Microsoft support.
 
 **Never going to scale beyond one user, and want to skip the selection-strategy layer entirely?**
 Use `DataverseUserPool` directly instead of wrapping it in a `DataversePool` - see ADR-0006 for
@@ -297,6 +335,19 @@ fewest leased connections (`PoolStats.LeasedCount`), with the same dead-member c
 ```csharp
 var pool = new DataversePool(members, new LeastConnectionsSlotSelectionStrategy());
 ```
+
+`HealthWeightedLeastConnectionsSlotSelectionStrategy` goes one step further: it ranks members by
+*headroom* (`(cap - leased) / cap`, where `cap` is the smaller of the pool's `MaxSize` and the
+server's `x-ms-dop-hint`), and after a member's throttle window ends it ramps that member back in
+(cap starts at 2, +1 every 5 s by default) instead of releasing every queued caller onto it at once.
+The ramp is a ranking preference, not a hard limit. See `docs/research/autoscaling.md` §9.6.
+
+**Permanent failures.** If connecting fails with something that won't heal on its own (revoked or
+expired client secret, deleted app registration, disabled application user, persistent 401), the
+member is quarantined for `DataverseUserPool.QuarantineDuration` (default 10 min) instead of being
+retried on the breaker's short cooldown. It's logged once at error level, skipped by the
+health-aware strategies, visible via the `dataversepool.member.quarantined` gauge, and can be cleared
+early with `ClearQuarantine()`. Unrecognised errors are treated as transient.
 
 **Throttle-aware routing.** Both strategies also skip a member that's currently marked as
 Dataverse-throttled. `DataversePool.AcquireAsync()` returns a `DataverseLease` (not a
@@ -347,6 +398,12 @@ needs.
 > opt back into Dataverse's raw value. See
 > [ADR-0017](docs/adr/0017-group-throttle-retry-helper-and-capped-retry-after.md).
 
+> **Scaling and telemetry notes.** Pool size does not adjust itself (no autoscaling or idle eviction), but you can
+> change it at runtime with `SetMaxSize` (ADR-0025). Throughput scales by adding application users to a `DataversePool`
+> (round-robin group). `ServiceClient.RecommendedDegreesOfParallelism` exposes Dataverse's `x-ms-dop-hint`, but the pool
+> does not read it automatically yet; automatic DOP needs its own spec (ADR-0025, "Open questions"). Capturing `x-ms-*` headers on successful calls
+> needs an HTTP-level observer outside `ServiceClient`; see `REVIEW-2026-09-30.md` Part 2.
+
 Why 429/exception-based rather than proactively reading Dataverse's `x-ms-ratelimit-*` response
 headers on every call: Headers are the theoretically better (leading, not lagging) signal, but
 `ServiceClient` doesn't surface response headers for *successful* calls anywhere in its public API
@@ -393,7 +450,10 @@ services.AddDataverseUserPool("primary", connectionString, options =>
 {
     options.MaxSize = 8;
     options.PrewarmCount = 2;
-});
+},
+// Same retry knobs as DataverseUserPool's constructor - see the MaxRetryCount note above for why
+// you may want the SDK to fail fast and let this pool own backoff instead.
+clientOptions: new DataverseClientOptions { MaxRetryCount = 0 });
 services.AddDataversePool("primary-pool", new[] { "primary" }); // single member today, add more names later
 
 // resolve later:
@@ -411,15 +471,20 @@ If you want a failing/opening resilience pipeline to also mark the pooled resour
 it gets recycled instead of handed out again), add `DataversePool.Polly`:
 
 ```csharp
+using ConnectionPool.Dataverse;
 using ConnectionPool.Dataverse.Polly;
 using Polly;
 
 var pipeline = new ResiliencePipelineBuilder<WhoAmIResponse>()
-    .AddRetryWithPoolHealthSignal(lease, new RetryStrategyOptions<WhoAmIResponse>
-    {
-        ShouldHandle = new PredicateBuilder<WhoAmIResponse>().Handle<Exception>(),
-        MaxRetryAttempts = 3,
-    })
+    .AddRetryWithPoolHealthSignal(
+        lease,
+        new RetryStrategyOptions<WhoAmIResponse>
+        {
+            ShouldHandle = new PredicateBuilder<WhoAmIResponse>().Handle<Exception>(),
+            MaxRetryAttempts = 3,
+        },
+        shouldMarkUnhealthy: exception =>
+            !DataverseThrottleDetector.TryGetRetryAfter(exception, out _))
     .Build();
 
 var response = await pipeline.ExecuteAsync(async _ => (WhoAmIResponse)lease.Resource.Execute(new WhoAmIRequest()));
@@ -427,7 +492,12 @@ var response = await pipeline.ExecuteAsync(async _ => (WhoAmIResponse)lease.Reso
 
 Any `OnRetry`/`OnOpened` callback you already had on `RetryStrategyOptions`/`CircuitBreakerStrategyOptions`
 keeps firing — `AddRetryWithPoolHealthSignal`/`AddCircuitBreakerWithPoolHealthSignal` only adds the
-`lease.MarkUnhealthy(...)` call, it doesn't replace your callback.
+`lease.MarkUnhealthy(...)` call, it doesn't replace your callback. By default every exception marks
+the resource unhealthy; the optional `shouldMarkUnhealthy` predicate lets Dataverse callers exclude
+recognized throttles, which affect the application user's request budget rather than the connection's
+health. The detector recognizes both the Web API's HTTP 429 and the SOAP path's
+`FaultException<OrganizationServiceFault>` service-protection-limit faults (confirmed live against
+a real tenant - see `PLAN-2026-09-30.md`).
 
 ## Optional: Metrics (OpenTelemetry-compatible)
 
@@ -457,6 +527,67 @@ services.AddOpenTelemetry().WithMetrics(m => m.AddMeter("DataversePool").AddProm
 Scope is deliberately generic (the `ConnectionPool.Core` `PoolStats` fields only) — Dataverse-specific
 signals like per-member circuit breaker state aren't covered yet. See
 [ADR-0018](docs/adr/0018-metrics-adapter-observable-gauges.md).
+
+### Operation latency, retries and throttles (built in)
+
+Gauges show *how full* the pool is, not *how long calls take*. `ConnectionPool.Dataverse` itself
+(no extra package) also publishes push-based histograms and counters on the same `"DataversePool"`
+meter for every call through `PooledOrganizationService` and `ExecuteWithThrottleRetryAsync`. The
+same `AddMeter("DataversePool")` line above picks them up. With no listener attached, they cost
+one flag check per call.
+
+| Instrument | Type | Tells you |
+|---|---|---|
+| `dataversepool.operation.acquire.duration` (s) | histogram | Time waiting for a lease — pool saturation or slow client creation |
+| `dataversepool.operation.duration` (s) | histogram | Time inside `ServiceClient` per attempt, including the SDK's own internal retries |
+| `dataversepool.operation.total.duration` (s) | histogram | End-to-end call latency across all attempts and `Retry-After` waits |
+| `dataversepool.operation.active` / `.waiting` | up-down counter | Calls executing now / queued for a lease now |
+| `dataversepool.operation.attempts` / `.calls` | counter | Attempts vs caller-visible calls |
+| `dataversepool.operation.retries` | counter | Retries scheduled after a recognized throttle |
+| `dataversepool.operation.retry_after` (s) | histogram | Capped `Retry-After` per recognized throttle |
+
+Tags: `pool.name`, `pool.member.name`, `dataverse.operation.name`, `outcome`
+(`success`/`error`/`throttled`/`canceled`) and `error.type` (exception type name only — never
+messages, IDs or URLs). The facade uses fixed operation names (`create`, `retrieve`,
+`retrieve_multiple`, `execute`, …). For the retry helper, pass a fixed low-cardinality name:
+
+```csharp
+await pool.ExecuteWithThrottleRetryAsync("import_accounts", (client, ct) => client.CreateAsync(entity, ct));
+```
+
+`pool.name` defaults to `"default"`. Set it with `new DataverseOperationMetricsOptions { PoolName = "orders" }`
+on the `DataversePool`/`PooledOrganizationService` constructor. `AddDataversePool` uses its pool name
+automatically.
+
+Two limits to know:
+- Calls made directly on `lease.Resource` are **not** measured. The library can't see inside your
+  own `ServiceClient` usage, so instrument it yourself if you need it.
+- A long `operation.duration` with few `retries` usually means the SDK is absorbing 429s internally
+  before this library ever sees them. Lower `DataverseClientOptions.MaxRetryCount` if you want those
+  stalls bounded and visible here.
+
+See [ADR-0024](docs/adr/0024-operation-level-metrics-on-instrumented-execution-paths.md).
+
+### Optional: automatic pool sizing (experimental)
+
+By default every member keeps its configured `PoolOptions.MaxSize`. Pass `PoolSizingOptions` to a
+`DataversePool` to size members at runtime:
+
+```csharp
+var pool = new DataversePool(members, sizingOptions: new PoolSizingOptions
+{
+    Strategy = new CompositePoolSizingStrategy(
+        new DopHintPoolSizingStrategy(),   // follow Dataverse's x-ms-dop-hint
+        new AimdPoolSizingStrategy(),      // halve on concurrent-request throttles, regrow slowly
+        new GradientPoolSizingStrategy()), // shrink when call latency climbs above its baseline
+    MinSizeFloor = 2,
+});
+```
+
+Only concurrent-request throttles shrink a member. A request-count throttle makes `Aimd` cap the
+request rate (or, for an execution-time throttle, its busy time) instead (calls are delayed, not failed), since a smaller pool does not fix a rate budget. Sizing sees calls made through
+`ExecuteWithThrottleRetryAsync` and `PooledOrganizationService` over a `DataversePool`. Watch the
+metrics above before relying on it. See [ADR-0026](docs/adr/0026-opt-in-automatic-pool-sizing.md).
 
 ## Optional: Drop-in `IOrganizationServiceAsync` facade
 
@@ -560,7 +691,8 @@ Every non-obvious choice is written up as an ADR in [`docs/adr/`](docs/adr/):
 21. [Base-client factory constructor for `DataverseServiceClientPolicy`/`DataverseUserPool`](docs/adr/0021-base-client-factory-constructor.md)
 22. [Shutdown disposal race, throttle-retry lease leak, probe-claim leak fixes](docs/adr/0022-shutdown-and-probe-claim-leak-fixes.md)
 23. [Corrected premise: A `ServiceClient` does not serialize concurrent async requests](docs/adr/0023-serviceclient-async-concurrency-corrected-premise.md)
-24. [Proposed operation-level metrics on instrumented execution paths](docs/adr/0024-operation-level-metrics-on-instrumented-execution-paths.md)
+24. [Operation-level metrics on instrumented execution paths](docs/adr/0024-operation-level-metrics-on-instrumented-execution-paths.md)
+25. [Runtime-adjustable pool size, as the first step toward automatic DOP](docs/adr/0025-runtime-adjustable-pool-size.md)
 
 ## Status / open items
 
@@ -594,3 +726,9 @@ pool creation/isolation/health-check timing — several behaviors here look like
 ## License
 
 [MIT](LICENSE)
+
+### Experimental: response budget observer
+
+Set `PoolSizingOptions.ObserveResponses = true` to read Dataverse's rate-limit headers from every
+response. `pool.GetResponseBudget(member)` returns the latest values, and a nearly exhausted budget
+briefly holds that member's requests. Off by default; see ADR-0026.

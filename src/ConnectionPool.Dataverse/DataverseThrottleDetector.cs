@@ -1,11 +1,16 @@
+using System.ServiceModel;
 using Microsoft.PowerPlatform.Dataverse.Client.Exceptions;
+using Microsoft.Xrm.Sdk;
 
 namespace ConnectionPool.Dataverse;
 
 /// <summary>
-/// Detects Dataverse's HTTP 429 / service-protection throttling signal from an exception thrown
-/// while using a leased <see cref="Microsoft.PowerPlatform.Dataverse.Client.ServiceClient"/>, and
-/// extracts the <c>Retry-After</c> duration Dataverse told the caller to back off for.
+/// Detects Dataverse's service-protection throttling signal from an exception thrown while using a
+/// leased <see cref="Microsoft.PowerPlatform.Dataverse.Client.ServiceClient"/>, and extracts the
+/// <c>Retry-After</c> duration Dataverse told the caller to back off for. Covers both transports the
+/// SDK can use under the hood: the Web API's HTTP 429 (<see cref="HttpOperationException"/>) and the
+/// SOAP path's fault (<see cref="FaultException{T}">FaultException&lt;OrganizationServiceFault&gt;</see>,
+/// confirmed live - see <see cref="ThrottlingFaultErrorCodes"/>'s remarks).
 ///
 /// Why the 429/exception path, not the proactive <c>x-ms-ratelimit-*</c> response headers:
 /// Dataverse's Web API returns proactive budget headers
@@ -27,7 +32,33 @@ namespace ConnectionPool.Dataverse;
 public static class DataverseThrottleDetector
 {
     private const string RetryAfterHeaderName = "Retry-After";
+
+    /// <summary>
+    /// Floor for a reported <c>Retry-After</c>. Live Web API request-count 429s were seen with
+    /// <c>Retry-After: 0</c>; honoring 0 would turn the retry into a tight loop against a still-closed window.
+    /// </summary>
+    public static readonly TimeSpan MinRetryAfter = TimeSpan.FromSeconds(1);
+
+    private static TimeSpan Clamp(TimeSpan reported, TimeSpan max) =>
+        reported > max ? max : reported < MinRetryAfter ? (MinRetryAfter < max ? MinRetryAfter : max) : reported;
     private static readonly TimeSpan DefaultRetryAfterWhenUnspecified = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// The three documented Dataverse service-protection-limit SOAP fault codes, confirmed live
+    /// against a real tenant (see PLAN-2026-09-30.md, Phase 2): <c>NumberOfRequests</c>
+    /// (-2147015902), <c>ExecutionTime</c> (-2147015903), and <c>ConcurrentRequests</c>
+    /// (-2147015898, the one actually observed in that run - a 150-call real-write burst produced
+    /// 63 <see cref="FaultException{T}">FaultException&lt;OrganizationServiceFault&gt;</see>s with this code and <c>Retry-After</c>
+    /// values from ~5 to ~13 minutes). These are the SOAP-path counterpart to the Web API's HTTP 429;
+    /// unlike the Web API path, there is no HTTP status code to key off - the fault's
+    /// <c>ErrorCode</c> is the only signal.
+    /// </summary>
+    private static readonly int[] ThrottlingFaultErrorCodes =
+    [
+        unchecked((int)0x80072322), // -2147015902: NumberOfRequests
+        unchecked((int)0x80072321), // -2147015903: ExecutionTime
+        unchecked((int)0x80072326), // -2147015898: ConcurrentRequests
+    ];
 
     /// <summary>
     /// Upper bound applied to whatever <c>Retry-After</c> Dataverse reports, unless a caller passes
@@ -44,8 +75,9 @@ public static class DataverseThrottleDetector
 
     /// <summary>
     /// Walks <paramref name="exception"/> and its <see cref="Exception.InnerException"/> chain
-    /// looking for a Dataverse 429 (service-protection limit exceeded). Returns <c>true</c> and
-    /// sets <paramref name="retryAfter"/> if found, capped at <see cref="DefaultMaxRetryAfter"/>.
+    /// looking for a Dataverse service-protection-limit rejection - a Web API 429 or a SOAP fault
+    /// with one of <see cref="ThrottlingFaultErrorCodes"/>. Returns <c>true</c> and sets
+    /// <paramref name="retryAfter"/> if found, capped at <see cref="DefaultMaxRetryAfter"/>.
     /// </summary>
     public static bool TryGetRetryAfter(Exception? exception, out TimeSpan retryAfter) =>
         TryGetRetryAfter(exception, DefaultMaxRetryAfter, out retryAfter);
@@ -70,7 +102,17 @@ public static class DataverseThrottleDetector
                 var reported = TryReadRetryAfterHeader(httpEx.Response!.Headers, out var parsed)
                     ? parsed
                     : DefaultRetryAfterWhenUnspecified;
-                retryAfter = reported > maxRetryAfter ? maxRetryAfter : reported;
+                retryAfter = Clamp(reported, maxRetryAfter);
+                return true;
+            }
+
+            if (ex is FaultException<OrganizationServiceFault> faultEx &&
+                ThrottlingFaultErrorCodes.Contains(faultEx.Detail.ErrorCode))
+            {
+                var reported = TryReadRetryAfterErrorDetail(faultEx.Detail.ErrorDetails, out var parsed)
+                    ? parsed
+                    : DefaultRetryAfterWhenUnspecified;
+                retryAfter = Clamp(reported, maxRetryAfter);
                 return true;
             }
         }
@@ -79,8 +121,95 @@ public static class DataverseThrottleDetector
         return false;
     }
 
+    /// <summary>
+    /// Decodes <i>which</i> service-protection limit an exception reports (<see cref="ThrottleReason"/>).
+    /// A SOAP fault is decoded exactly from its error code. A Web API 429 carries the code/message in
+    /// its body, so it is decoded best-effort from the response text and message (the three hex codes
+    /// or Dataverse's wording) - not yet verified live; anything unrecognized is
+    /// <see cref="ThrottleReason.Unknown"/>. Returns <c>false</c> if the exception is not a throttle at
+    /// all. Does not apply the <c>Retry-After</c> cap, so it never throws on a bad one.
+    /// </summary>
+    public static bool TryGetThrottleReason(Exception? exception, out ThrottleReason reason)
+    {
+        for (var ex = exception; ex is not null; ex = ex.InnerException)
+        {
+            if (ex is FaultException<OrganizationServiceFault> faultEx &&
+                ThrottlingFaultErrorCodes.Contains(faultEx.Detail.ErrorCode))
+            {
+                reason = faultEx.Detail.ErrorCode switch
+                {
+                    unchecked((int)0x80072322) => ThrottleReason.RequestCount,
+                    unchecked((int)0x80072321) => ThrottleReason.ExecutionTime,
+                    _ => ThrottleReason.ConcurrentRequests,
+                };
+                return true;
+            }
+
+            if (ex is HttpOperationException httpEx && IsThrottlingStatusCode(httpEx.Response?.StatusCode))
+            {
+                reason = DecodeFromText(httpEx.Message + " " + httpEx.Response?.Content);
+                return true;
+            }
+        }
+
+        reason = default;
+        return false;
+    }
+
+    private static ThrottleReason DecodeFromText(string text)
+    {
+        bool Has(string marker) => text.Contains(marker, StringComparison.OrdinalIgnoreCase);
+
+        if (Has("80072326") || Has("concurrent requests"))
+        {
+            return ThrottleReason.ConcurrentRequests;
+        }
+
+        if (Has("80072321") || Has("combined execution time"))
+        {
+            return ThrottleReason.ExecutionTime;
+        }
+
+        if (Has("80072322") || Has("number of requests"))
+        {
+            return ThrottleReason.RequestCount;
+        }
+
+        return ThrottleReason.Unknown;
+    }
+
     private static bool IsThrottlingStatusCode(System.Net.HttpStatusCode? statusCode) =>
         statusCode.HasValue && (int)statusCode.Value == 429;
+
+    /// <summary>
+    /// Reads the SOAP fault's <c>Retry-After</c> <see cref="ErrorDetailCollection"/> entry. Observed
+    /// live as a boxed <see cref="TimeSpan"/> (see <see cref="ThrottlingFaultErrorCodes"/>'s remarks);
+    /// also accepts a numeric seconds value defensively, in case a different fault path ever reports
+    /// it differently.
+    /// </summary>
+    private static bool TryReadRetryAfterErrorDetail(ErrorDetailCollection? errorDetails, out TimeSpan retryAfter)
+    {
+        retryAfter = default;
+        if (errorDetails is null || !errorDetails.TryGetValue(RetryAfterHeaderName, out var value))
+        {
+            return false;
+        }
+
+        switch (value)
+        {
+            case TimeSpan span:
+                retryAfter = span;
+                return true;
+            case int seconds:
+                retryAfter = TimeSpan.FromSeconds(Math.Max(0, seconds));
+                return true;
+            case string raw when int.TryParse(raw, out var parsedSeconds):
+                retryAfter = TimeSpan.FromSeconds(Math.Max(0, parsedSeconds));
+                return true;
+            default:
+                return false;
+        }
+    }
 
     private static bool TryReadRetryAfterHeader(
         IDictionary<string, IEnumerable<string>>? headers,

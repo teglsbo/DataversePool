@@ -56,4 +56,31 @@ public class PoolOptionsValidationTests
         await using var pool = new ResourcePool<FakeResource>(policy, new PoolOptions());
         Assert.NotNull(pool);
     }
+
+    [Fact]
+    public void Defaults_BoundAcquireAndCreate_RatherThanWaitingForever()
+    {
+        // A pool whose defaults are all "wait forever" turns a saturated or hung dependency into
+        // callers blocked indefinitely with no exception and no signal. Both knobs therefore now
+        // default to a finite (deliberately generous) duration; null remains available as an
+        // explicit opt-out.
+        var options = new PoolOptions();
+
+        Assert.Equal(PoolOptions.DefaultAcquireTimeout, options.AcquireTimeout);
+        Assert.Equal(PoolOptions.DefaultCreateTimeout, options.CreateTimeout);
+        Assert.True(options.AcquireTimeout > TimeSpan.Zero);
+        Assert.True(options.CreateTimeout > TimeSpan.Zero);
+    }
+
+    [Fact]
+    public async Task Defaults_CanStillBeOptedOutOf_ByExplicitNull()
+    {
+        var options = new PoolOptions { AcquireTimeout = null, CreateTimeout = null };
+
+        Assert.Null(options.AcquireTimeout);
+        Assert.Null(options.CreateTimeout);
+
+        // Null must remain constructible (it means "unbounded", not "invalid").
+        await using var _ = new ResourcePool<FakeResource>(new FakePolicy(), options);
+    }
 }

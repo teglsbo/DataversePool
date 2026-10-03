@@ -39,6 +39,7 @@ public sealed class MemberCircuitBreaker
     private readonly TimeSpan _cooldownPeriod;
     private readonly TimeSpan _probeClaimTimeout;
     private readonly Dictionary<DataverseUserPool, CircuitState> _state = new();
+    private readonly Dictionary<DataverseUserPool, DateTimeOffset> _recoveredAt = new();
     private readonly object _lock = new();
 
     public MemberCircuitBreaker(int failureThreshold, TimeSpan cooldownPeriod, TimeSpan? probeClaimTimeout = null)
@@ -103,13 +104,18 @@ public sealed class MemberCircuitBreaker
         {
             if (!isOpen)
             {
-                _state.Remove(member); // healthy again - clear all breaker bookkeeping
+                if (_state.Remove(member))
+                {
+                    _recoveredAt[member] = now; // healthy again - clear breaker bookkeeping, remember when
+                }
+
                 return true;
             }
 
             if (!_state.TryGetValue(member, out var state))
             {
                 _state[member] = new CircuitState { OpenedAt = now };
+                _recoveredAt.Remove(member);
                 return false; // just opened this round - not eligible yet
             }
 
@@ -171,6 +177,7 @@ public sealed class MemberCircuitBreaker
             if (succeeded)
             {
                 _state.Remove(member); // close the circuit immediately rather than waiting for the next stats snapshot
+                _recoveredAt[member] = DateTimeOffset.UtcNow;
                 return;
             }
 
@@ -215,4 +222,64 @@ public sealed class MemberCircuitBreaker
             state.ProbeClaimedAt = null;
         }
     }
+
+    /// <summary>
+    /// When <paramref name="member"/>'s circuit last closed after having been open (a successful
+    /// half-open probe, or its failure counters dropping back below threshold); null if it never
+    /// recovered or has since re-opened. Selection strategies use it to slow-start a recovered
+    /// member instead of granting it a full share immediately (docs/research/autoscaling.md §9.6 item 3).
+    /// </summary>
+    public DateTimeOffset? GetRecoveredAt(DataverseUserPool member)
+    {
+        lock (_lock)
+        {
+            return _recoveredAt.TryGetValue(member, out var at) ? at : null;
+        }
+    }
+
+    /// <summary>
+    /// Non-mutating read of <paramref name="member"/>'s current breaker state - unlike
+    /// <see cref="IsEligible(DataverseUserPool, PoolStats, DateTimeOffset)"/>, this never claims a
+    /// half-open probe slot or opens/resets any bookkeeping; it exists purely so telemetry (e.g. a
+    /// <c>breaker_state</c> gauge) can observe what a selection round would currently see without
+    /// disturbing it. Safe to call as often as a metrics collector likes, concurrently with real
+    /// selection rounds.
+    /// </summary>
+    public MemberCircuitState GetState(DataverseUserPool member, PoolStats stats, DateTimeOffset now)
+    {
+        var isOpen = stats.ConsecutiveCreateFailures >= _failureThreshold
+            || stats.ConsecutiveOperationalFailures >= _failureThreshold;
+
+        lock (_lock)
+        {
+            if (!isOpen)
+            {
+                return MemberCircuitState.Closed;
+            }
+
+            if (!_state.TryGetValue(member, out var state) || now - state.OpenedAt < _cooldownPeriod)
+            {
+                return MemberCircuitState.Open;
+            }
+
+            return MemberCircuitState.HalfOpen;
+        }
+    }
+}
+
+/// <summary>
+/// A member's circuit-breaker state as seen by <see cref="MemberCircuitBreaker.GetState"/>. Numeric
+/// values are part of this type's public contract (used verbatim as a <c>breaker_state</c> gauge
+/// value by <see cref="DataverseUserPoolMetrics"/>) - do not renumber existing members.
+/// </summary>
+public enum MemberCircuitState
+{
+    /// <summary>Healthy - eligible for selection without restriction.</summary>
+    Closed = 0,
+
+    /// <summary>Past its cooldown, but not yet proven healthy again - only a single probe caller is eligible.</summary>
+    HalfOpen = 1,
+
+    /// <summary>Failing and still within its cooldown window - not eligible for selection.</summary>
+    Open = 2,
 }

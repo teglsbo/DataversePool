@@ -32,17 +32,13 @@ public class LivePinnedWebApiConcurrencyTests
     /// <c>DVPOOL_IT_PINNED_CONCURRENCY</c>. Each worker sends exactly one request; there are no
     /// retries, so every 429 and every other HTTP or transport failure remains visible.
     /// </remarks>
-    [Fact]
+    [SkippableFact]
     public async Task SlowRequests_WithPinnedAffinity_ExposeTheRealConcurrentRequestOutcome()
     {
-        var connectionString = GetConnectionString();
-        if (connectionString is null)
-        {
-            _output.WriteLine(
-                "Skipped: set DVPOOL_IT_CONNECTION_STRING or DVPOOL_IT_URL, " +
-                "DVPOOL_IT_TENANT_ID, DVPOOL_IT_CLIENT_ID, and DVPOOL_IT_CLIENT_SECRET.");
-            return;
-        }
+        var connectionString = LiveDataverseCredentials.GetConnectionString(0);
+        Skip.If(
+            connectionString is null,
+            "Set DVPOOL_IT_CONNECTION_STRING or DVPOOL_IT_URL, DVPOOL_IT_TENANT_ID, DVPOOL_IT_CLIENT_ID, and DVPOOL_IT_CLIENT_SECRET.");
 
         var concurrency = GetPositiveEnvironmentInteger("DVPOOL_IT_PINNED_CONCURRENCY", 128);
 
@@ -75,7 +71,7 @@ public class LivePinnedWebApiConcurrencyTests
         http.DefaultRequestHeaders.Add("OData-MaxVersion", "4.0");
         http.DefaultRequestHeaders.Add("OData-Version", "4.0");
 
-        var whoAmIUri = new Uri(environmentUri, "api/data/v9.2/WhoAmI");
+        var whoAmIUri = new Uri(environmentUri, "api/data/v9.2/WhoAmI()");
         using (var warmup = await http.GetAsync(whoAmIUri))
         {
             Assert.True(
@@ -225,18 +221,14 @@ public class LivePinnedWebApiConcurrencyTests
     /// affinity cookie and Dataverse web server. The default is 160 aggregate requests, split 80/80:
     /// above the measured single-user limit of 100, but below it for each identity independently.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task SlowRequests_WithTwoAppUsers_SustainMoreThanOneUsersConcurrentLimit()
     {
-        var connectionStringA = GetConnectionString();
-        var connectionStringB = GetConnectionString("_B");
-        if (connectionStringA is null || connectionStringB is null)
-        {
-            _output.WriteLine(
-                "Skipped: both application users require connection strings or URL, tenant, " +
-                "client ID, and client secret environment variables (second user uses suffix _B).");
-            return;
-        }
+        var connectionStringA = LiveDataverseCredentials.GetConnectionString(0);
+        var connectionStringB = LiveDataverseCredentials.GetConnectionString(1);
+        Skip.If(
+            connectionStringA is null || connectionStringB is null,
+            "Set credentials for both application users; the second user's variables use suffix _B.");
 
         var aggregateConcurrency = GetPositiveEnvironmentInteger(
             "DVPOOL_IT_PINNED_TWO_USER_CONCURRENCY",
@@ -274,7 +266,7 @@ public class LivePinnedWebApiConcurrencyTests
         http.DefaultRequestHeaders.Add("OData-MaxVersion", "4.0");
         http.DefaultRequestHeaders.Add("OData-Version", "4.0");
 
-        var whoAmIUri = new Uri(environmentUri, "api/data/v9.2/WhoAmI");
+        var whoAmIUri = new Uri(environmentUri, "api/data/v9.2/WhoAmI()");
         var userIdA = await WarmupAndGetUserIdAsync(http, whoAmIUri, accessTokenA);
         var affinityAfterA = GetAffinityCookie(cookies, environmentUri);
         var userIdB = await WarmupAndGetUserIdAsync(http, whoAmIUri, accessTokenB);
@@ -457,25 +449,6 @@ public class LivePinnedWebApiConcurrencyTests
                 cookie.Name.Equals("ARRAffinity", StringComparison.OrdinalIgnoreCase));
         Assert.NotNull(affinityCookie);
         return affinityCookie;
-    }
-
-    private static string? GetConnectionString(string suffix = "")
-    {
-        var connectionString =
-            Environment.GetEnvironmentVariable($"DVPOOL_IT_CONNECTION_STRING{suffix}");
-        if (!string.IsNullOrWhiteSpace(connectionString))
-        {
-            return connectionString;
-        }
-
-        var url = Environment.GetEnvironmentVariable("DVPOOL_IT_URL");
-        var tenantId = Environment.GetEnvironmentVariable($"DVPOOL_IT_TENANT_ID{suffix}");
-        var clientId = Environment.GetEnvironmentVariable($"DVPOOL_IT_CLIENT_ID{suffix}");
-        var clientSecret = Environment.GetEnvironmentVariable($"DVPOOL_IT_CLIENT_SECRET{suffix}");
-
-        return new[] { url, tenantId, clientId, clientSecret }.All(value => !string.IsNullOrWhiteSpace(value))
-            ? $"AuthType=ClientSecret;Url={url};TenantId={tenantId};ClientId={clientId};ClientSecret={clientSecret};"
-            : null;
     }
 
     private static Uri GetEnvironmentRoot(Uri connectedOrgUri)

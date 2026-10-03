@@ -86,6 +86,54 @@ public class PoolMetricsTests
         Assert.Equal(0, GetValue(measurements, "dataversepool.pool.idle"));
     }
 
+    [Fact]
+    public void Collect_ReadsStatsOncePerCollection_AndGaugesShareOneSnapshot()
+    {
+        var meterName = UniqueMeterName();
+        var calls = 0;
+        using var metrics = new PoolMetrics("pool-a", () =>
+        {
+            calls++;
+            return SampleStats(maxSize: 10 + calls, created: calls);
+        }, meterName);
+
+        var first = CollectMeasurements(meterName);
+        Assert.Equal(1, calls);
+        Assert.Equal(11, GetValue(first, "dataversepool.pool.max_size"));
+        Assert.Equal(1, GetValue(first, "dataversepool.pool.created"));
+
+        var second = CollectMeasurements(meterName);
+        Assert.Equal(2, calls);
+        Assert.Equal(12, GetValue(second, "dataversepool.pool.max_size"));
+        Assert.Equal(2, GetValue(second, "dataversepool.pool.created"));
+    }
+
+    [Fact]
+    public void MeterFactoryConstructor_CreatesMeterThroughFactory()
+    {
+        var meterName = UniqueMeterName();
+        var factory = new RecordingMeterFactory();
+        using var metrics = new PoolMetrics(factory, "pool-a", () => SampleStats(maxSize: 9), meterName);
+
+        Assert.Equal(new[] { meterName }, factory.Created);
+        Assert.Equal(9, GetValue(CollectMeasurements(meterName), "dataversepool.pool.max_size"));
+    }
+
+    private sealed class RecordingMeterFactory : IMeterFactory
+    {
+        public List<string> Created { get; } = new();
+
+        public Meter Create(MeterOptions options)
+        {
+            Created.Add(options.Name);
+            return new Meter(options);
+        }
+
+        public void Dispose()
+        {
+        }
+    }
+
     private static string UniqueMeterName() => $"DataversePool.Tests.{Guid.NewGuid():N}";
 
     private static PoolStats SampleStats(

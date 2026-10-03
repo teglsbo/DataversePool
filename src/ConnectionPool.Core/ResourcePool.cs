@@ -14,9 +14,20 @@ public sealed partial class ResourcePool<T> : IAsyncDisposable where T : notnull
     private readonly PoolOptions _options;
 
     // One permit per unit of pool capacity (created-or-creatable resource). Acquire waits for a
-    // permit; Return/recycle-completion releases one. This naturally bounds total created slots to
-    // MaxSize without any separate counter needing to be kept in lockstep.
+    // permit; Return/recycle-completion releases one (via ReleasePermit). This naturally bounds total
+    // created slots to the current max size without any separate counter needing to be kept in
+    // lockstep. Its own maxCount is unbounded because SetMaxSize can grow it at runtime.
     private readonly SemaphoreSlim _capacityGate;
+
+    // Current concurrency limit. Starts at PoolOptions.MaxSize; changed only by SetMaxSize.
+    private int _maxSize;
+
+    // Permits still owed after a shrink that could not take them back immediately because they were
+    // held by in-flight leases/creations. ReleasePermit pays this down instead of returning the
+    // permit to _capacityGate, so a shrink takes effect as leases come back - nothing in flight is
+    // cancelled. See docs/adr/0025.
+    private int _permitDebt;
+    private readonly object _resizeLock = new();
 
     // Ensures policy.CreateAsync is never invoked concurrently, regardless of caller (warmup, lazy
     // acquire, or background recycle). See docs/adr/0002. May, in the rare case of a CreateTimeout
@@ -32,6 +43,7 @@ public sealed partial class ResourcePool<T> : IAsyncDisposable where T : notnull
     private readonly SemaphoreSlim _warmupGate = new(1, 1);
 
     private readonly ConcurrentStack<Slot<T>> _idle = new();
+    private readonly object _idlePushLock = new();
     private int _createdCount;
     private int _waitingCount;
     private int _unhealthyOrRecyclingCount;
@@ -70,7 +82,115 @@ public sealed partial class ResourcePool<T> : IAsyncDisposable where T : notnull
             throw new ArgumentOutOfRangeException(nameof(options), "MaxIdleLifetime must be a positive duration when set.");
         }
 
-        _capacityGate = new SemaphoreSlim(_options.MaxSize, _options.MaxSize);
+        _maxSize = _options.MaxSize;
+        _capacityGate = new SemaphoreSlim(_maxSize, int.MaxValue);
+    }
+
+    /// <summary>The current concurrency limit: <see cref="PoolOptions.MaxSize"/> until changed by
+    /// <see cref="SetMaxSize"/>.</summary>
+    public int MaxSize => Volatile.Read(ref _maxSize);
+
+    /// <summary>
+    /// Changes the maximum number of concurrently created/leased resources at runtime, e.g. to follow
+    /// Dataverse's <c>RecommendedDegreesOfParallelism</c> or an operator's decision. Takes effect for
+    /// subsequent acquires; never cancels or waits for anything in flight. See docs/adr/0025.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Growing</b> releases the extra capacity immediately, so waiting callers proceed at once.</para>
+    /// <para><b>Shrinking</b> immediately takes back as much unused capacity as is free; the rest is
+    /// taken back as in-flight leases are returned. Until then, more than <paramref name="maxSize"/>
+    /// leases can briefly be outstanding - <see cref="PoolStats.LeasedCount"/> shows the real number.
+    /// Idle resources above the new limit are disposed in the background, and returned ones are
+    /// disposed rather than re-idled while the pool is over its new size.</para>
+    /// <para>Thread-safe; concurrent calls are applied in some serial order and the last one wins.</para>
+    /// </remarks>
+    /// <param name="maxSize">The new limit. Must be positive.</param>
+    public void SetMaxSize(int maxSize)
+    {
+        if (maxSize <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maxSize), maxSize, "MaxSize must be positive.");
+        }
+
+        ThrowIfDisposed();
+
+        lock (_resizeLock)
+        {
+            var delta = maxSize - _maxSize;
+            Volatile.Write(ref _maxSize, maxSize);
+
+            if (delta > 0)
+            {
+                // Cancel outstanding debt first: those permits are still circulating and simply no
+                // longer need to be destroyed when they come back.
+                var toRelease = delta;
+                while (toRelease > 0)
+                {
+                    var debt = Volatile.Read(ref _permitDebt);
+                    if (debt <= 0)
+                    {
+                        break;
+                    }
+
+                    var forgiven = Math.Min(debt, toRelease);
+                    if (Interlocked.CompareExchange(ref _permitDebt, debt - forgiven, debt) == debt)
+                    {
+                        toRelease -= forgiven;
+                    }
+                }
+
+                if (toRelease > 0)
+                {
+                    _capacityGate.Release(toRelease);
+                }
+            }
+            else if (delta < 0)
+            {
+                var toTake = -delta;
+                while (toTake > 0 && _capacityGate.Wait(0))
+                {
+                    toTake--;
+                }
+
+                if (toTake > 0)
+                {
+                    Interlocked.Add(ref _permitDebt, toTake);
+                }
+
+                _ = TrimExcessIdleAsync();
+            }
+        }
+    }
+
+    /// <summary>Returns one capacity permit - unless a shrink still owes one, in which case the
+    /// permit is retired instead. Every permit release in this pool goes through here.</summary>
+    private void ReleasePermit()
+    {
+        while (true)
+        {
+            var debt = Volatile.Read(ref _permitDebt);
+            if (debt <= 0)
+            {
+                _capacityGate.Release();
+                return;
+            }
+
+            if (Interlocked.CompareExchange(ref _permitDebt, debt - 1, debt) == debt)
+            {
+                return;
+            }
+        }
+    }
+
+    private bool IsOverSize => Volatile.Read(ref _createdCount) > Volatile.Read(ref _maxSize);
+
+    private async Task TrimExcessIdleAsync()
+    {
+        while (IsOverSize && Volatile.Read(ref _poolDisposed) == 0 && _idle.TryPop(out var slot))
+        {
+            Interlocked.Decrement(ref _createdCount);
+            await SafeDisposeAsync(slot.Resource).ConfigureAwait(false);
+        }
     }
 
     /// <summary>
@@ -86,7 +206,7 @@ public sealed partial class ResourcePool<T> : IAsyncDisposable where T : notnull
     public async Task WarmupAsync(CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        var target = Math.Min(_options.PrewarmCount, _options.MaxSize);
+        var target = Math.Min(_options.PrewarmCount, MaxSize);
 
         // _warmupGate makes the whole "check current count against target, then create the
         // shortfall" decision a single atomic step across concurrent WarmupAsync callers - see
@@ -115,7 +235,12 @@ public sealed partial class ResourcePool<T> : IAsyncDisposable where T : notnull
                     }
 
                     var slot = await CreateNewSlotAsync(cancellationToken).ConfigureAwait(false);
-                    _idle.Push(slot);
+                    if (!TryPushIdle(slot))
+                    {
+                        Interlocked.Decrement(ref _createdCount);
+                        await SafeDisposeAsync(slot.Resource).ConfigureAwait(false);
+                        throw new ObjectDisposedException(nameof(ResourcePool<T>));
+                    }
                 }
                 finally
                 {
@@ -124,7 +249,7 @@ public sealed partial class ResourcePool<T> : IAsyncDisposable where T : notnull
                     // capacity," not "a resource physically exists" - idle resources sit in _idle with
                     // their permit already released, to be re-consumed by whichever AcquireAsync next
                     // claims them. See docs/adr/0013.
-                    _capacityGate.Release();
+                    ReleasePermit();
                 }
             }
         }
@@ -220,7 +345,7 @@ public sealed partial class ResourcePool<T> : IAsyncDisposable where T : notnull
             }
             catch
             {
-                _capacityGate.Release();
+                ReleasePermit();
                 throw;
             }
         }
@@ -238,7 +363,7 @@ public sealed partial class ResourcePool<T> : IAsyncDisposable where T : notnull
         var idle = _idle.Count;
         var created = Volatile.Read(ref _createdCount);
         return new PoolStats(
-            MaxSize: _options.MaxSize,
+            MaxSize: MaxSize,
             CreatedCount: created,
             IdleCount: idle,
             LeasedCount: Math.Max(0, created - idle),
@@ -280,11 +405,39 @@ public sealed partial class ResourcePool<T> : IAsyncDisposable where T : notnull
         // A successful, healthy return is evidence the member is operationally fine again - reset
         // the counter immediately rather than waiting for it to decay some other way.
         Interlocked.Exchange(ref _consecutiveOperationalFailures, 0);
+
+        if (IsOverSize)
+        {
+            // Shrunk by SetMaxSize while this lease was out: retire the resource instead of
+            // re-idling it. See docs/adr/0025.
+            Interlocked.Decrement(ref _createdCount);
+            ReleasePermit();
+            return SafeDisposeAsync(slot.Resource);
+        }
+
+        try
+        {
+            _policy.OnReturned(slot.Resource!); // scrub any per-lease state before next caller (ADR-0009)
+        }
+        catch (Exception exception)
+        {
+            slot.State = SlotState.Unhealthy;
+            slot.LastIncidentException = exception;
+            slot.LastIncidentAt = DateTimeOffset.UtcNow;
+            slot.LastIncidentWasLeak = false;
+            PublishHealthChanged(SlotHealthState.MarkedUnhealthy, slot.LastIncident);
+            _ = RecycleInBackgroundAsync(slot);
+            return ValueTask.CompletedTask;
+        }
+
         slot.State = SlotState.Idle;
         slot.BecameIdleAt = DateTimeOffset.UtcNow;
-        _policy.OnReturned(slot.Resource!); // scrub any per-lease state before next caller (ADR-0009)
-        _idle.Push(slot);
-        _capacityGate.Release();
+        if (!TryPushIdle(slot))
+        {
+            return DisposeAbandonedSlotAsync(slot);
+        }
+
+        ReleasePermit();
         return ValueTask.CompletedTask;
     }
 
@@ -381,7 +534,7 @@ public sealed partial class ResourcePool<T> : IAsyncDisposable where T : notnull
         // them. Any lease returned after this point is disposed directly by ReturnAsync/
         // RecycleInBackgroundAsync instead of being re-idled. See docs/adr/0007 (#2).
         var acquiredPermits = 0;
-        for (var i = 0; i < _options.MaxSize; i++)
+        for (var i = 0; i < MaxSize; i++)
         {
             if (await _capacityGate.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false))
             {
@@ -396,7 +549,16 @@ public sealed partial class ResourcePool<T> : IAsyncDisposable where T : notnull
         // Drain _idle while still holding every permit collected above, so a concurrent
         // AcquireAsync cannot win one of these permits (once released, below) and pop/create a
         // slot while this loop is in the middle of disposing idle resources. See docs/adr/0022.
-        while (_idle.TryPop(out var slot))
+        List<Slot<T>> idleSlots = new();
+        lock (_idlePushLock)
+        {
+            while (_idle.TryPop(out var slot))
+            {
+                idleSlots.Add(slot);
+            }
+        }
+
+        foreach (var slot in idleSlots)
         {
             await SafeDisposeAsync(slot.Resource).ConfigureAwait(false);
         }
@@ -416,6 +578,20 @@ public sealed partial class ResourcePool<T> : IAsyncDisposable where T : notnull
         foreach (var observer in observersSnapshot)
         {
             observer.OnCompleted();
+        }
+    }
+
+    private bool TryPushIdle(Slot<T> slot)
+    {
+        lock (_idlePushLock)
+        {
+            if (Volatile.Read(ref _poolDisposed) == 1)
+            {
+                return false;
+            }
+
+            _idle.Push(slot);
+            return true;
         }
     }
 

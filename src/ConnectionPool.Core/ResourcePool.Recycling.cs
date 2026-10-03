@@ -21,6 +21,12 @@ public sealed partial class ResourcePool<T> where T : notnull
         PublishHealthChanged(SlotHealthState.RecyclingStarted, slot.LastIncident);
         await SafeDisposeAsync(slot.Resource).ConfigureAwait(false);
 
+        // The old resource is gone; CreateThroughGateAsync counts the replacement back in on
+        // success. (Previously the decrement happened only on failure, so every successful recycle
+        // inflated CreatedCount by one - harmless until SetMaxSize started comparing it against the
+        // limit. See docs/adr/0025.)
+        Interlocked.Decrement(ref _createdCount);
+
         try
         {
             slot.Resource = await CreateThroughGateAsync(cancellationToken).ConfigureAwait(false);
@@ -44,16 +50,14 @@ public sealed partial class ResourcePool<T> where T : notnull
             // unhealthy, so it must NOT be counted as a create failure (that would incorrectly help
             // trip the circuit breaker for what was really just a caller giving up waiting). The old
             // resource was already disposed above and no replacement was created, so the slot's
-            // capacity genuinely is gone; reflect that in _createdCount without touching the
-            // create-failure counter or publishing a health incident. See docs/adr/0014.
-            Interlocked.Decrement(ref _createdCount);
+            // capacity genuinely is gone (already reflected in _createdCount above) - don't touch the
+            // create-failure counter or publish a health incident. See docs/adr/0014.
             throw;
         }
         catch (Exception ex)
         {
             Interlocked.Increment(ref _consecutiveCreateFailures);
             PublishHealthChanged(SlotHealthState.RecoveryFailed, new PoolIncidentInfo(ex, DateTimeOffset.UtcNow));
-            Interlocked.Decrement(ref _createdCount);
             return false;
         }
         finally
@@ -70,17 +74,28 @@ public sealed partial class ResourcePool<T> where T : notnull
         {
             if (recycled)
             {
+                Interlocked.Decrement(ref _createdCount);
                 await SafeDisposeAsync(slot.Resource).ConfigureAwait(false);
             }
         }
+        else if (recycled && IsOverSize)
+        {
+            // Shrunk by SetMaxSize during the recycle: retire the fresh resource. See docs/adr/0025.
+            Interlocked.Decrement(ref _createdCount);
+            await SafeDisposeAsync(slot.Resource).ConfigureAwait(false);
+        }
         else if (recycled)
         {
-            _idle.Push(slot);
+            if (!TryPushIdle(slot))
+            {
+                Interlocked.Decrement(ref _createdCount);
+                await SafeDisposeAsync(slot.Resource).ConfigureAwait(false);
+            }
         }
 
         // Whether recovery succeeded or the slot's capacity was permanently given up, the permit is
         // released so waiters can proceed (either using the recycled slot, or creating a new one).
-        _capacityGate.Release();
+        ReleasePermit();
     }
 
     private async Task<Slot<T>> CreateNewSlotAsync(CancellationToken cancellationToken)
@@ -106,7 +121,20 @@ public sealed partial class ResourcePool<T> where T : notnull
             Task completed;
             if (_options.CreateTimeout is { } timeout)
             {
-                completed = await Task.WhenAny(createTask, Task.Delay(timeout, cancellationToken)).ConfigureAwait(false);
+                // The timeout delay is scoped to its own CTS that is cancelled as soon as the race
+                // resolves, so a completed creation doesn't leave a live timer (and a registration
+                // on the caller's token) pending for the full CreateTimeout. This matters now that
+                // CreateTimeout is on by default: without it, every single creation in a
+                // high-churn pool would leak a timer for PoolOptions.DefaultCreateTimeout.
+                using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                try
+                {
+                    completed = await Task.WhenAny(createTask, Task.Delay(timeout, timeoutCts.Token)).ConfigureAwait(false);
+                }
+                finally
+                {
+                    timeoutCts.Cancel();
+                }
             }
             else
             {
@@ -200,6 +228,14 @@ public sealed partial class ResourcePool<T> where T : notnull
 
     private async ValueTask DisposeAbandonedSlotAsync(Slot<T> slot)
     {
-        await SafeDisposeAsync(slot.Resource).ConfigureAwait(false);
+        try
+        {
+            await SafeDisposeAsync(slot.Resource).ConfigureAwait(false);
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _createdCount);
+            ReleasePermit();
+        }
     }
 }

@@ -1,3 +1,4 @@
+using ConnectionPool.Core;
 using ConnectionPool.Dataverse;
 using Xunit;
 
@@ -7,10 +8,8 @@ namespace ConnectionPool.Dataverse.Tests;
 /// Covers <see cref="DataverseClientOptions"/> validation and its wiring into
 /// <see cref="DataverseServiceClientPolicy"/>'s constructor. This is the only part of the
 /// MaxRetryCount/RetryPauseTime/UseExponentialRetryDelayForConcurrencyThrottle override feature
-/// testable without a live Dataverse connection - see the class docs on
-/// <see cref="DataverseServiceClientPolicy"/> for why the actual override application (base client
-/// + clone) cannot be unit-tested (ServiceClient requires a live connection and cannot be
-/// subclassed/mocked).
+/// testable without a live Dataverse connection. The integration test below verifies real
+/// ServiceClient option application and return scrubbing when credentials are available.
 /// </summary>
 public class DataverseClientOptionsTests
 {
@@ -20,6 +19,17 @@ public class DataverseClientOptionsTests
         var options = new DataverseClientOptions();
         options.Validate(); // should not throw
     }
+
+    [Fact]
+    public void Validate_ThrowsWhenPerConnectionAndSharedSessionIdBothSet()
+    {
+        var options = new DataverseClientOptions { PerConnectionSessionTrackingId = true, SessionTrackingId = Guid.NewGuid() };
+        Assert.Throws<ArgumentException>(options.Validate);
+    }
+
+    [Fact]
+    public void Validate_AllowsPerConnectionSessionIdAlone() =>
+        new DataverseClientOptions { PerConnectionSessionTrackingId = true }.Validate();
 
     [Fact]
     public void Validate_AllowsZero()
@@ -71,5 +81,60 @@ public class DataverseClientOptionsTests
         // Should not throw during construction - the property itself has no invalid range, only
         // application to a real ServiceClient (untestable without a live connection) can fail.
         _ = new DataverseServiceClientPolicy("AuthType=OAuth;", clientOptions: options);
+    }
+
+    [Fact]
+    public void PolicyConstructor_AcceptsWebApiAndSessionTrackingOptions()
+    {
+        var options = new DataverseClientOptions
+        {
+            UseWebApi = true,
+            SessionTrackingId = Guid.NewGuid(),
+        };
+
+        _ = new DataverseServiceClientPolicy("AuthType=OAuth;", clientOptions: options);
+    }
+
+    [SkippableFact]
+    [Trait("Category", "Integration")]
+    public async Task ReturnedClient_RestoresConfiguredBaseline()
+    {
+        var connectionString = LiveDataverseCredentials.GetConnectionString(0);
+        Skip.If(string.IsNullOrWhiteSpace(connectionString), "Set DVPOOL_IT_CONNECTION_STRING.");
+
+        var trackingId = Guid.NewGuid();
+        var clientOptions = new DataverseClientOptions
+        {
+            UseWebApi = true,
+            SessionTrackingId = trackingId,
+            MaxRetryCount = 0,
+        };
+        await using var pool = new DataverseUserPool(
+            "baseline-probe", connectionString!,
+            new PoolOptions { MaxSize = 1 }, clientOptions: clientOptions);
+
+        var lease = await pool.AcquireAsync();
+        var client = lease.Resource;
+        Assert.True(client.UseWebApi);
+        Assert.Equal(trackingId, client.SessionTrackingId);
+        Assert.Equal(0, client.MaxRetryCount);
+        Assert.False(client.EnableAffinityCookie);
+
+        client.CallerId = Guid.NewGuid();
+        client.CallerAADObjectId = Guid.NewGuid();
+        client.UseWebApi = false;
+        client.SessionTrackingId = Guid.NewGuid();
+        client.MaxRetryCount = 5;
+        client.EnableAffinityCookie = true;
+        await lease.DisposeAsync();
+
+        await using var next = await pool.AcquireAsync();
+        Assert.Same(client, next.Resource);
+        Assert.Equal(Guid.Empty, next.Resource.CallerId);
+        Assert.Null(next.Resource.CallerAADObjectId);
+        Assert.True(next.Resource.UseWebApi);
+        Assert.Equal(trackingId, next.Resource.SessionTrackingId);
+        Assert.Equal(0, next.Resource.MaxRetryCount);
+        Assert.False(next.Resource.EnableAffinityCookie);
     }
 }

@@ -58,7 +58,7 @@ public sealed class LeastConnectionsSlotSelectionStrategy : ISlotSelectionStrate
         {
             var member = members[i];
 
-            if (member.IsThrottled)
+            if (member.IsThrottled || member.IsQuarantined)
             {
                 continue;
             }
@@ -120,4 +120,7 @@ public sealed class LeastConnectionsSlotSelectionStrategy : ISlotSelectionStrate
 
     public void ReportAcquireAbandoned(DataverseUserPool member, long? claimGeneration) =>
         _breaker.AbandonProbe(member, claimGeneration);
+
+    /// <inheritdoc />
+    public MemberCircuitBreaker Breaker => _breaker;
 }

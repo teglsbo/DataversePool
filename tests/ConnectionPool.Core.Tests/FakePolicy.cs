@@ -27,6 +27,7 @@ public sealed class FakePolicy : IPooledResourcePolicy<FakeResource>
     public Func<FakeResource, PoolIncidentInfo?, bool>? HealthOverride;
     public Func<Task>? BeforeCreateDelay;
     public Func<FakeResource, Task>? BeforeDisposeDelay;
+    public Action<FakeResource>? OnReturnedOverride;
     public bool FailNextCreate;
 
     public async Task<FakeResource> CreateAsync(CancellationToken cancellationToken)
@@ -76,7 +77,11 @@ public sealed class FakePolicy : IPooledResourcePolicy<FakeResource>
         Interlocked.Increment(ref DisposeCallCount);
     }
 
-    public void OnReturned(FakeResource resource) => Interlocked.Increment(ref OnReturnedCallCount);
+    public void OnReturned(FakeResource resource)
+    {
+        Interlocked.Increment(ref OnReturnedCallCount);
+        OnReturnedOverride?.Invoke(resource);
+    }
 
     private static void InterlockedMax(ref int target, int value)
     {

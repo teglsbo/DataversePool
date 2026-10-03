@@ -67,5 +67,32 @@ public sealed class DataverseLease : IAsyncDisposable
         return false;
     }
 
+    /// <summary>
+    /// Reports a non-throttle operation failure observed on this lease. If
+    /// <see cref="DataverseFailureClassifier.IsConnectionFault"/> recognizes a connection-level fault,
+    /// the connection is recycled via <see cref="MarkUnhealthy"/> (which also counts towards
+    /// <see cref="Member"/>'s circuit breaker); if it is additionally a known permanent failure
+    /// (<see cref="DataverseFailureClassifier.IsPermanent"/>, e.g. HTTP 401), <see cref="Member"/> is
+    /// quarantined. Service faults, cancellation and unrecognized errors are ignored. Call
+    /// <see cref="ReportIfThrottled(Exception, TimeSpan?)"/> first - a 429 is not a fault. Returns
+    /// <c>true</c> if the failure was reported.
+    /// </summary>
+    public bool ReportIfConnectionFault(Exception exception)
+    {
+        var permanent = DataverseFailureClassifier.IsPermanent(exception, out var reason);
+        if (!permanent && !DataverseFailureClassifier.IsConnectionFault(exception))
+        {
+            return false;
+        }
+
+        MarkUnhealthy(exception);
+        if (permanent)
+        {
+            Member.Quarantine(reason);
+        }
+
+        return true;
+    }
+
     public ValueTask DisposeAsync() => _inner.DisposeAsync();
 }

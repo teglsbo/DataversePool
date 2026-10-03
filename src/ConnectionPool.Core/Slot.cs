@@ -11,7 +11,8 @@ internal enum SlotState
 /// <summary>
 /// Internal unit of pooled capacity. A slot's <see cref="Resource"/> may be replaced in place during
 /// recycling, but the <see cref="Slot"/> object identity (and thus its accounting against
-/// <see cref="PoolOptions.MaxSize"/>) is stable for the pool's lifetime.
+/// the pool's max size) is stable until the slot is retired by recycle failure, shutdown, or a
+/// runtime shrink via <see cref="ResourcePool{T}.SetMaxSize"/>.
 /// </summary>
 internal sealed class Slot<T> where T : notnull
 {

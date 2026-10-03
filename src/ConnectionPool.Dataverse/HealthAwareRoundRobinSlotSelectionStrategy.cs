@@ -16,7 +16,9 @@ namespace ConnectionPool.Dataverse;
 /// budget at once), <see cref="SlotSelection.AllMembersUnavailable"/> is reported so
 /// <see cref="DataversePool"/> can decide - per its configured
 /// <see cref="AllUnavailableBehavior"/> - whether to fail open (pick one anyway, the default,
-/// preserving docs/adr/0007 #6) or fail fast.
+/// preserving docs/adr/0007 #6) or fail fast. The operational-failure count it consumes is
+/// pool-wide, not per slot: under mixed traffic, successful returns from other slots can reset the
+/// count and mask one persistently failing clone. See docs/adr/0013.
 /// </summary>
 public sealed class HealthAwareRoundRobinSlotSelectionStrategy : ISlotSelectionStrategy
 {
@@ -54,7 +56,7 @@ public sealed class HealthAwareRoundRobinSlotSelectionStrategy : ISlotSelectionS
 
             // Check throttle first (cheap, no side effects) so a throttled member never consumes
             // the circuit breaker's single half-open probe slot for no reason.
-            if (member.IsThrottled)
+            if (member.IsThrottled || member.IsQuarantined)
             {
                 continue;
             }
@@ -109,4 +111,7 @@ public sealed class HealthAwareRoundRobinSlotSelectionStrategy : ISlotSelectionS
 
     public void ReportAcquireAbandoned(DataverseUserPool member, long? claimGeneration) =>
         _breaker.AbandonProbe(member, claimGeneration);
+
+    /// <inheritdoc />
+    public MemberCircuitBreaker Breaker => _breaker;
 }

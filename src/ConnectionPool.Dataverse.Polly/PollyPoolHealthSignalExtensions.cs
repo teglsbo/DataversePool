@@ -24,12 +24,14 @@ public static class PollyPoolHealthSignalExtensions
 {
     /// <summary>
     /// Adds a retry strategy to the pipeline that also calls <paramref name="lease"/>.MarkUnhealthy
-    /// whenever a retry is triggered by an exception.
+    /// whenever a retry is triggered by an exception accepted by
+    /// <paramref name="shouldMarkUnhealthy"/>. By default, every exception marks the lease unhealthy.
     /// </summary>
     public static ResiliencePipelineBuilder<TResult> AddRetryWithPoolHealthSignal<TResult, TResource>(
         this ResiliencePipelineBuilder<TResult> builder,
         PooledLease<TResource> lease,
-        RetryStrategyOptions<TResult>? baseOptions = null)
+        RetryStrategyOptions<TResult>? baseOptions = null,
+        Func<Exception, bool>? shouldMarkUnhealthy = null)
         where TResource : notnull
     {
         ArgumentNullException.ThrowIfNull(builder);
@@ -46,7 +48,7 @@ public static class PollyPoolHealthSignalExtensions
 
             if (args.Outcome.Exception is { } exception)
             {
-                lease.MarkUnhealthy(exception);
+                MarkUnhealthyIfRequired(lease, exception, shouldMarkUnhealthy);
             }
         };
 
@@ -55,12 +57,14 @@ public static class PollyPoolHealthSignalExtensions
 
     /// <summary>
     /// Adds a circuit breaker strategy to the pipeline that also calls
-    /// <paramref name="lease"/>.MarkUnhealthy whenever the circuit opens due to an exception.
+    /// <paramref name="lease"/>.MarkUnhealthy when the circuit opens due to an exception accepted
+    /// by <paramref name="shouldMarkUnhealthy"/>. By default, every exception marks the lease unhealthy.
     /// </summary>
     public static ResiliencePipelineBuilder<TResult> AddCircuitBreakerWithPoolHealthSignal<TResult, TResource>(
         this ResiliencePipelineBuilder<TResult> builder,
         PooledLease<TResource> lease,
-        CircuitBreakerStrategyOptions<TResult>? baseOptions = null)
+        CircuitBreakerStrategyOptions<TResult>? baseOptions = null,
+        Func<Exception, bool>? shouldMarkUnhealthy = null)
         where TResource : notnull
     {
         ArgumentNullException.ThrowIfNull(builder);
@@ -77,7 +81,7 @@ public static class PollyPoolHealthSignalExtensions
 
             if (args.Outcome.Exception is { } exception)
             {
-                lease.MarkUnhealthy(exception);
+                MarkUnhealthyIfRequired(lease, exception, shouldMarkUnhealthy);
             }
         };
 
@@ -88,7 +92,8 @@ public static class PollyPoolHealthSignalExtensions
     public static ResiliencePipelineBuilder AddRetryWithPoolHealthSignal<TResource>(
         this ResiliencePipelineBuilder builder,
         PooledLease<TResource> lease,
-        RetryStrategyOptions? baseOptions = null)
+        RetryStrategyOptions? baseOptions = null,
+        Func<Exception, bool>? shouldMarkUnhealthy = null)
         where TResource : notnull
     {
         ArgumentNullException.ThrowIfNull(builder);
@@ -105,7 +110,7 @@ public static class PollyPoolHealthSignalExtensions
 
             if (args.Outcome.Exception is { } exception)
             {
-                lease.MarkUnhealthy(exception);
+                MarkUnhealthyIfRequired(lease, exception, shouldMarkUnhealthy);
             }
         };
 
@@ -116,7 +121,8 @@ public static class PollyPoolHealthSignalExtensions
     public static ResiliencePipelineBuilder AddCircuitBreakerWithPoolHealthSignal<TResource>(
         this ResiliencePipelineBuilder builder,
         PooledLease<TResource> lease,
-        CircuitBreakerStrategyOptions? baseOptions = null)
+        CircuitBreakerStrategyOptions? baseOptions = null,
+        Func<Exception, bool>? shouldMarkUnhealthy = null)
         where TResource : notnull
     {
         ArgumentNullException.ThrowIfNull(builder);
@@ -133,10 +139,22 @@ public static class PollyPoolHealthSignalExtensions
 
             if (args.Outcome.Exception is { } exception)
             {
-                lease.MarkUnhealthy(exception);
+                MarkUnhealthyIfRequired(lease, exception, shouldMarkUnhealthy);
             }
         };
 
         return builder.AddCircuitBreaker(options);
+    }
+
+    private static void MarkUnhealthyIfRequired<TResource>(
+        PooledLease<TResource> lease,
+        Exception exception,
+        Func<Exception, bool>? shouldMarkUnhealthy)
+        where TResource : notnull
+    {
+        if (shouldMarkUnhealthy is null || shouldMarkUnhealthy(exception))
+        {
+            lease.MarkUnhealthy(exception);
+        }
     }
 }

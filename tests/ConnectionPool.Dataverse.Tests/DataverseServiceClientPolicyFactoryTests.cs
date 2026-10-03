@@ -93,4 +93,23 @@ public class DataverseServiceClientPolicyFactoryTests
         var actual = await Assert.ThrowsAsync<InvalidOperationException>(() => pool.AcquireAsync());
         Assert.Same(expected, actual);
     }
+
+    [Fact]
+    public void LastRecommendedDegreesOfParallelism_Null_BeforeAnyConnectionIsReturned()
+    {
+        // The -1 sentinel (see DataverseServiceClientPolicy) must never leak out as -1; until
+        // OnReturned has sampled a real ServiceClient at least once, the public property must
+        // report null rather than a bogus negative DOP.
+        var policy = new DataverseServiceClientPolicy(_ => Task.FromResult<ServiceClient>(null!));
+
+        Assert.Null(policy.LastRecommendedDegreesOfParallelism);
+    }
+
+    [Fact]
+    public void DataverseUserPool_RecommendedDegreesOfParallelism_Null_BeforeAnyConnectionIsReturned()
+    {
+        var pool = new DataverseUserPool("a", "dummy-a");
+
+        Assert.Null(pool.RecommendedDegreesOfParallelism);
+    }
 }

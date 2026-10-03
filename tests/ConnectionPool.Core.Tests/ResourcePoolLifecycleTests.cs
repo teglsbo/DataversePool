@@ -51,6 +51,27 @@ public class ResourcePoolLifecycleTests
     }
 
     [Fact]
+    public async Task DisposeAsync_RecyclesResource_WhenPolicyOnReturnedThrows()
+    {
+        var policy = new FakePolicy
+        {
+            OnReturnedOverride = _ => throw new InvalidOperationException("Scrub failed."),
+        };
+        await using var pool = new ResourcePool<FakeResource>(policy, new PoolOptions { MaxSize = 1 });
+
+        var lease = await pool.AcquireAsync();
+        var original = lease.Resource;
+        await lease.DisposeAsync();
+
+        await using var replacementLease = await pool.AcquireAsync();
+
+        Assert.NotSame(original, replacementLease.Resource);
+        Assert.True(original.Disposed);
+        Assert.Equal(1, pool.GetStats().CreatedCount);
+        Assert.Equal(1, policy.DisposeCallCount);
+    }
+
+    [Fact]
     public async Task AcquireAsync_BlocksBeyondMaxSize_UntilReleased()
     {
         var policy = new FakePolicy();

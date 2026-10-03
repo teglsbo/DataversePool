@@ -1,8 +1,10 @@
 using System.Net;
 using System.Net.Http;
+using System.ServiceModel;
 using ConnectionPool.Dataverse;
 using Microsoft.PowerPlatform.Dataverse.Client.Exceptions;
 using Microsoft.PowerPlatform.Dataverse.Client.HttpUtils;
+using Microsoft.Xrm.Sdk;
 using Xunit;
 
 namespace ConnectionPool.Dataverse.Tests;
@@ -129,11 +131,99 @@ public class DataverseThrottleDetectorTests
     }
 
     [Fact]
+    public void TryGetRetryAfter_FloorsReportedZero_ToMinRetryAfter()
+    {
+        var ex = BuildThrottlingException(retryAfterSeconds: 0);
+
+        var found = DataverseThrottleDetector.TryGetRetryAfter(ex, out var retryAfter);
+
+        Assert.True(found);
+        Assert.Equal(DataverseThrottleDetector.MinRetryAfter, retryAfter);
+    }
+
+    [Fact]
     public void TryGetRetryAfter_Throws_WhenMaxRetryAfterIsNotPositive()
     {
         var ex = BuildThrottlingException(retryAfterSeconds: 30);
 
         Assert.Throws<ArgumentOutOfRangeException>(
             () => DataverseThrottleDetector.TryGetRetryAfter(ex, TimeSpan.Zero, out _));
+    }
+
+    // --- SOAP path: FaultException<OrganizationServiceFault> ---
+    //
+    // These codes and the boxed-TimeSpan ErrorDetails shape were confirmed live against a real
+    // tenant (PLAN-2026-09-30.md, Phase 2): a 150-call real-write burst produced 63 faults with
+    // ErrorCode -2147015898 (ConcurrentRequests) and a "Retry-After" ErrorDetails entry holding a
+    // TimeSpan, ranging ~5 to ~13 minutes across the run.
+
+    private static FaultException<OrganizationServiceFault> BuildSoapThrottlingFault(
+        int errorCode,
+        TimeSpan? retryAfter)
+    {
+        var fault = new OrganizationServiceFault { ErrorCode = errorCode };
+        if (retryAfter is { } value)
+        {
+            fault.ErrorDetails["Retry-After"] = value;
+        }
+
+        return new FaultException<OrganizationServiceFault>(fault);
+    }
+
+    [Theory]
+    [InlineData(unchecked((int)0x80072326))] // -2147015898: ConcurrentRequests (observed live)
+    [InlineData(unchecked((int)0x80072322))] // -2147015902: NumberOfRequests
+    [InlineData(unchecked((int)0x80072321))] // -2147015903: ExecutionTime
+    public void TryGetRetryAfter_RecognizesEachSoapThrottlingFaultCode(int errorCode)
+    {
+        var ex = BuildSoapThrottlingFault(errorCode, TimeSpan.FromSeconds(30));
+
+        var found = DataverseThrottleDetector.TryGetRetryAfter(ex, out var retryAfter);
+
+        Assert.True(found);
+        Assert.Equal(TimeSpan.FromSeconds(30), retryAfter);
+    }
+
+    [Fact]
+    public void TryGetRetryAfter_UsesDefault_ForSoapFault_WhenRetryAfterDetailMissing()
+    {
+        var ex = BuildSoapThrottlingFault(unchecked((int)0x80072326), retryAfter: null);
+
+        var found = DataverseThrottleDetector.TryGetRetryAfter(ex, out var retryAfter);
+
+        Assert.True(found);
+        Assert.True(retryAfter > TimeSpan.Zero);
+    }
+
+    [Fact]
+    public void TryGetRetryAfter_CapsAtDefaultMaxRetryAfter_ForSoapFault()
+    {
+        // Observed live up to ~13 minutes - well above the 80s default cap.
+        var ex = BuildSoapThrottlingFault(unchecked((int)0x80072326), TimeSpan.FromMinutes(13));
+
+        var found = DataverseThrottleDetector.TryGetRetryAfter(ex, out var retryAfter);
+
+        Assert.True(found);
+        Assert.Equal(DataverseThrottleDetector.DefaultMaxRetryAfter, retryAfter);
+    }
+
+    [Fact]
+    public void TryGetRetryAfter_ReturnsFalse_ForSoapFault_WithUnrelatedErrorCode()
+    {
+        var ex = BuildSoapThrottlingFault(errorCode: -2147220970, TimeSpan.FromMinutes(1));
+
+        Assert.False(DataverseThrottleDetector.TryGetRetryAfter(ex, out _));
+    }
+
+    [Fact]
+    public void TryGetRetryAfter_FindsSoapThrottlingFault_WrappedInsideAnotherException()
+    {
+        var inner = BuildSoapThrottlingFault(unchecked((int)0x80072326), TimeSpan.FromSeconds(30));
+        var outer = new InvalidOperationException("wrapper", inner);
+
+        var found = DataverseThrottleDetector.TryGetRetryAfter(outer, out var retryAfter);
+
+        Assert.True(found);
+        Assert.Equal(TimeSpan.FromSeconds(30), retryAfter);
     }
 }

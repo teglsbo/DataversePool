@@ -1,7 +1,7 @@
 # ADR-0024: Operation-level metrics on instrumented execution paths
 
 ## Status
-Proposed
+Accepted — implemented (2026-10-01). See "Implementation notes" at the end.
 
 ## Context
 ADR-0018 added `DataversePool.Metrics`, which publishes the generic pool's point-in-time
@@ -286,3 +286,40 @@ attribution, but live Dataverse access is not required for the core metric seman
 - This ADR does not implement proactive rate limiting or adaptive concurrency. The resulting
   metrics may inform such a future design, but no control loop should be added until production
   evidence demonstrates a need and a safe algorithm.
+
+## Implementation notes
+
+- **Shared executor instead of `LeaseScope` hooks.** `PooledOrganizationService` and
+  `ExecuteWithThrottleRetryAsync` now both run through one internal, generic
+  `DataverseOperationExecutor` loop. The facade calls it with `maxAttempts: 1`. `LeaseScope`
+  (ADR-0020) was removed: the executor keeps all of its guarantees and tests (release exactly once,
+  exact exception identity, throttle reported before release). It also makes the retry loop
+  testable with fake leases for the first time.
+- **Recorder.** `DataverseOperationRecorder` owns all nine instruments on a meter named
+  `"DataversePool"`, the same name as the `DataversePool.Metrics` gauges. Each write is guarded, so
+  a throwing listener cannot alter an outcome. The enabled flag is read once per call, so a listener
+  attaching mid-call cannot unbalance the up-down counters. Tags use a stack `TagList`. A test
+  asserts that with no listener, the executor allocates no more per call than a plain
+  acquire/try/finally.
+- **Public surface:** `DataverseOperationMetrics` (name constants), `DataverseOperationMetricsOptions`
+  (`PoolName`), optional `metricsOptions` parameters on the `DataversePool` and
+  `PooledOrganizationService` constructors, and the named `ExecuteWithThrottleRetryAsync` overload.
+  The unnamed overload records `dataverse.operation.name = "custom"`. `AddDataversePool` uses its
+  DI key as `pool.name`. A facade over a `DataversePool` inherits the pool's name unless overridden.
+- **Classification:** `canceled` requires the caller's own token to be cancelled. An SDK-internal
+  `TaskCanceledException` (e.g. HTTP timeout) counts as `error`. A throttle reporter that throws is
+  treated as "not throttled", which keeps the old exception-filter semantics.
+- **Testing requirements 1–10** are covered in `DataverseOperationExecutorTests` and
+  `PooledOrganizationServiceTests`, using a real `MeterListener`. Beyond them, tests also show that
+  the lease is released before a same-member `Retry-After` wait, and that a throwing listener
+  changes nothing.
+- **SOAP-path throttling (resolved).** Until 2026-10 the throttle reporter inside the executor only
+  recognized the Web API's HTTP 429, so on the SOAP transport a throttled call was classified
+  `error`, never `throttled`, and never fed `dataverse.operation.throttle.*`. `DataverseThrottleDetector`
+  now also recognizes the three service-protection `OrganizationServiceFault` codes (confirmed live
+  for `ConcurrentRequests` and `NumberOfRequests`; see ADR-0008's addendum), so the `throttled`
+  outcome and the throttle metrics are populated on both transports. The metrics do not yet say
+  *which* limit fired (request count, execution time, concurrency).
+- **Connection faults.** The executor also reports non-throttle transport failures to the lease
+  (`ReportIfConnectionFault`), recycling the connection and feeding the breaker. This changes pool
+  health, not the recorded outcome: such a call is still classified `error`.

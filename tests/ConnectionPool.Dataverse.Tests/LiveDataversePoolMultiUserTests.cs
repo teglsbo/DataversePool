@@ -26,20 +26,16 @@ public class LiveDataversePoolMultiUserTests
 
     public LiveDataversePoolMultiUserTests(ITestOutputHelper output) => _output = output;
 
-    private static string? ConnectionStringA =>
-        Environment.GetEnvironmentVariable("DVPOOL_IT_CONNECTION_STRING");
+    private static string? ConnectionStringA => LiveDataverseCredentials.GetConnectionString(0);
 
-    private static string? ConnectionStringB =>
-        Environment.GetEnvironmentVariable("DVPOOL_IT_CONNECTION_STRING_B");
+    private static string? ConnectionStringB => LiveDataverseCredentials.GetConnectionString(1);
 
-    [Fact]
+    [SkippableFact]
     public async Task AcquireAsync_RoundRobinsAcrossBothRealMembers_AndBothAuthenticateAsDistinctUsers()
     {
-        if (string.IsNullOrEmpty(ConnectionStringA) || string.IsNullOrEmpty(ConnectionStringB))
-        {
-            _output.WriteLine("Skipped: DVPOOL_IT_CONNECTION_STRING / DVPOOL_IT_CONNECTION_STRING_B not both set.");
-            return;
-        }
+        Skip.If(
+            string.IsNullOrEmpty(ConnectionStringA) || string.IsNullOrEmpty(ConnectionStringB),
+            "Set DVPOOL_IT_CONNECTION_STRING and DVPOOL_IT_CONNECTION_STRING_B.");
 
         await using var poolA = new DataverseUserPool("A", ConnectionStringA);
         await using var poolB = new DataverseUserPool("B", ConnectionStringB);
@@ -82,14 +78,12 @@ public class LiveDataversePoolMultiUserTests
     /// pool can genuinely dispatch concurrently *across* members (not serialized member-by-member),
     /// which is the mechanism the ceiling-raising claim depends on.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task AcquireAsync_CanServeConcurrentCallers_FromBothMembersSimultaneously()
     {
-        if (string.IsNullOrEmpty(ConnectionStringA) || string.IsNullOrEmpty(ConnectionStringB))
-        {
-            _output.WriteLine("Skipped: DVPOOL_IT_CONNECTION_STRING / DVPOOL_IT_CONNECTION_STRING_B not both set.");
-            return;
-        }
+        Skip.If(
+            string.IsNullOrEmpty(ConnectionStringA) || string.IsNullOrEmpty(ConnectionStringB),
+            "Set DVPOOL_IT_CONNECTION_STRING and DVPOOL_IT_CONNECTION_STRING_B.");
 
         await using var poolA = new DataverseUserPool("A", ConnectionStringA, new PoolOptions { MaxSize = 4 });
         await using var poolB = new DataverseUserPool("B", ConnectionStringB, new PoolOptions { MaxSize = 4 });
@@ -119,16 +113,14 @@ public class LiveDataversePoolMultiUserTests
     /// <see cref="DataversePool"/> API. Every operation acquires a group lease, records the selected
     /// member, and invokes the slow Web API query through that lease's <see cref="ServiceClient"/>.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task TwoRealMembers_ExecuteMoreThanOneUsersConcurrentLimitThroughDataversePool()
     {
         var connectionStringA = GetConnectionString();
         var connectionStringB = GetConnectionString("_B");
-        if (connectionStringA is null || connectionStringB is null)
-        {
-            _output.WriteLine("Skipped: credentials for both application users are not set.");
-            return;
-        }
+        Skip.If(
+            connectionStringA is null || connectionStringB is null,
+            "Set credentials for both application users.");
 
         var concurrency = GetPositiveEnvironmentInteger("DVPOOL_IT_POOL_CONCURRENCY", 160);
         Assert.True(concurrency > 100 && concurrency % 2 == 0);
