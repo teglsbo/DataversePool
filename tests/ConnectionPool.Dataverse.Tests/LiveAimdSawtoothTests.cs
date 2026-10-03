@@ -40,6 +40,7 @@ public class LiveAimdSawtoothTests
         var slow = Environment.GetEnvironmentVariable("DVPOOL_IT_SAWTOOTH_SLOW") == "1";
         var slowData = Environment.GetEnvironmentVariable("DVPOOL_IT_SAWTOOTH_SLOW") == "data";
         var createMode = Environment.GetEnvironmentVariable("DVPOOL_IT_SAWTOOTH_SLOW") == "create";
+        var createWeb = Environment.GetEnvironmentVariable("DVPOOL_IT_SAWTOOTH_SLOW") == "create-web";
 
         // MaxRetryCount 0: the SDK must not absorb 429s, or the pool never sees them.
         var member = new DataverseUserPool(
@@ -64,6 +65,7 @@ public class LiveAimdSawtoothTests
         var failed = 0L;
         var inFlight = 0;
         var reasons = new ConcurrentDictionary<string, long>();
+        var samples = new ConcurrentDictionary<string, string>();
 
         async Task Worker()
         {
@@ -76,6 +78,19 @@ public class LiveAimdSawtoothTests
                         Interlocked.Increment(ref inFlight);
                         try
                         {
+                            if (createWeb)
+                            {
+                                using var response = await client.ExecuteWebRequestAsync(
+                                    HttpMethod.Post, "accounts", "{\"name\":\"dvpool-sim-" + Guid.NewGuid().ToString("N") + "\"}", null, "application/json", ct);
+                                if (!response.IsSuccessStatusCode)
+                                {
+                                    samples.TryAdd("web-nonthrown:" + (int)response.StatusCode, $"HTTP {(int)response.StatusCode} returned, not thrown. Headers: {response.Headers}. Body: {await response.Content.ReadAsStringAsync(ct)}");
+                                    throw new HttpRequestException($"HTTP {(int)response.StatusCode}", null, response.StatusCode);
+                                }
+
+                                return (int)response.StatusCode;
+                            }
+
                             if (createMode)
                             {
                                 var account = new Microsoft.Xrm.Sdk.Entity("account") { ["name"] = "dvpool-sim-" + Guid.NewGuid().ToString("N") };
@@ -99,6 +114,7 @@ public class LiveAimdSawtoothTests
                         catch (Exception ex) when (DataverseThrottleDetector.TryGetThrottleReason(ex, out var reason))
                         {
                             reasons.AddOrUpdate(reason.ToString(), 1, (_, n) => n + 1);
+                            samples.TryAdd((createWeb ? "web:" : "soap:") + reason, Describe(ex));
                             throw;
                         }
                         finally
@@ -157,6 +173,16 @@ public class LiveAimdSawtoothTests
             File.WriteAllText(Path.Combine(dir, "sawtooth.csv"), csv.ToString());
         }
 
+        foreach (var (key, text) in samples.OrderBy(kv => kv.Key))
+        {
+            _output.WriteLine($"THROTTLE SAMPLE [{key}]{Environment.NewLine}{text}");
+        }
+
+        if (!string.IsNullOrEmpty(dir))
+        {
+            File.WriteAllText(Path.Combine(dir, "throttle-samples.txt"), string.Join(Environment.NewLine + Environment.NewLine, samples.OrderBy(kv => kv.Key).Select(kv => $"[{kv.Key}]{Environment.NewLine}{kv.Value}")));
+        }
+
         var drops = 0;
         var rises = 0;
         for (var i = 1; i < sizes.Count; i++)
@@ -167,5 +193,34 @@ public class LiveAimdSawtoothTests
 
         _output.WriteLine($"SUMMARY ok={ok} failed={failed} size min={sizes.Min()} max={sizes.Max()} drops={drops} rises={rises} throttles=[{string.Join(", ", reasons.Select(kv => kv.Key + "=" + kv.Value))}]");
         Assert.True(ok > 0);
+    }
+
+    private static string Describe(Exception exception)
+    {
+        var text = new StringBuilder();
+        for (var ex = exception; ex is not null; ex = ex.InnerException)
+        {
+            text.AppendLine($"{ex.GetType().FullName}: {ex.Message}");
+            if (ex is System.ServiceModel.FaultException<Microsoft.Xrm.Sdk.OrganizationServiceFault> fault)
+            {
+                text.AppendLine($"  ErrorCode=0x{(uint)fault.Detail.ErrorCode:X8} ({fault.Detail.ErrorCode}), Message={fault.Detail.Message}");
+                foreach (var kv in fault.Detail.ErrorDetails)
+                {
+                    text.AppendLine($"  ErrorDetails[{kv.Key}]={kv.Value}");
+                }
+            }
+
+            if (ex is Microsoft.PowerPlatform.Dataverse.Client.Exceptions.HttpOperationException http)
+            {
+                text.AppendLine($"  StatusCode={(int?)http.Response?.StatusCode}, Content={http.Response?.Content}");
+                if (http.Response?.Headers is { } headers)
+                {
+                    text.AppendLine("  Headers: " + string.Join("; ", headers.Select(h => h.Key + "=" + string.Join(",", h.Value))));
+                }
+            }
+        }
+
+        text.AppendLine($"  Detector: reason={(DataverseThrottleDetector.TryGetThrottleReason(exception, out var reason) ? reason.ToString() : "none")}, retryAfter={(DataverseThrottleDetector.TryGetRetryAfter(exception, TimeSpan.MaxValue, out var retry) ? retry.ToString() : "none")}");
+        return text.ToString();
     }
 }

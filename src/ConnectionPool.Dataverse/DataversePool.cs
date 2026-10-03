@@ -180,6 +180,43 @@ public sealed class DataversePool : IAsyncDisposable
     }
 
     /// <summary>
+    /// Verifies that no two members authenticate as the same Dataverse user in the same organization.
+    /// Service-protection budgets are per user, so two members on one user share a budget without
+    /// seeing each other's 429s and both overshoot. Calls <c>WhoAmI</c> once per member (sequentially,
+    /// one lease each) - opt-in, intended once at startup after <see cref="WarmupAsync"/>.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">Two or more members resolve to the same user.</exception>
+    public async Task ValidateDistinctIdentitiesAsync(CancellationToken cancellationToken = default)
+    {
+        var identities = new List<(string Member, Guid UserId, Guid OrganizationId)>(_members.Count);
+        foreach (var member in _members)
+        {
+            await using var lease = await member.AcquireAsync(cancellationToken).ConfigureAwait(false);
+            var who = (Microsoft.Crm.Sdk.Messages.WhoAmIResponse)await lease.Resource
+                .ExecuteAsync(new Microsoft.Crm.Sdk.Messages.WhoAmIRequest(), cancellationToken)
+                .ConfigureAwait(false);
+            identities.Add((member.Name, who.UserId, who.OrganizationId));
+        }
+
+        var duplicates = FindDuplicateIdentities(identities);
+        if (duplicates.Count > 0)
+        {
+            throw new InvalidOperationException(
+                "Members share a Dataverse user (and therefore one service-protection budget): " +
+                string.Join("; ", duplicates.Select(g => string.Join(", ", g))) +
+                ". Use exactly one member per application user.");
+        }
+    }
+
+    internal static IReadOnlyList<IReadOnlyList<string>> FindDuplicateIdentities(
+        IEnumerable<(string Member, Guid UserId, Guid OrganizationId)> identities) =>
+        identities
+            .GroupBy(i => (i.UserId, i.OrganizationId))
+            .Where(g => g.Count() > 1)
+            .Select(g => (IReadOnlyList<string>)g.Select(i => i.Member).ToArray())
+            .ToArray();
+
+    /// <summary>
     /// Runs <paramref name="operation"/> against a leased <see cref="ServiceClient"/>, and if it
     /// throws a Dataverse HTTP 429/service-protection signal (detected via
     /// <see cref="DataverseThrottleDetector"/>, same as <see cref="DataverseLease.ReportIfThrottled(Exception, TimeSpan?)"/>),

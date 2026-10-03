@@ -131,6 +131,17 @@ public class DataverseThrottleDetectorTests
     }
 
     [Fact]
+    public void TryGetRetryAfter_FloorsReportedZero_ToMinRetryAfter()
+    {
+        var ex = BuildThrottlingException(retryAfterSeconds: 0);
+
+        var found = DataverseThrottleDetector.TryGetRetryAfter(ex, out var retryAfter);
+
+        Assert.True(found);
+        Assert.Equal(DataverseThrottleDetector.MinRetryAfter, retryAfter);
+    }
+
+    [Fact]
     public void TryGetRetryAfter_Throws_WhenMaxRetryAfterIsNotPositive()
     {
         var ex = BuildThrottlingException(retryAfterSeconds: 30);

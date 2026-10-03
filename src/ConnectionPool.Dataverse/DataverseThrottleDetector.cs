@@ -32,6 +32,15 @@ namespace ConnectionPool.Dataverse;
 public static class DataverseThrottleDetector
 {
     private const string RetryAfterHeaderName = "Retry-After";
+
+    /// <summary>
+    /// Floor for a reported <c>Retry-After</c>. Live Web API request-count 429s were seen with
+    /// <c>Retry-After: 0</c>; honoring 0 would turn the retry into a tight loop against a still-closed window.
+    /// </summary>
+    public static readonly TimeSpan MinRetryAfter = TimeSpan.FromSeconds(1);
+
+    private static TimeSpan Clamp(TimeSpan reported, TimeSpan max) =>
+        reported > max ? max : reported < MinRetryAfter ? (MinRetryAfter < max ? MinRetryAfter : max) : reported;
     private static readonly TimeSpan DefaultRetryAfterWhenUnspecified = TimeSpan.FromSeconds(5);
 
     /// <summary>
@@ -93,7 +102,7 @@ public static class DataverseThrottleDetector
                 var reported = TryReadRetryAfterHeader(httpEx.Response!.Headers, out var parsed)
                     ? parsed
                     : DefaultRetryAfterWhenUnspecified;
-                retryAfter = reported > maxRetryAfter ? maxRetryAfter : reported;
+                retryAfter = Clamp(reported, maxRetryAfter);
                 return true;
             }
 
@@ -103,7 +112,7 @@ public static class DataverseThrottleDetector
                 var reported = TryReadRetryAfterErrorDetail(faultEx.Detail.ErrorDetails, out var parsed)
                     ? parsed
                     : DefaultRetryAfterWhenUnspecified;
-                retryAfter = reported > maxRetryAfter ? maxRetryAfter : reported;
+                retryAfter = Clamp(reported, maxRetryAfter);
                 return true;
             }
         }
