@@ -28,8 +28,12 @@ limit fired before it shrinks anything.
   exception. `DataverseUserPool` facades and a single `DataverseUserPool` are not sized.
 - The throttle reason is decoded by `DataverseThrottleDetector.TryGetThrottleReason`. SOAP faults
   are exact (0x80072322 request count, 0x80072321 execution time, 0x80072326 concurrent requests).
-  A Web API 429 is decoded best-effort from the message and body text; this is **not verified
-  live**, and anything unrecognized is `Unknown`.
+  A Web API 429 is decoded from the message and response body text. **Verified live (2026-10-03):**
+  through the SDK the `HttpOperationException` message is generic (`TooManyRequests`) and the body
+  is `{"error":{"code":"0x80072326","message":"Number of concurrent requests exceeded the limit of 100."}}`,
+  decoded as `ConcurrentRequests` (`LiveWebApiThrottleReasonTests`). Only the concurrency facet has
+  been seen on the Web API; the other two bodies are assumed to follow the same shape. Anything
+  unrecognized is `Unknown`.
 
 ### Deviations from the §9.2 sketch
 

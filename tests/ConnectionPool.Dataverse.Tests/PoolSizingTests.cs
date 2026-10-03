@@ -611,6 +611,20 @@ public class PoolSizingTests
     }
 
     [Fact]
+    public void ThrottleReason_WebApi429_IsDecodedFromResponseBody_AsSeenLive()
+    {
+        // Verbatim shape captured live: the SDK's message is generic, the body carries the code.
+        var ex = new HttpOperationException("Operation returned an invalid status code 'TooManyRequests'")
+        {
+            Response = new HttpResponseMessageWrapper(
+                new HttpResponseMessage((HttpStatusCode)429),
+                content: "{\"error\":{\"code\":\"0x80072326\",\"message\":\"Number of concurrent requests exceeded the limit of 100.\"}}"),
+        };
+        Assert.True(DataverseThrottleDetector.TryGetThrottleReason(ex, out var reason));
+        Assert.Equal(ThrottleReason.ConcurrentRequests, reason);
+    }
+
+    [Fact]
     public void ThrottleReason_NonThrottle_ReturnsFalse() =>
         Assert.False(DataverseThrottleDetector.TryGetThrottleReason(new InvalidOperationException(), out _));
 }
