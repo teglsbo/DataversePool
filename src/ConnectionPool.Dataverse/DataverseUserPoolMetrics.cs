@@ -66,6 +66,13 @@ public sealed class DataverseUserPoolMetrics : IDisposable
             },
             description: "Seconds remaining until this member's throttle window expires, or 0 if not throttled.");
 
+        _meter.CreateObservableGauge(
+            "dataversepool.member.quarantined",
+            () => member.QuarantineReason is { } reason
+                ? new Measurement<int>(1, new KeyValuePair<string, object?>[] { tags[0], new("quarantine_reason", reason) })
+                : new Measurement<int>(0, tags),
+            description: "1 while this member is quarantined for a permanent failure (revoked secret, disabled app user, ...), with a quarantine_reason tag; 0 otherwise.");
+
         if (breaker is not null)
         {
             _meter.CreateObservableGauge(

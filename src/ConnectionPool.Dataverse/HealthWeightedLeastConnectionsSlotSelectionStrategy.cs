@@ -118,7 +118,7 @@ public sealed class HealthWeightedLeastConnectionsSlotSelectionStrategy : ISlotS
         for (var i = 0; i < members.Count; i++)
         {
             var member = members[i];
-            if (member.IsThrottled)
+            if (member.IsThrottled || member.IsQuarantined)
             {
                 continue;
             }

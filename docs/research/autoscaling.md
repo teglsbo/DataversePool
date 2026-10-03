@@ -1310,7 +1310,13 @@ whole app user, so skipping the member is deliberately conservative. Suggested o
 
 **Status:** items (1) and (2) are implemented as `HealthWeightedLeastConnectionsSlotSelectionStrategy`
 (headroom ranking; stateless post-throttle ramp derived from `ThrottledUntil`; `dop_hint` cap).
-Items (3)'s probe ramp and (4) are not started.
+Item (4) is implemented too: `DataverseFailureClassifier.IsPermanent` (AADSTS secret/app/tenant
+errors, `invalid_client`, app user disabled/not in org, HTTP 401 — all on the connection-establishment
+path only; unknown means transient) makes `DataverseUserPool.AcquireAsync` quarantine the member for
+`QuarantineDuration` (default 10 min), logging once at error level. All three health-aware strategies
+skip quarantined members (still failing open if every member is unavailable); `ClearQuarantine()` is the
+operator reset; the `dataversepool.member.quarantined` gauge carries a `quarantine_reason` tag. Not done:
+quarantine from the *operational* path (`MarkUnhealthy`), and item (3)'s post-probe ramp.
 
 ## 10. Configurable settings proposal
 

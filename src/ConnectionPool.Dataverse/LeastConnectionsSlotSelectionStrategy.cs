@@ -58,7 +58,7 @@ public sealed class LeastConnectionsSlotSelectionStrategy : ISlotSelectionStrate
         {
             var member = members[i];
 
-            if (member.IsThrottled)
+            if (member.IsThrottled || member.IsQuarantined)
             {
                 continue;
             }

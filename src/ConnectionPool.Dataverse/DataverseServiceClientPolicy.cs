@@ -198,12 +198,15 @@ public sealed class DataverseServiceClientPolicy : IPooledResourcePolicy<Service
             if (_baseClient is null || !_baseClient.IsReady)
             {
                 var error = _baseClient?.LastError;
+                var lastException = _baseClient?.LastException;
                 // Don't leave a non-ready client (e.g. one the factory returned but that failed to
                 // authenticate) sitting in _baseClient - nothing else will ever dispose it if this
                 // policy is never retried or explicitly disposed. See docs/adr/0022.
                 _baseClient?.Dispose();
                 _baseClient = null;
-                throw new InvalidOperationException($"Failed to establish base Dataverse connection: {error}");
+                // Keep the SDK's own exception as InnerException so DataverseFailureClassifier can
+                // see the original auth error (AADSTS code, HTTP status) behind the message.
+                throw new InvalidOperationException($"Failed to establish base Dataverse connection: {error}", lastException);
             }
 
             // See docs/adr/0002 - this base client is never leased out directly, only cloned, but

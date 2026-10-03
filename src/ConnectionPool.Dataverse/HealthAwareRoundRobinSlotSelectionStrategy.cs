@@ -56,7 +56,7 @@ public sealed class HealthAwareRoundRobinSlotSelectionStrategy : ISlotSelectionS
 
             // Check throttle first (cheap, no side effects) so a throttled member never consumes
             // the circuit breaker's single half-open probe slot for no reason.
-            if (member.IsThrottled)
+            if (member.IsThrottled || member.IsQuarantined)
             {
                 continue;
             }

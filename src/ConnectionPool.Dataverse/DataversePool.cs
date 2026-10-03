@@ -136,8 +136,8 @@ public sealed class DataversePool : IAsyncDisposable
         var earliest = earliestRetryAt == default ? (DateTimeOffset?)null : earliestRetryAt;
 
         var message = earliest is { } when
-            ? $"All {names.Length} member(s) are currently circuit-open or throttled. Earliest known retry: {when:O}."
-            : $"All {names.Length} member(s) are currently circuit-open or throttled.";
+            ? $"All {names.Length} member(s) are currently circuit-open, throttled or quarantined. Earliest known retry: {when:O}."
+            : $"All {names.Length} member(s) are currently circuit-open, throttled or quarantined.";
 
         return new DataversePoolUnavailableException(message, names, earliest);
     }

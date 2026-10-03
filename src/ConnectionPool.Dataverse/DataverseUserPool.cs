@@ -14,13 +14,19 @@ public sealed class DataverseUserPool : IAsyncDisposable
 {
     private readonly DataverseServiceClientPolicy _policy;
     private readonly ResourcePool<ServiceClient> _pool;
+    private readonly ILogger? _logger;
     private long _throttledUntilTicks; // 0 = not throttled; otherwise DateTimeOffset.UtcTicks (UTC)
+    private QuarantineInfo? _quarantine;
+    private TimeSpan _quarantineDuration = TimeSpan.FromMinutes(10);
+
+    private sealed record QuarantineInfo(DateTimeOffset Until, string Reason);
 
     public string Name { get; }
 
     public DataverseUserPool(string name, string connectionString, PoolOptions? options = null, ILogger? logger = null, DataverseClientOptions? clientOptions = null)
     {
         Name = name;
+        _logger = logger;
         _policy = new DataverseServiceClientPolicy(connectionString, logger, clientOptions);
         _pool = new ResourcePool<ServiceClient>(_policy, options);
     }
@@ -34,6 +40,7 @@ public sealed class DataverseUserPool : IAsyncDisposable
     public DataverseUserPool(string name, Func<CancellationToken, Task<ServiceClient>> baseClientFactory, PoolOptions? options = null, ILogger? logger = null, DataverseClientOptions? clientOptions = null)
     {
         Name = name;
+        _logger = logger;
         _policy = new DataverseServiceClientPolicy(baseClientFactory, logger, clientOptions);
         _pool = new ResourcePool<ServiceClient>(_policy, options);
     }
@@ -41,8 +48,70 @@ public sealed class DataverseUserPool : IAsyncDisposable
     /// <summary>Sequentially creates the configured prewarm count of connections. See docs/adr/0002.</summary>
     public Task WarmupAsync(CancellationToken cancellationToken = default) => _pool.WarmupAsync(cancellationToken);
 
-    public Task<PooledLease<ServiceClient>> AcquireAsync(CancellationToken cancellationToken = default)
-        => _pool.AcquireAsync(cancellationToken);
+    public async Task<PooledLease<ServiceClient>> AcquireAsync(CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            return await _pool.AcquireAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not PoolAcquireTimeoutException
+            && !(ex is OperationCanceledException && cancellationToken.IsCancellationRequested))
+        {
+            if (DataverseFailureClassifier.IsPermanent(ex, out var reason))
+            {
+                Quarantine(reason);
+            }
+
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// How long a member stays quarantined after a permanent failure (see <see cref="Quarantine"/>)
+    /// before selection tries it again. Default 10 minutes - deliberately much longer than the
+    /// circuit breaker's cooldown, because a permanent failure needs a human fix, not a retry.
+    /// </summary>
+    public TimeSpan QuarantineDuration
+    {
+        get => _quarantineDuration;
+        set
+        {
+            ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(value, TimeSpan.Zero);
+            _quarantineDuration = value;
+        }
+    }
+
+    /// <summary>True while this member is quarantined for a permanent (non-self-healing) failure.</summary>
+    public bool IsQuarantined => Volatile.Read(ref _quarantine) is { } q && q.Until > DateTimeOffset.UtcNow;
+
+    /// <summary>UTC instant the quarantine ends, or <c>null</c> if not quarantined.</summary>
+    public DateTimeOffset? QuarantinedUntil => IsQuarantined ? Volatile.Read(ref _quarantine)!.Until : null;
+
+    /// <summary>Why this member is quarantined, or <c>null</c> if it is not.</summary>
+    public string? QuarantineReason => IsQuarantined ? Volatile.Read(ref _quarantine)!.Reason : null;
+
+    /// <summary>
+    /// Takes this member out of selection for <see cref="QuarantineDuration"/>. Called automatically
+    /// when an acquire fails with a failure <see cref="DataverseFailureClassifier"/> considers
+    /// permanent (revoked secret, disabled app user, ...); callable directly too. Logs at error
+    /// level once per quarantine, not once per failed call. A quarantined member is skipped like a
+    /// throttled one, and the pool still fails open if every member is unavailable.
+    /// </summary>
+    public void Quarantine(string reason)
+    {
+        var next = new QuarantineInfo(DateTimeOffset.UtcNow + _quarantineDuration, reason);
+        var previous = Interlocked.Exchange(ref _quarantine, next);
+        if (previous is null || previous.Until <= DateTimeOffset.UtcNow)
+        {
+            _logger?.LogError(
+                "Dataverse member '{Member}' quarantined for {Duration} - permanent failure: {Reason}. " +
+                "Fix the credentials/configuration, or call ClearQuarantine() after fixing.",
+                Name, _quarantineDuration, reason);
+        }
+    }
+
+    /// <summary>Ends any quarantine immediately (e.g. an operator rotated the secret).</summary>
+    public void ClearQuarantine() => Interlocked.Exchange(ref _quarantine, null);
 
     public PoolStats GetStats() => _pool.GetStats();
 

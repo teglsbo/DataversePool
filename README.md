@@ -336,6 +336,13 @@ server's `x-ms-dop-hint`), and after a member's throttle window ends it ramps th
 (cap starts at 2, +1 every 5 s by default) instead of releasing every queued caller onto it at once.
 The ramp is a ranking preference, not a hard limit. See `docs/research/autoscaling.md` §9.6.
 
+**Permanent failures.** If connecting fails with something that won't heal on its own (revoked or
+expired client secret, deleted app registration, disabled application user, persistent 401), the
+member is quarantined for `DataverseUserPool.QuarantineDuration` (default 10 min) instead of being
+retried on the breaker's short cooldown. It's logged once at error level, skipped by the
+health-aware strategies, visible via the `dataversepool.member.quarantined` gauge, and can be cleared
+early with `ClearQuarantine()`. Unrecognised errors are treated as transient.
+
 **Throttle-aware routing.** Both strategies also skip a member that's currently marked as
 Dataverse-throttled. `DataversePool.AcquireAsync()` returns a `DataverseLease` (not a
 plain lease) specifically so you can report a 429 back to the member that actually served the
