@@ -1315,8 +1315,9 @@ errors, `invalid_client`, app user disabled/not in org, HTTP 401 — all on the 
 path only; unknown means transient) makes `DataverseUserPool.AcquireAsync` quarantine the member for
 `QuarantineDuration` (default 10 min), logging once at error level. All three health-aware strategies
 skip quarantined members (still failing open if every member is unavailable); `ClearQuarantine()` is the
-operator reset; the `dataversepool.member.quarantined` gauge carries a `quarantine_reason` tag. Not done:
-quarantine from the *operational* path (`MarkUnhealthy`).
+operator reset; the `dataversepool.member.quarantined` gauge carries a `quarantine_reason` tag. Operational-path
+quarantine is done too: `DataverseLease.ReportIfConnectionFault` (called by the shared executor)
+recycles the connection on transport-level faults and quarantines on a permanent one such as a 401.
 Item (3) is implemented: `MemberCircuitBreaker` records when a circuit closes after being open
 (`GetRecoveredAt`), and `HealthWeightedLeastConnectionsSlotSelectionStrategy` applies the same
 `rampStart`/`rampStepInterval` slow-start from that instant (the tighter of the throttle and recovery

@@ -8,16 +8,20 @@ namespace ConnectionPool.Dataverse;
 internal delegate bool ThrottleReporter<in TLease>(TLease lease, Exception exception, TimeSpan? maxRetryAfter, out TimeSpan retryAfter);
 
 /// <summary>How <see cref="DataverseOperationExecutor"/> reads the member identity/name and
-/// reports throttling for a given lease type. One instance per lease type, created once - not
+/// reports throttling and connection faults for a given lease type. One instance per lease type, created once - not
 /// per call.</summary>
 internal sealed class LeaseAccessors<TLease>(
     Func<TLease, object> member,
     Func<TLease, string> memberName,
-    ThrottleReporter<TLease> reportIfThrottled)
+    ThrottleReporter<TLease> reportIfThrottled,
+    Func<TLease, Exception, bool>? reportIfConnectionFault = null)
 {
     public Func<TLease, object> Member { get; } = member;
     public Func<TLease, string> MemberName { get; } = memberName;
     public ThrottleReporter<TLease> ReportIfThrottled { get; } = reportIfThrottled;
+
+    /// <summary>Reports a non-throttle failure that looks like a connection fault; null = never.</summary>
+    public Func<TLease, Exception, bool>? ReportIfConnectionFault { get; } = reportIfConnectionFault;
 }
 
 internal static class DataverseLeaseAccessors
@@ -26,7 +30,8 @@ internal static class DataverseLeaseAccessors
         static lease => lease.Member,
         static lease => lease.Member.Name,
         static (DataverseLease lease, Exception exception, TimeSpan? maxRetryAfter, out TimeSpan retryAfter) =>
-            lease.ReportIfThrottled(exception, out retryAfter, maxRetryAfter));
+            lease.ReportIfThrottled(exception, out retryAfter, maxRetryAfter),
+        static (lease, exception) => lease.ReportIfConnectionFault(exception));
 }
 
 /// <summary>
@@ -111,6 +116,11 @@ internal static class DataverseOperationExecutor
                 catch (Exception ex)
                 {
                     var throttled = TryReportThrottle(accessors, lease, ex, maxRetryAfter, out var retryAfter);
+                    if (!throttled && !cancellationToken.IsCancellationRequested)
+                    {
+                        TryReportConnectionFault(accessors, lease, ex);
+                    }
+
                     if (enabled)
                     {
                         var outcome = throttled
@@ -230,6 +240,20 @@ internal static class DataverseOperationExecutor
         finally
         {
             recorder.WaitingChanged(scope, -1);
+        }
+    }
+
+    /// <summary>Health reporting must never replace the operation's own exception, so a throwing
+    /// reporter is swallowed.</summary>
+    private static void TryReportConnectionFault<TLease>(LeaseAccessors<TLease> accessors, TLease lease, Exception exception)
+    {
+        try
+        {
+            accessors.ReportIfConnectionFault?.Invoke(lease, exception);
+        }
+        catch
+        {
+            // intentionally ignored
         }
     }
 

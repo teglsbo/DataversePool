@@ -25,6 +25,7 @@ public class DataverseOperationExecutorTests
         public FakeMember Member { get; } = member;
         public int DisposeCount { get; private set; }
         public int ThrottleReports { get; set; }
+        public List<Exception> FaultReports { get; } = new();
 
         public ValueTask DisposeAsync()
         {
@@ -54,6 +55,36 @@ public class DataverseOperationExecutorTests
             retryAfter = TimeSpan.Zero;
             return false;
         });
+
+    private static readonly LeaseAccessors<FakeLease> FaultAccessors = new(
+        static l => l.Member,
+        static l => l.Member.Name,
+        static (FakeLease lease, Exception ex, TimeSpan? cap, out TimeSpan retryAfter) =>
+        {
+            retryAfter = TimeSpan.Zero;
+            if (ex is not FakeThrottleException t)
+            {
+                return false;
+            }
+
+            retryAfter = t.RetryAfter;
+            return true;
+        },
+        static (lease, ex) =>
+        {
+            lease.FaultReports.Add(ex);
+            return true;
+        });
+
+    private static readonly LeaseAccessors<FakeLease> ThrowingFaultReporterAccessors = new(
+        static l => l.Member,
+        static l => l.Member.Name,
+        static (FakeLease lease, Exception ex, TimeSpan? cap, out TimeSpan retryAfter) =>
+        {
+            retryAfter = TimeSpan.Zero;
+            return false;
+        },
+        static (lease, ex) => throw new InvalidOperationException("fault reporter bug"));
 
     private static readonly LeaseAccessors<FakeLease> ThrowingReporterAccessors = new(
         static l => l.Member,
@@ -89,6 +120,59 @@ public class DataverseOperationExecutorTests
         DataverseOperationExecutor.ExecuteAsync(scope, accessors ?? Accessors, acquire, operation, maxAttempts, maxRetryAfter, cancellationToken);
 
     private static OperationMetricsScope Uninstrumented() => new(NewRecorder(), "pool-x", "op");
+
+    // ----- Connection-fault health signal (PLAN Phase 3 item 6) -----
+
+    [Fact]
+    public async Task NonThrottleFailure_IsReportedToFaultReporter_AndPropagatesUnchanged()
+    {
+        var lease = new FakeLease(new("a"));
+        var boom = new InvalidOperationException("boom");
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            Run(Uninstrumented(), Sequence(lease), (_, _) => throw boom, accessors: FaultAccessors));
+
+        Assert.Same(boom, thrown);
+        Assert.Same(boom, Assert.Single(lease.FaultReports));
+        Assert.Equal(1, lease.DisposeCount);
+    }
+
+    [Fact]
+    public async Task ThrottledFailure_IsNotReportedAsFault()
+    {
+        var lease = new FakeLease(new("a"));
+
+        await Assert.ThrowsAsync<FakeThrottleException>(() =>
+            Run(Uninstrumented(), Sequence(lease), (_, _) => throw new FakeThrottleException(TimeSpan.FromSeconds(1)), accessors: FaultAccessors));
+
+        Assert.Empty(lease.FaultReports);
+    }
+
+    [Fact]
+    public async Task CallerCancellation_IsNotReportedAsFault()
+    {
+        var lease = new FakeLease(new("a"));
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        await Assert.ThrowsAsync<OperationCanceledException>(() =>
+            Run(Uninstrumented(), Sequence(lease), (_, ct) => throw new OperationCanceledException(ct), cancellationToken: cts.Token, accessors: FaultAccessors));
+
+        Assert.Empty(lease.FaultReports);
+    }
+
+    [Fact]
+    public async Task ThrowingFaultReporter_DoesNotReplaceOperationException()
+    {
+        var lease = new FakeLease(new("a"));
+        var boom = new InvalidOperationException("boom");
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            Run(Uninstrumented(), Sequence(lease), (_, _) => throw boom, accessors: ThrowingFaultReporterAccessors));
+
+        Assert.Same(boom, thrown);
+        Assert.Equal(1, lease.DisposeCount);
+    }
 
     // ----- Lease release / exception identity (formerly LeaseScopeTests, docs/adr/0020) -----
 

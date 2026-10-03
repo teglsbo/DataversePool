@@ -89,4 +89,62 @@ public static class DataverseFailureClassifier
 
         return false;
     }
+
+    /// <summary>
+    /// True if <paramref name="exception"/> looks like a failure of the <i>connection</i> (socket, TLS,
+    /// HTTP transport, IO or timeout) rather than a response from Dataverse about the request. A
+    /// service fault (<c>FaultException</c>, e.g. record not found, plugin or validation error)
+    /// anywhere in the chain means the server answered, so it is never a connection fault. Caller
+    /// cancellation (<see cref="OperationCanceledException"/>) is never one either. Callers must rule
+    /// out throttling (HTTP 429) first. Used to decide whether an operation failure should recycle the
+    /// connection and count towards the member's circuit breaker.
+    /// </summary>
+    public static bool IsConnectionFault(Exception? exception)
+    {
+        if (exception is null)
+        {
+            return false;
+        }
+
+        var seen = new HashSet<Exception>(ReferenceEqualityComparer.Instance);
+        var pending = new Stack<Exception>();
+        pending.Push(exception);
+        var transport = false;
+
+        while (pending.Count > 0)
+        {
+            var current = pending.Pop();
+            if (!seen.Add(current))
+            {
+                continue;
+            }
+
+            if (current is OperationCanceledException
+                || current.GetType().FullName?.StartsWith("System.ServiceModel.FaultException", StringComparison.Ordinal) == true)
+            {
+                return false;
+            }
+
+            if (current is HttpRequestException or System.Net.Sockets.SocketException or IOException
+                or System.Net.WebException or TimeoutException)
+            {
+                transport = true;
+            }
+
+            if (current is AggregateException aggregate)
+            {
+                foreach (var inner in aggregate.InnerExceptions)
+                {
+                    pending.Push(inner);
+                }
+            }
+
+            if (current.InnerException is { } next)
+            {
+                pending.Push(next);
+            }
+        }
+
+        return transport;
+    }
 }
