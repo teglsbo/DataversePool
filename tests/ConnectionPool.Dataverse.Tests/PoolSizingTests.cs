@@ -1,0 +1,303 @@
+using System.Net;
+using System.ServiceModel;
+using ConnectionPool.Core;
+using Microsoft.PowerPlatform.Dataverse.Client.Exceptions;
+using Microsoft.PowerPlatform.Dataverse.Client.HttpUtils;
+using Microsoft.Xrm.Sdk;
+using Xunit;
+
+namespace ConnectionPool.Dataverse.Tests;
+
+public class PoolSizingTests
+{
+    private sealed class ManualTime : TimeProvider
+    {
+        private DateTimeOffset _now = new(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        public override DateTimeOffset GetUtcNow() => _now;
+        public void Advance(TimeSpan by) => _now += by;
+    }
+
+    private static DataverseUserPool NewMember(string name = "u", int maxSize = 8) =>
+        new(name, "dummy", new PoolOptions { MaxSize = maxSize });
+
+    private static PoolSizingOperationOutcome Throttle(ThrottleReason reason, TimeSpan? retryAfter = null) =>
+        new("op", TimeSpan.FromMilliseconds(5), PoolSizingOutcomeKind.Throttled, reason, retryAfter, 0);
+
+    private static PoolStats Stats(DataverseUserPool m) => m.GetStats();
+
+    // ----- Aimd -----
+
+    [Fact]
+    public async Task Aimd_ConcurrencyThrottle_HalvesImmediately()
+    {
+        await using var m = NewMember();
+        var aimd = new AimdPoolSizingStrategy(timeProvider: new ManualTime());
+        aimd.GetInitialSize(m, 8);
+
+        var d = aimd.OnOperationCompleted(m, Throttle(ThrottleReason.ConcurrentRequests));
+
+        Assert.Equal(4, d?.TargetMaxSize);
+    }
+
+    [Theory]
+    [InlineData(ThrottleReason.RequestCount)]
+    [InlineData(ThrottleReason.ExecutionTime)]
+    [InlineData(ThrottleReason.Unknown)]
+    public async Task Aimd_WindowBudgetThrottles_DoNotShrink(ThrottleReason reason)
+    {
+        await using var m = NewMember();
+        var aimd = new AimdPoolSizingStrategy(timeProvider: new ManualTime());
+        aimd.GetInitialSize(m, 8);
+
+        Assert.Null(aimd.OnOperationCompleted(m, Throttle(reason)));
+    }
+
+    [Fact]
+    public async Task Aimd_BurstOfThrottles_DecreasesOnlyOncePerHoldoff()
+    {
+        await using var m = NewMember();
+        var time = new ManualTime();
+        var aimd = new AimdPoolSizingStrategy(timeProvider: time);
+        aimd.GetInitialSize(m, 8);
+
+        Assert.Equal(4, aimd.OnOperationCompleted(m, Throttle(ThrottleReason.ConcurrentRequests))?.TargetMaxSize);
+        Assert.Null(aimd.OnOperationCompleted(m, Throttle(ThrottleReason.ConcurrentRequests)));
+
+        time.Advance(TimeSpan.FromSeconds(11));
+        Assert.Equal(2, aimd.OnOperationCompleted(m, Throttle(ThrottleReason.ConcurrentRequests))?.TargetMaxSize);
+    }
+
+    [Fact]
+    public async Task Aimd_NeverShrinksBelowMinSize()
+    {
+        await using var m = NewMember(maxSize: 3);
+        var time = new ManualTime();
+        var aimd = new AimdPoolSizingStrategy(new AimdPoolSizingStrategyOptions { MinSize = 2 }, time);
+        aimd.GetInitialSize(m, 3);
+
+        Assert.Equal(2, aimd.OnOperationCompleted(m, Throttle(ThrottleReason.ConcurrentRequests))?.TargetMaxSize);
+        time.Advance(TimeSpan.FromSeconds(11));
+        Assert.Equal(2, aimd.OnOperationCompleted(m, Throttle(ThrottleReason.ConcurrentRequests))?.TargetMaxSize);
+    }
+
+    [Fact]
+    public async Task Aimd_RegrowsAdditivelyOnlyAfterCooldown_UpToCeiling()
+    {
+        await using var m = NewMember();
+        var time = new ManualTime();
+        var aimd = new AimdPoolSizingStrategy(timeProvider: time);
+        aimd.GetInitialSize(m, 8);
+        aimd.OnOperationCompleted(m, Throttle(ThrottleReason.ConcurrentRequests));
+
+        Assert.Null(aimd.OnTick(m, Stats(m), null));
+
+        time.Advance(TimeSpan.FromSeconds(31));
+        Assert.Equal(5, aimd.OnTick(m, Stats(m), null)?.TargetMaxSize);
+        Assert.Equal(6, aimd.OnTick(m, Stats(m), null)?.TargetMaxSize);
+        Assert.Equal(7, aimd.OnTick(m, Stats(m), null)?.TargetMaxSize);
+        Assert.Equal(8, aimd.OnTick(m, Stats(m), null)?.TargetMaxSize);
+        Assert.Null(aimd.OnTick(m, Stats(m), null));
+    }
+
+    [Fact]
+    public async Task Aimd_CooldownHonoursLongerRetryAfter()
+    {
+        await using var m = NewMember();
+        var time = new ManualTime();
+        var aimd = new AimdPoolSizingStrategy(timeProvider: time);
+        aimd.GetInitialSize(m, 8);
+        aimd.OnOperationCompleted(m, Throttle(ThrottleReason.ConcurrentRequests, TimeSpan.FromSeconds(60)));
+
+        time.Advance(TimeSpan.FromSeconds(45));
+        Assert.Null(aimd.OnTick(m, Stats(m), null));
+        time.Advance(TimeSpan.FromSeconds(20));
+        Assert.NotNull(aimd.OnTick(m, Stats(m), null));
+    }
+
+    [Fact]
+    public void Aimd_InvalidOptions_Throw()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => new AimdPoolSizingStrategy(new AimdPoolSizingStrategyOptions { DecreaseFactor = 1.0 }));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new AimdPoolSizingStrategy(new AimdPoolSizingStrategyOptions { IncreaseStep = 0 }));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new AimdPoolSizingStrategy(new AimdPoolSizingStrategyOptions { MinSize = 5, Ceiling = 3 }));
+    }
+
+    // ----- DopHint / Fixed -----
+
+    [Fact]
+    public async Task DopHint_NoHintObserved_HasNoOpinion()
+    {
+        await using var m = NewMember();
+        var s = new DopHintPoolSizingStrategy();
+        Assert.Equal(8, s.GetInitialSize(m, 8));
+        Assert.Null(s.OnTick(m, Stats(m), null));
+    }
+
+    [Fact]
+    public void DopHint_InvalidOptions_Throw()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => new DopHintPoolSizingStrategy(new DopHintPoolSizingStrategyOptions { Multiplier = 0 }));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new DopHintPoolSizingStrategy(new DopHintPoolSizingStrategyOptions { Floor = 4, Ceiling = 2 }));
+    }
+
+    [Fact]
+    public async Task Fixed_ReturnsConfiguredSize_AndNeverDecides()
+    {
+        await using var m = NewMember();
+        IPoolSizingStrategy s = new FixedPoolSizingStrategy();
+        Assert.Equal(8, s.GetInitialSize(m, 8));
+        Assert.Null(s.OnOperationCompleted(m, Throttle(ThrottleReason.ConcurrentRequests)));
+        Assert.Null(s.OnTick(m, Stats(m), null));
+    }
+
+    // ----- Composite -----
+
+    private sealed class Scripted(int initial) : IPoolSizingStrategy
+    {
+        public int? NextOnOp;
+        public int? NextOnTick;
+        public int GetInitialSize(DataverseUserPool member, int configuredMaxSize) => initial;
+        public PoolSizingDecision? OnOperationCompleted(DataverseUserPool member, PoolSizingOperationOutcome outcome) =>
+            NextOnOp is { } v ? new PoolSizingDecision(v) : null;
+        public PoolSizingDecision? OnTick(DataverseUserPool member, PoolStats currentStats, PoolSizingDecision? lastDecision) =>
+            NextOnTick is { } v ? new PoolSizingDecision(v) : null;
+    }
+
+    [Fact]
+    public async Task Composite_Min_RemembersSilentChildsEarlierVote()
+    {
+        await using var m = NewMember();
+        var low = new Scripted(8);
+        var high = new Scripted(8);
+        var c = new CompositePoolSizingStrategy(low, high);
+        Assert.Equal(8, c.GetInitialSize(m, 8));
+
+        low.NextOnOp = 3;
+        Assert.Equal(3, c.OnOperationCompleted(m, Throttle(ThrottleReason.ConcurrentRequests))?.TargetMaxSize);
+
+        low.NextOnOp = null;
+        high.NextOnTick = 6;
+        Assert.Equal(3, c.OnTick(m, Stats(m), null)?.TargetMaxSize);
+    }
+
+    [Fact]
+    public async Task Composite_Max_TakesLargest_AndNoOpinionYieldsNull()
+    {
+        await using var m = NewMember();
+        var a = new Scripted(4);
+        var b = new Scripted(6);
+        var c = new CompositePoolSizingStrategy(new IPoolSizingStrategy[] { a, b }, PoolSizingCombineMode.Max);
+        Assert.Equal(6, c.GetInitialSize(m, 8));
+        Assert.Null(c.OnTick(m, Stats(m), null));
+        a.NextOnTick = 9;
+        Assert.Equal(9, c.OnTick(m, Stats(m), null)?.TargetMaxSize);
+    }
+
+    [Fact]
+    public void Composite_RequiresChildren() =>
+        Assert.Throws<ArgumentException>(() => new CompositePoolSizingStrategy(Array.Empty<IPoolSizingStrategy>()));
+
+    // ----- Controller / pool wiring -----
+
+    [Fact]
+    public async Task Controller_AppliesDecisions_ClampedToFloorAndCeiling()
+    {
+        await using var m = NewMember(maxSize: 8);
+        var s = new Scripted(8);
+        using var controller = new PoolSizingController(new[] { m }, new PoolSizingOptions { Strategy = s, MinSizeFloor = 2, MaxSizeCeiling = 10 });
+
+        s.NextOnOp = 1;
+        controller.Record(m, Throttle(ThrottleReason.ConcurrentRequests));
+        Assert.Equal(2, m.MaxSize);
+
+        s.NextOnOp = 99;
+        controller.Record(m, Throttle(ThrottleReason.ConcurrentRequests));
+        Assert.Equal(10, m.MaxSize);
+    }
+
+    [Fact]
+    public async Task Controller_InitialSizeIsApplied_AndTickDrivesStrategy()
+    {
+        await using var m = NewMember(maxSize: 8);
+        var s = new Scripted(5);
+        using var controller = new PoolSizingController(new[] { m }, new PoolSizingOptions { Strategy = s });
+        Assert.Equal(5, m.MaxSize);
+
+        s.NextOnTick = 7;
+        controller.Tick();
+        Assert.Equal(7, m.MaxSize);
+    }
+
+    [Fact]
+    public async Task Controller_FaultyStrategyOnTick_DoesNotThrow()
+    {
+        await using var m = NewMember();
+        using var controller = new PoolSizingController(new[] { m }, new PoolSizingOptions { Strategy = new Throwing() });
+        controller.Tick();
+    }
+
+    private sealed class Throwing : IPoolSizingStrategy
+    {
+        public int GetInitialSize(DataverseUserPool member, int configuredMaxSize) => configuredMaxSize;
+        public PoolSizingDecision? OnTick(DataverseUserPool member, PoolStats currentStats, PoolSizingDecision? lastDecision) =>
+            throw new InvalidOperationException("boom");
+    }
+
+    [Fact]
+    public async Task Pool_WithFixedOrNoOptions_HasNoSink_AndAimdHasOne()
+    {
+        var a = NewMember("a");
+        await using var none = new DataversePool(a);
+        Assert.Null(none.SizingSink);
+
+        var b = NewMember("b");
+        await using var fixedPool = new DataversePool(b, sizingOptions: new PoolSizingOptions());
+        Assert.Null(fixedPool.SizingSink);
+
+        var c = NewMember("c");
+        await using var aimd = new DataversePool(c, sizingOptions: new PoolSizingOptions { Strategy = new AimdPoolSizingStrategy() });
+        Assert.NotNull(aimd.SizingSink);
+    }
+
+    [Fact]
+    public void Options_Validate_RejectsBadValues()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => new PoolSizingOptions { TickInterval = TimeSpan.Zero }.Validate());
+        Assert.Throws<ArgumentOutOfRangeException>(() => new PoolSizingOptions { MinSizeFloor = 0 }.Validate());
+        Assert.Throws<ArgumentOutOfRangeException>(() => new PoolSizingOptions { MinSizeFloor = 4, MaxSizeCeiling = 2 }.Validate());
+    }
+
+    // ----- Throttle reason decoding -----
+
+    private static FaultException<OrganizationServiceFault> Fault(uint code) =>
+        new(new OrganizationServiceFault { ErrorCode = unchecked((int)code) }, "fault");
+
+    [Theory]
+    [InlineData(0x80072322u, ThrottleReason.RequestCount)]
+    [InlineData(0x80072321u, ThrottleReason.ExecutionTime)]
+    [InlineData(0x80072326u, ThrottleReason.ConcurrentRequests)]
+    public void ThrottleReason_SoapFaultCodes_AreDecoded(uint code, ThrottleReason expected)
+    {
+        Assert.True(DataverseThrottleDetector.TryGetThrottleReason(Fault(code), out var reason));
+        Assert.Equal(expected, reason);
+    }
+
+    [Theory]
+    [InlineData("Number of requests exceeded the limit of 6000", ThrottleReason.RequestCount)]
+    [InlineData("Combined execution time exceeded the limit", ThrottleReason.ExecutionTime)]
+    [InlineData("Number of concurrent requests exceeded the limit of 52", ThrottleReason.ConcurrentRequests)]
+    [InlineData("something else", ThrottleReason.Unknown)]
+    public void ThrottleReason_WebApi429_IsDecodedFromMessage(string message, ThrottleReason expected)
+    {
+        var ex = new HttpOperationException(message)
+        {
+            Response = new HttpResponseMessageWrapper(new HttpResponseMessage((HttpStatusCode)429), content: null),
+        };
+        Assert.True(DataverseThrottleDetector.TryGetThrottleReason(ex, out var reason));
+        Assert.Equal(expected, reason);
+    }
+
+    [Fact]
+    public void ThrottleReason_NonThrottle_ReturnsFalse() =>
+        Assert.False(DataverseThrottleDetector.TryGetThrottleReason(new InvalidOperationException(), out _));
+}

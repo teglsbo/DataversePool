@@ -22,6 +22,7 @@ public sealed class DataversePool : IAsyncDisposable
     private readonly IReadOnlyList<DataverseUserPool> _members;
     private readonly ISlotSelectionStrategy _strategy;
     private readonly AllUnavailableBehavior _allUnavailableBehavior;
+    private readonly PoolSizingController? _sizing;
 
     /// <param name="members">The member pools, one per Dataverse application/service user.</param>
     /// <param name="strategy">Member selection; defaults to <see cref="HealthAwareRoundRobinSlotSelectionStrategy"/>.</param>
@@ -29,13 +30,17 @@ public sealed class DataversePool : IAsyncDisposable
     /// <param name="metricsOptions">Optional operation-metrics settings (the <c>pool.name</c> tag) for
     /// <see cref="ExecuteWithThrottleRetryAsync{T}(string, Func{ServiceClient, CancellationToken, Task{T}}, int?, TimeSpan?, CancellationToken)"/>
     /// and any <see cref="PooledOrganizationService"/> wrapping this pool. See docs/adr/0024.</param>
+    /// <param name="sizingOptions">Optional automatic member sizing (docs/adr/0026). Omitted, or a
+    /// <see cref="FixedPoolSizingStrategy"/>, keeps every member's configured size.</param>
     public DataversePool(
         IEnumerable<DataverseUserPool> members,
         ISlotSelectionStrategy? strategy = null,
         AllUnavailableBehavior allUnavailableBehavior = AllUnavailableBehavior.FailOpen,
-        DataverseOperationMetricsOptions? metricsOptions = null)
+        DataverseOperationMetricsOptions? metricsOptions = null,
+        PoolSizingOptions? sizingOptions = null)
     {
         metricsOptions?.Validate();
+        sizingOptions?.Validate();
         MetricsPoolName = metricsOptions?.PoolName ?? DataverseOperationMetricsOptions.DefaultPoolName;
         _members = members?.ToArray() ?? throw new ArgumentNullException(nameof(members));
         if (_members.Count == 0)
@@ -45,7 +50,13 @@ public sealed class DataversePool : IAsyncDisposable
 
         _strategy = strategy ?? new HealthAwareRoundRobinSlotSelectionStrategy();
         _allUnavailableBehavior = allUnavailableBehavior;
+        if (sizingOptions is not null && sizingOptions.Strategy is not FixedPoolSizingStrategy)
+        {
+            _sizing = new PoolSizingController(_members, sizingOptions);
+        }
     }
+
+    internal IOperationOutcomeSink? SizingSink => _sizing;
 
     /// <summary>Convenience constructor for the common single-member case - equivalent to
     /// <c>new DataversePool(new[] { member }, strategy, allUnavailableBehavior)</c>. Prefer this
@@ -55,8 +66,9 @@ public sealed class DataversePool : IAsyncDisposable
         DataverseUserPool member,
         ISlotSelectionStrategy? strategy = null,
         AllUnavailableBehavior allUnavailableBehavior = AllUnavailableBehavior.FailOpen,
-        DataverseOperationMetricsOptions? metricsOptions = null)
-        : this(new[] { member ?? throw new ArgumentNullException(nameof(member)) }, strategy, allUnavailableBehavior, metricsOptions)
+        DataverseOperationMetricsOptions? metricsOptions = null,
+        PoolSizingOptions? sizingOptions = null)
+        : this(new[] { member ?? throw new ArgumentNullException(nameof(member)) }, strategy, allUnavailableBehavior, metricsOptions, sizingOptions)
     {
     }
 
@@ -258,11 +270,13 @@ public sealed class DataversePool : IAsyncDisposable
             (lease, ct) => operation(lease.Resource, ct),
             attempts,
             maxRetryAfter,
-            cancellationToken).ConfigureAwait(false);
+            cancellationToken,
+            _sizing).ConfigureAwait(false);
     }
 
     public async ValueTask DisposeAsync()
     {
+        _sizing?.Dispose();
         foreach (var member in _members)
         {
             await member.DisposeAsync().ConfigureAwait(false);

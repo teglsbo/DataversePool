@@ -121,6 +121,87 @@ public class DataverseOperationExecutorTests
 
     private static OperationMetricsScope Uninstrumented() => new(NewRecorder(), "pool-x", "op");
 
+    // ----- Pool-sizing outcome sink (docs/adr/0026) -----
+
+    private sealed class CapturingSink(bool throws = false) : IOperationOutcomeSink
+    {
+        public List<(object Member, PoolSizingOperationOutcome Outcome)> Recorded { get; } = new();
+
+        public void Record(object member, PoolSizingOperationOutcome outcome)
+        {
+            Recorded.Add((member, outcome));
+            if (throws)
+            {
+                throw new InvalidOperationException("sink failure");
+            }
+        }
+    }
+
+    [Fact]
+    public async Task Sink_ReceivesSuccessAndThrottledAttempts_WithoutAMetricsListener()
+    {
+        var member = new FakeMember("m");
+        var sink = new CapturingSink();
+        var calls = 0;
+
+        var result = await DataverseOperationExecutor.ExecuteAsync(
+            Uninstrumented(),
+            Accessors,
+            Sequence(new FakeLease(member), new FakeLease(new FakeMember("other"))),
+            (FakeLease _, CancellationToken _) =>
+                ++calls == 1 ? throw new FakeThrottleException(TimeSpan.Zero) : Task.FromResult(7),
+            maxAttempts: 2,
+            maxRetryAfter: null,
+            CancellationToken.None,
+            sink);
+
+        Assert.Equal(7, result);
+        Assert.Equal(2, sink.Recorded.Count);
+        Assert.Equal(PoolSizingOutcomeKind.Throttled, sink.Recorded[0].Outcome.Outcome);
+        Assert.Equal(ThrottleReason.Unknown, sink.Recorded[0].Outcome.ThrottleReason);
+        Assert.Same(member, sink.Recorded[0].Member);
+        Assert.Equal(PoolSizingOutcomeKind.Success, sink.Recorded[1].Outcome.Outcome);
+        Assert.Equal("op", sink.Recorded[1].Outcome.OperationName);
+    }
+
+    [Fact]
+    public async Task Sink_ClassifiesErrorAndCanceled()
+    {
+        var sink = new CapturingSink();
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => DataverseOperationExecutor.ExecuteAsync(
+            Uninstrumented(), Accessors, Sequence(new FakeLease(new FakeMember("m"))),
+            (FakeLease _, CancellationToken _) => Task.FromException<int>(new InvalidOperationException()),
+            1, null, CancellationToken.None, sink));
+
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => DataverseOperationExecutor.ExecuteAsync(
+            Uninstrumented(), Accessors, Sequence(new FakeLease(new FakeMember("m"))),
+            (FakeLease _, CancellationToken ct) => Task.FromCanceled<int>(ct),
+            1, null, cts.Token, sink));
+
+        Assert.Equal(PoolSizingOutcomeKind.Error, sink.Recorded[0].Outcome.Outcome);
+        Assert.Equal(PoolSizingOutcomeKind.Canceled, sink.Recorded[1].Outcome.Outcome);
+    }
+
+    [Fact]
+    public async Task Sink_Throwing_NeverReplacesResultOrException()
+    {
+        var sink = new CapturingSink(throws: true);
+
+        var ok = await DataverseOperationExecutor.ExecuteAsync(
+            Uninstrumented(), Accessors, Sequence(new FakeLease(new FakeMember("m"))),
+            (FakeLease _, CancellationToken _) => Task.FromResult(1), 1, null, CancellationToken.None, sink);
+        Assert.Equal(1, ok);
+
+        var boom = new InvalidOperationException("original");
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(() => DataverseOperationExecutor.ExecuteAsync(
+            Uninstrumented(), Accessors, Sequence(new FakeLease(new FakeMember("m"))),
+            (FakeLease _, CancellationToken _) => Task.FromException<int>(boom), 1, null, CancellationToken.None, sink));
+        Assert.Same(boom, thrown);
+    }
+
     // ----- Connection-fault health signal (PLAN Phase 3 item 6) -----
 
     [Fact]

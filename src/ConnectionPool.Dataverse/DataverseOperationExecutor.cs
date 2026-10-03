@@ -24,6 +24,12 @@ internal sealed class LeaseAccessors<TLease>(
     public Func<TLease, Exception, bool>? ReportIfConnectionFault { get; } = reportIfConnectionFault;
 }
 
+/// <summary>Receives each completed attempt (with the serving member) for automatic pool sizing.</summary>
+internal interface IOperationOutcomeSink
+{
+    void Record(object member, PoolSizingOperationOutcome outcome);
+}
+
 internal static class DataverseLeaseAccessors
 {
     public static readonly LeaseAccessors<DataverseLease> Instance = new(
@@ -61,7 +67,8 @@ internal static class DataverseOperationExecutor
         Func<TLease, CancellationToken, Task<TResult>> operation,
         int maxAttempts,
         TimeSpan? maxRetryAfter,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        IOperationOutcomeSink? sink = null)
         where TLease : IAsyncDisposable
     {
         var recorder = scope.Recorder;
@@ -100,6 +107,10 @@ internal static class DataverseOperationExecutor
                 if (enabled)
                 {
                     recorder.ActiveChanged(scope, memberName, +1);
+                }
+
+                if (enabled || sink is not null)
+                {
                     attemptStart = Stopwatch.GetTimestamp();
                 }
 
@@ -111,6 +122,8 @@ internal static class DataverseOperationExecutor
                         recorder.AttemptCompleted(scope, memberName, attemptStart, DataverseOperationMetrics.OutcomeSuccess, exception: null);
                     }
 
+                    TryRecordOutcome(sink, accessors, lease, scope, attemptStart, PoolSizingOutcomeKind.Success, null, null);
+
                     return result;
                 }
                 catch (Exception ex)
@@ -119,6 +132,16 @@ internal static class DataverseOperationExecutor
                     if (!throttled && !cancellationToken.IsCancellationRequested)
                     {
                         TryReportConnectionFault(accessors, lease, ex);
+                    }
+
+                    if (sink is not null)
+                    {
+                        var kind = throttled
+                            ? PoolSizingOutcomeKind.Throttled
+                            : DataverseOperationRecorder.ClassifyFailure(ex, cancellationToken) == DataverseOperationMetrics.OutcomeCanceled
+                                ? PoolSizingOutcomeKind.Canceled
+                                : PoolSizingOutcomeKind.Error;
+                        TryRecordOutcome(sink, accessors, lease, scope, attemptStart, kind, throttled ? ex : null, throttled ? retryAfter : null);
                     }
 
                     if (enabled)
@@ -191,7 +214,8 @@ internal static class DataverseOperationExecutor
         Func<TLease, CancellationToken, Task> operation,
         int maxAttempts,
         TimeSpan? maxRetryAfter,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        IOperationOutcomeSink? sink = null)
         where TLease : IAsyncDisposable =>
         ExecuteAsync<TLease, bool>(
             scope,
@@ -204,7 +228,42 @@ internal static class DataverseOperationExecutor
             },
             maxAttempts,
             maxRetryAfter,
-            cancellationToken);
+            cancellationToken,
+            sink);
+
+    /// <summary>Sizing feedback must never replace the operation's own result or exception.</summary>
+    private static void TryRecordOutcome<TLease>(
+        IOperationOutcomeSink? sink,
+        LeaseAccessors<TLease> accessors,
+        TLease lease,
+        OperationMetricsScope scope,
+        long attemptStart,
+        PoolSizingOutcomeKind kind,
+        Exception? throttle,
+        TimeSpan? retryAfter)
+    {
+        if (sink is null)
+        {
+            return;
+        }
+
+        try
+        {
+            ThrottleReason? reason = null;
+            if (throttle is not null)
+            {
+                reason = DataverseThrottleDetector.TryGetThrottleReason(throttle, out var r) ? r : ThrottleReason.Unknown;
+            }
+
+            sink.Record(
+                accessors.Member(lease),
+                new PoolSizingOperationOutcome(scope.OperationName, Stopwatch.GetElapsedTime(attemptStart), kind, reason, retryAfter, InFlightCount: 0));
+        }
+        catch
+        {
+            // intentionally ignored
+        }
+    }
 
     private static Task<TLease> AcquireAsync<TLease>(
         OperationMetricsScope scope,

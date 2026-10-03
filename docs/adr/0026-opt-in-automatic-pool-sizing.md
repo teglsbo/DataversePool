@@ -1,0 +1,58 @@
+# ADR-0026: Opt-in automatic pool sizing via `IPoolSizingStrategy`
+
+## Status
+Accepted. `Fixed` (default), `DopHint`, `Aimd` and `Composite` are implemented. `Gradient`, the
+window-budget pacer and BBR-style probing are **not**.
+
+## Context
+
+ADR-0025 made `DataverseUserPool.MaxSize` adjustable at runtime. `docs/research/autoscaling.md` §9
+designed a pluggable decision interface on top of it. Dataverse has three independent service
+protection limits and only one of them is a concurrency problem, so a controller must know *which*
+limit fired before it shrinks anything.
+
+## Decision
+
+- `IPoolSizingStrategy` is a pure decision interface, like `ISlotSelectionStrategy`. It returns a
+  `PoolSizingDecision`; it never calls `SetMaxSize`.
+- `DataversePool` takes an optional `PoolSizingOptions`. A `PoolSizingController` is created only
+  when the strategy is not `FixedPoolSizingStrategy`, so the default path has no timer, no sink and
+  no per-call cost.
+- The controller feeds the strategy every completed attempt and a periodic tick, serializes calls
+  per member, clamps each decision to `MinSizeFloor` / `MaxSizeCeiling` (default 4x configured), and
+  calls `SetMaxSize` only on change. Shrinking stays graceful (ADR-0025). A throwing strategy on
+  tick is swallowed.
+- Attempts reach the controller through an internal `IOperationOutcomeSink` on the shared
+  `DataverseOperationExecutor`, from both `ExecuteWithThrottleRetryAsync` and
+  `PooledOrganizationService` over a `DataversePool`. The sink cannot alter the caller's result or
+  exception. `DataverseUserPool` facades and a single `DataverseUserPool` are not sized.
+- The throttle reason is decoded by `DataverseThrottleDetector.TryGetThrottleReason`. SOAP faults
+  are exact (0x80072322 request count, 0x80072321 execution time, 0x80072326 concurrent requests).
+  A Web API 429 is decoded best-effort from the message and body text; this is **not verified
+  live**, and anything unrecognized is `Unknown`.
+
+### Deviations from the §9.2 sketch
+
+- `GetInitialSize(member, configuredMaxSize)`: a member does not expose its `PoolOptions`.
+- `OnOperationCompleted` returns `PoolSizingDecision?` so a reaction can be immediate.
+- Pacing fields on the decision exist but are ignored: no pacer consumes them yet.
+- `TrickleMinSize` is not implemented.
+
+### Strategy behaviour
+
+- `Aimd` halves only on `ConcurrentRequests`. A `DecreaseHoldoff` (10 s) ignores the burst of
+  in-flight throttles that follow one congestion event, otherwise one event would collapse the
+  size. Regrowth is +1 per tick after `max(CooldownAfterThrottle, Retry-After)`. Request-count,
+  execution-time and unknown throttles never change the size.
+- `DopHint` follows `RecommendedDegreesOfParallelism` on tick and has no opinion until a hint exists.
+- `Composite` keeps each child's latest vote per member and combines with `Min` (default) or `Max`,
+  so a silent child does not lose its earlier, lower vote.
+
+## Consequences
+
+- Strictly opt-in; existing behaviour is unchanged without options.
+- Per-user throttling means each member is sized from its own throttles only.
+- Unit-tested with a fake clock; no live test, since ExecutionTime throttling has never been
+  reproduced and concurrency throttling needs sustained load.
+- Recommended for production only after observing it with the ADR-0024 metrics on a non-critical
+  tenant.

@@ -1039,6 +1039,11 @@ without a code fork).
 
 ### 9.2 Proposed interface: `IPoolSizingStrategy`
 
+> **Status:** implemented for `Fixed`, `DopHint`, `Aimd` and `Composite` (`docs/adr/0026`). Deviations
+> from the sketch below: `GetInitialSize` also takes the configured max size, `OnOperationCompleted`
+> returns the decision, the pacing fields are ignored, and `Aimd` has a decrease holdoff but no
+> probing. `Gradient`, the pacer and `TrickleMinSize` are still open.
+
 Named and shaped to sit next to `ISlotSelectionStrategy`, with the same conventions: an
 XML-doc-driven interface in `ConnectionPool.Dataverse`, default-interface-method no-ops for
 callbacks most implementations won't need, and ADR cross-references once an ADR is written for it.

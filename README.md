@@ -568,6 +568,26 @@ Two limits to know:
 
 See [ADR-0024](docs/adr/0024-operation-level-metrics-on-instrumented-execution-paths.md).
 
+### Optional: automatic pool sizing (experimental)
+
+By default every member keeps its configured `PoolOptions.MaxSize`. Pass `PoolSizingOptions` to a
+`DataversePool` to size members at runtime:
+
+```csharp
+var pool = new DataversePool(members, sizingOptions: new PoolSizingOptions
+{
+    Strategy = new CompositePoolSizingStrategy(
+        new DopHintPoolSizingStrategy(),   // follow Dataverse's x-ms-dop-hint
+        new AimdPoolSizingStrategy()),     // halve on concurrent-request throttles, regrow slowly
+    MinSizeFloor = 2,
+});
+```
+
+Only concurrent-request throttles shrink a member; request-count and execution-time throttles are
+rate budgets that a smaller pool does not fix. Sizing sees calls made through
+`ExecuteWithThrottleRetryAsync` and `PooledOrganizationService` over a `DataversePool`. Watch the
+metrics above before relying on it. See [ADR-0026](docs/adr/0026-opt-in-automatic-pool-sizing.md).
+
 ## Optional: Drop-in `IOrganizationServiceAsync` facade
 
 If your codebase already has code built around a constructor-injected `IOrganizationServiceAsync`/

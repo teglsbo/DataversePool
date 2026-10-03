@@ -112,6 +112,63 @@ public static class DataverseThrottleDetector
         return false;
     }
 
+    /// <summary>
+    /// Decodes <i>which</i> service-protection limit an exception reports (<see cref="ThrottleReason"/>).
+    /// A SOAP fault is decoded exactly from its error code. A Web API 429 carries the code/message in
+    /// its body, so it is decoded best-effort from the response text and message (the three hex codes
+    /// or Dataverse's wording) - not yet verified live; anything unrecognized is
+    /// <see cref="ThrottleReason.Unknown"/>. Returns <c>false</c> if the exception is not a throttle at
+    /// all. Does not apply the <c>Retry-After</c> cap, so it never throws on a bad one.
+    /// </summary>
+    public static bool TryGetThrottleReason(Exception? exception, out ThrottleReason reason)
+    {
+        for (var ex = exception; ex is not null; ex = ex.InnerException)
+        {
+            if (ex is FaultException<OrganizationServiceFault> faultEx &&
+                ThrottlingFaultErrorCodes.Contains(faultEx.Detail.ErrorCode))
+            {
+                reason = faultEx.Detail.ErrorCode switch
+                {
+                    unchecked((int)0x80072322) => ThrottleReason.RequestCount,
+                    unchecked((int)0x80072321) => ThrottleReason.ExecutionTime,
+                    _ => ThrottleReason.ConcurrentRequests,
+                };
+                return true;
+            }
+
+            if (ex is HttpOperationException httpEx && IsThrottlingStatusCode(httpEx.Response?.StatusCode))
+            {
+                reason = DecodeFromText(httpEx.Message + " " + httpEx.Response?.Content);
+                return true;
+            }
+        }
+
+        reason = default;
+        return false;
+    }
+
+    private static ThrottleReason DecodeFromText(string text)
+    {
+        bool Has(string marker) => text.Contains(marker, StringComparison.OrdinalIgnoreCase);
+
+        if (Has("80072326") || Has("concurrent requests"))
+        {
+            return ThrottleReason.ConcurrentRequests;
+        }
+
+        if (Has("80072321") || Has("combined execution time"))
+        {
+            return ThrottleReason.ExecutionTime;
+        }
+
+        if (Has("80072322") || Has("number of requests"))
+        {
+            return ThrottleReason.RequestCount;
+        }
+
+        return ThrottleReason.Unknown;
+    }
+
     private static bool IsThrottlingStatusCode(System.Net.HttpStatusCode? statusCode) =>
         statusCode.HasValue && (int)statusCode.Value == 429;
 

@@ -43,6 +43,7 @@ public sealed class PooledOrganizationService : IOrganizationServiceAsync2
     private readonly Func<CancellationToken, Task<DataverseLease>> _acquireLease;
     private readonly DataverseOperationRecorder _recorder;
     private readonly string _poolName;
+    private readonly IOperationOutcomeSink? _sizingSink;
 
     /// <summary>Wraps a multi-member <see cref="DataversePool"/>. Each call acquires a lease from
     /// whichever member the pool's <see cref="ISlotSelectionStrategy"/> selects - see
@@ -60,6 +61,7 @@ public sealed class PooledOrganizationService : IOrganizationServiceAsync2
         ArgumentNullException.ThrowIfNull(pool);
         metricsOptions?.Validate();
         _acquireLease = pool.AcquireAsync;
+        _sizingSink = pool.SizingSink;
         _recorder = recorder;
         _poolName = metricsOptions?.PoolName ?? pool.MetricsPoolName;
     }
@@ -93,7 +95,8 @@ public sealed class PooledOrganizationService : IOrganizationServiceAsync2
             (lease, _) => operation(lease.Resource),
             maxAttempts: 1,
             maxRetryAfter: null,
-            cancellationToken);
+            cancellationToken,
+            _sizingSink);
 
     private Task RunAsync(string operationName, Func<ServiceClient, Task> operation, CancellationToken cancellationToken) =>
         DataverseOperationExecutor.ExecuteAsync(
@@ -103,7 +106,8 @@ public sealed class PooledOrganizationService : IOrganizationServiceAsync2
             (lease, _) => operation(lease.Resource),
             maxAttempts: 1,
             maxRetryAfter: null,
-            cancellationToken);
+            cancellationToken,
+            _sizingSink);
 
     // ----- IOrganizationServiceAsync2 (cancellable) -----
 
