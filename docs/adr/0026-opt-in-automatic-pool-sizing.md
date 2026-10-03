@@ -91,6 +91,8 @@ response (`x-ms-ratelimit-burst-remaining-xrm-requests`, `x-ms-ratelimit-time-re
   assembly because correlation needs that executor hook.
 - The listener filter must admit `System.Net.Http.HttpRequestOut` as well as `.Stop`; the runtime
   checks the activity name before emitting `Stop`.
+- One process-wide, ref-counted listener serves all pools, so a response is delivered once even with
+  several observing pools. `ObservedAt` is stamped by the receiving controller's clock.
 - `DataversePool.GetResponseBudget(member)` returns the latest `ResponseBudget`.
 - If burst or time remaining falls to `LowBudgetFraction` (default 5 %) of the largest value seen,
   the member's pacer holds attempts for `LowBudgetBackoff` (default 5 s). It fails open afterwards.
@@ -98,4 +100,6 @@ response (`x-ms-ratelimit-burst-remaining-xrm-requests`, `x-ms-ratelimit-time-re
   is verified locally (`ResponseObservationLoadTests`).
 - Listener cost, measured on loopback (median of 5 rounds): about 139 us/call without the listener,
   160 us with it unattributed and 154 us attributed, so roughly 15-20 us per call. Real Dataverse calls
-  take tens of milliseconds, so this is negligible. Not verified: number formats on other locales.
+  take tens of milliseconds, so this is negligible. Numbers are parsed independently of the
+  current culture: `1,199.97` (as sent) and `1.199,97` are accepted, ambiguous values such as `1,5` are
+  ignored rather than guessed.

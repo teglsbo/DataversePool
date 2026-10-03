@@ -42,6 +42,22 @@ public class ResponseObservationTests
         Assert.Equal("abc", b.ServiceRequestId);
     }
 
+    [Theory]
+    [InlineData("1,199.97", 1199.97)]
+    [InlineData("1200", 1200.0)]
+    [InlineData("0.5", 0.5)]
+    [InlineData("1.199,97", 1199.97)]
+    [InlineData("1.200", 1.2)] // invariant is the server format, so this is not a thousands group
+    [InlineData("12,5", null)] // ambiguous, rejected rather than guessed
+    [InlineData("1,5", null)]
+    [InlineData("1,19.9", null)]
+    public void TryParse_NumberFormats_AreCultureIndependent(string raw, double? expected)
+    {
+        using var r = Response(("x-ms-ratelimit-time-remaining-xrm-requests", raw), ("x-ms-dop-hint", "4"));
+        ResponseObservation.TryParse(r, DateTimeOffset.UnixEpoch, out var b);
+        Assert.Equal(expected, b.TimeRemainingSeconds);
+    }
+
     [Fact]
     public void TryParse_NoRelevantHeaders_ReturnsFalse()
     {
@@ -112,6 +128,25 @@ public class ResponseObservationTests
         Assert.Same(member, seen.Member);
         Assert.Equal(123, seen.Budget.BurstRemainingRequests);
         Assert.Equal(6, seen.Budget.DopHint);
+        server.Stop();
+    }
+
+    [Fact]
+    public async Task TwoObservers_DeliverEachResponseOnce()
+    {
+        var port = Random.Shared.Next(20000, 40000);
+        var prefix = $"http://127.0.0.1:{port}/";
+        using var server = await StartServerAsync(prefix);
+        using var first = ResponseObservation.Start();
+        using var second = ResponseObservation.Start();
+        using var http = new HttpClient();
+        var sink = new CapturingSink();
+
+        ResponseObservation.Current.Value = new ResponseObservation.Target(sink, new object());
+        try { using var _ = await http.GetAsync(prefix); }
+        finally { ResponseObservation.Current.Value = null; }
+
+        Assert.Single(sink.Responses);
         server.Stop();
     }
 

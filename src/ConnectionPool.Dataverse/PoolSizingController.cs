@@ -40,7 +40,7 @@ internal sealed class PoolSizingController : IOperationOutcomeSink, IDisposable
 
         if (options.ObserveResponses)
         {
-            _observer = ResponseObservation.Start(options.TimeProvider);
+            _observer = ResponseObservation.Start();
         }
 
         _timer = options.TimeProvider.CreateTimer(_ => Tick(), null, options.TickInterval, options.TickInterval);
@@ -58,6 +58,7 @@ internal sealed class PoolSizingController : IOperationOutcomeSink, IDisposable
             return;
         }
 
+        budget = budget with { ObservedAt = _options.TimeProvider.GetUtcNow() };
         Volatile.Write(ref state.Budget, budget);
         var low = false;
         lock (state.Gate)

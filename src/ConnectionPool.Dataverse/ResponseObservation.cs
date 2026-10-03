@@ -36,12 +36,48 @@ internal static class ResponseObservation
 
     private static readonly ConcurrentDictionary<Type, PropertyInfo?> ResponseProperties = new();
 
-    /// <summary>Starts listening; dispose to stop. Safe to call more than once.</summary>
-    public static IDisposable Start(TimeProvider? time = null)
+    private static readonly object Gate = new();
+    private static Observer? _shared;
+    private static int _leases;
+
+    /// <summary>
+    /// Starts listening; dispose to stop. One process-wide listener is shared by all callers, so a response
+    /// is delivered once however many pools observe.
+    /// </summary>
+    public static IDisposable Start()
     {
-        var observer = new Observer(time ?? TimeProvider.System);
-        observer.Subscription = DiagnosticListener.AllListeners.Subscribe(observer);
-        return observer;
+        lock (Gate)
+        {
+            if (_leases++ == 0)
+            {
+                _shared = new Observer();
+                _shared.Subscription = DiagnosticListener.AllListeners.Subscribe(_shared);
+            }
+        }
+
+        return new Lease();
+    }
+
+    private sealed class Lease : IDisposable
+    {
+        private int _disposed;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            {
+                return;
+            }
+
+            lock (Gate)
+            {
+                if (--_leases == 0)
+                {
+                    _shared?.Dispose();
+                    _shared = null;
+                }
+            }
+        }
     }
 
     internal static bool TryParse(HttpResponseMessage response, DateTimeOffset observedAt, out ResponseBudget budget)
@@ -57,18 +93,31 @@ internal static class ResponseObservation
     private static string? ReadRaw(HttpResponseMessage response, string name) =>
         response.Headers.TryGetValues(name, out var values) ? values.FirstOrDefault() : null;
 
-    // The server formats numbers like "1,199.97"; fall back to the current culture for other formats.
+    private static readonly NumberFormatInfo CommaDecimal = new() { NumberDecimalSeparator = ",", NumberGroupSeparator = "." };
+
+    private static readonly System.Text.RegularExpressions.Regex InvariantShape =
+        new(@"^-?(\d{1,3}(,\d{3})+|\d+)(\.\d+)?$", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    private static readonly System.Text.RegularExpressions.Regex CommaDecimalShape =
+        new(@"^-?\d{1,3}(\.\d{3})+,\d+$", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    // The server sends "1,199.97". Culture-independent: a value is read as invariant only if its separators are
+    // well-formed, otherwise as grouped comma-decimal ("1.199,97"). Anything else, such as "1,5", is rejected, not guessed.
     private static double? ReadDouble(HttpResponseMessage response, string name)
     {
-        var raw = ReadRaw(response, name);
-        if (string.IsNullOrWhiteSpace(raw))
+        var raw = ReadRaw(response, name)?.Trim();
+        if (string.IsNullOrEmpty(raw))
         {
             return null;
         }
 
         const NumberStyles styles = NumberStyles.Float | NumberStyles.AllowThousands;
-        if (double.TryParse(raw, styles, CultureInfo.InvariantCulture, out var v) ||
-            double.TryParse(raw, styles, CultureInfo.CurrentCulture, out v))
+        if (InvariantShape.IsMatch(raw) && double.TryParse(raw, styles, CultureInfo.InvariantCulture, out var v))
+        {
+            return v;
+        }
+
+        if (CommaDecimalShape.IsMatch(raw) && double.TryParse(raw, styles, CommaDecimal, out v))
         {
             return v;
         }
@@ -76,7 +125,7 @@ internal static class ResponseObservation
         return null;
     }
 
-    private sealed class Observer(TimeProvider time) : IObserver<DiagnosticListener>, IObserver<KeyValuePair<string, object?>>, IDisposable
+    private sealed class Observer : IObserver<DiagnosticListener>, IObserver<KeyValuePair<string, object?>>, IDisposable
     {
         private IDisposable? _handlerSubscription;
         public IDisposable? Subscription;
@@ -102,7 +151,7 @@ internal static class ResponseObservation
             {
                 var property = ResponseProperties.GetOrAdd(evt.Value.GetType(), static t => t.GetProperty("Response"));
                 if (property?.GetValue(evt.Value) is HttpResponseMessage response &&
-                    TryParse(response, time.GetUtcNow(), out var budget))
+                    TryParse(response, DateTimeOffset.UtcNow, out var budget))
                 {
                     target.Sink.OnResponse(target.Member, budget);
                 }
