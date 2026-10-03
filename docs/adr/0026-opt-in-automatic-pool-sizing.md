@@ -98,6 +98,9 @@ response (`x-ms-ratelimit-burst-remaining-xrm-requests`, `x-ms-ratelimit-time-re
   the member's pacer holds attempts for `LowBudgetBackoff` (default 5 s). It fails open afterwards.
 - Verified live (`LiveResponseBudgetTests`). Attribution under 2,200 concurrent calls across 50 members
   is verified locally (`ResponseObservationLoadTests`).
+- Live, two app users, 300 concurrent SOAP and Web API calls (`TwoMembers_UnderLoad_EachGetsItsOwnBudget`):
+  each member's burst budget fell from 8000 to 7845 and 7850, which matches about 150 calls each, so
+  budgets are per user and attributed correctly.
 - Listener cost, measured on loopback (median of 5 rounds): about 139 us/call without the listener,
   160 us with it unattributed and 154 us attributed, so roughly 15-20 us per call. Real Dataverse calls
   take tens of milliseconds, so this is negligible. Numbers are parsed independently of the
