@@ -121,8 +121,17 @@ response (`x-ms-ratelimit-burst-remaining-xrm-requests`, `x-ms-ratelimit-time-re
 - Still unseen live: an `ExecutionTime` throttle, so that pacer remains unit-tested only.
 
 ### Addendum: backend node and budget
-- `ResponseBudget.ServerId` is the last part of `X-Source` (the backend node), logged for diagnostics; the soak CSV
-  records it per member (`a_server_no`, `b_server_no`, `servers_seen`).
+- `X-Source` is sent as two header values; the first is constant, the last identifies the node. `ResponseBudget.ServerId`
+  is the last value (then the last `|` part). `GetServerNodeStats` gives per-node response counts and burst range;
+  the soak report has a "Backend nodes" section and `a_nodes`/`b_nodes` CSV columns.
+- A 4-minute soak saw about 15 nodes per identity, all with the same burst range (about 6165-7337).
+- Pinned drain test (`LiveNodeBudgetScopeTests`, opt-in `DVPOOL_IT_NODESCOPE=1`): the affinity cookie did not hold under
+  16 concurrent workers (about 87% of calls reached other nodes), yet the `RequestCount` 429 came after 7677 calls
+  although the pinned node answered only about 1000. Calls across nodes exhaust one budget: per user in this sandbox.
+- Microsoft documents the limits as enforced per user per web server ("each web server ... enforces these limits
+  independently"), with defaults of 6000 requests / 20 min execution time / 52+ concurrent. The burst header is
+  documented as "remaining requests for this connection", for debugging only, and resetting when the server changes.
+  `X-Source` is undocumented, so it may not be a web server. Do not assume more nodes means more budget.
 - `ARRAffinity` identifies the node, but only when the client sends it back; the pool disables affinity cookies, so
   without one each response got a fresh value. With a pinned cookie, a series stays on one `X-Source` node.
 - Three pinned series run one after another gave burst remaining 7959..7940, 7939..7920, 7919..7900: one
