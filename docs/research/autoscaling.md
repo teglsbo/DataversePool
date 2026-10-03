@@ -1272,7 +1272,7 @@ phased, not a single release:
 This phasing applies regardless of which strategies are ultimately implemented: it is a statement
 about evidence sequencing, not about algorithm preference.
 
-### 9.6 Member-selection health model (proposal — not implemented)
+### 9.6 Member-selection health model (items 1–4 implemented; see Status)
 
 Companion to §9.2's *sizing* strategies: this is about `ISlotSelectionStrategy` (which member serves
 the next acquire). Today's `LeastConnections`/`HealthAwareRoundRobin` treat health as binary —
@@ -1316,7 +1316,11 @@ path only; unknown means transient) makes `DataverseUserPool.AcquireAsync` quara
 `QuarantineDuration` (default 10 min), logging once at error level. All three health-aware strategies
 skip quarantined members (still failing open if every member is unavailable); `ClearQuarantine()` is the
 operator reset; the `dataversepool.member.quarantined` gauge carries a `quarantine_reason` tag. Not done:
-quarantine from the *operational* path (`MarkUnhealthy`), and item (3)'s post-probe ramp.
+quarantine from the *operational* path (`MarkUnhealthy`).
+Item (3) is implemented: `MemberCircuitBreaker` records when a circuit closes after being open
+(`GetRecoveredAt`), and `HealthWeightedLeastConnectionsSlotSelectionStrategy` applies the same
+`rampStart`/`rampStepInterval` slow-start from that instant (the tighter of the throttle and recovery
+ramps wins).
 
 ## 10. Configurable settings proposal
 

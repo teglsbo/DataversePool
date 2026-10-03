@@ -19,6 +19,9 @@ namespace ConnectionPool.Dataverse;
 /// <see cref="RampStart"/> and grows by one every <see cref="RampStepInterval"/> until it reaches the
 /// full cap. A new throttle moves <c>ThrottledUntil</c> forward and so restarts the ramp. Stateless:
 /// derived from <c>ThrottledUntil</c> alone.</description></item>
+/// <item><description><c>rampCap</c> (slow-start after recovery): the same ramp restarts from
+/// <see cref="MemberCircuitBreaker.GetRecoveredAt"/> when a circuit-open member's half-open probe
+/// succeeds, so it is not given a full share the instant it closes.</description></item>
 /// </list>
 ///
 /// The ramp is a <b>ranking preference, not a hard limit</b>: a member over its cap just scores
@@ -101,7 +104,11 @@ public sealed class HealthWeightedLeastConnectionsSlotSelectionStrategy : ISlotS
             cap = Math.Min(cap, hint);
         }
 
-        return Math.Max(1, ComputeRampCap(member.ThrottledUntil, now, RampStart, RampStepInterval, cap));
+        cap = ComputeRampCap(member.ThrottledUntil, now, RampStart, RampStepInterval, cap);
+
+        // Same slow-start after a half-open probe succeeds: a just-recovered member isn't handed a full share.
+        cap = ComputeRampCap(_breaker.GetRecoveredAt(member), now, RampStart, RampStepInterval, cap);
+        return Math.Max(1, cap);
     }
 
     public SlotSelection SelectNext(IReadOnlyList<DataverseUserPool> members, IReadOnlyList<PoolStats> memberStats)

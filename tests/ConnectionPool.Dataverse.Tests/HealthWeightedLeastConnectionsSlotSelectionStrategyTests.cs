@@ -104,6 +104,33 @@ public class HealthWeightedLeastConnectionsSlotSelectionStrategyTests
     }
 
     [Fact]
+    public void SelectNext_MemberRecoveredViaHalfOpenProbe_IsRampedIn()
+    {
+        var recovering = new DataverseUserPool("recovering", "dummy-a");
+        var steady = new DataverseUserPool("steady", "dummy-b");
+        var members = new[] { recovering, steady };
+        var strategy = new HealthWeightedLeastConnectionsSlotSelectionStrategy(
+            failureThreshold: 2, cooldownPeriod: TimeSpan.FromMilliseconds(5),
+            rampStart: 2, rampStepInterval: TimeSpan.FromHours(1));
+
+        // Open the circuit, wait out the cooldown, win the probe and report success.
+        var failing = new[] { Stats(0, consecutiveFailures: 5), Stats(4) };
+        Assert.Equal("steady", strategy.SelectNext(members, failing).Member.Name);
+        Thread.Sleep(50);
+        var probe = strategy.SelectNext(members, failing);
+        Assert.Equal("recovering", probe.Member.Name);
+        strategy.ReportAcquireOutcome(recovering, succeeded: true, probe.ProbeClaimGeneration);
+
+        Assert.NotNull(strategy.Breaker!.GetRecoveredAt(recovering));
+
+        // Closed again, holding 2 leases: cap is rampStart (2) -> headroom 0, so 'steady' (0.5) wins.
+        var healthy = new[] { Stats(2), Stats(4) };
+        var picks = Enumerable.Range(0, 4).Select(_ => strategy.SelectNext(members, healthy).Member.Name);
+
+        Assert.All(picks, name => Assert.Equal("steady", name));
+    }
+
+    [Fact]
     public void SelectNext_NeverThrottledMember_IsNotRamped()
     {
         var members = new[] { new DataverseUserPool("a", "dummy-a"), new DataverseUserPool("b", "dummy-b") };

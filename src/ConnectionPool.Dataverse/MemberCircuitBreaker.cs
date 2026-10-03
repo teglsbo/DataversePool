@@ -39,6 +39,7 @@ public sealed class MemberCircuitBreaker
     private readonly TimeSpan _cooldownPeriod;
     private readonly TimeSpan _probeClaimTimeout;
     private readonly Dictionary<DataverseUserPool, CircuitState> _state = new();
+    private readonly Dictionary<DataverseUserPool, DateTimeOffset> _recoveredAt = new();
     private readonly object _lock = new();
 
     public MemberCircuitBreaker(int failureThreshold, TimeSpan cooldownPeriod, TimeSpan? probeClaimTimeout = null)
@@ -103,13 +104,18 @@ public sealed class MemberCircuitBreaker
         {
             if (!isOpen)
             {
-                _state.Remove(member); // healthy again - clear all breaker bookkeeping
+                if (_state.Remove(member))
+                {
+                    _recoveredAt[member] = now; // healthy again - clear breaker bookkeeping, remember when
+                }
+
                 return true;
             }
 
             if (!_state.TryGetValue(member, out var state))
             {
                 _state[member] = new CircuitState { OpenedAt = now };
+                _recoveredAt.Remove(member);
                 return false; // just opened this round - not eligible yet
             }
 
@@ -171,6 +177,7 @@ public sealed class MemberCircuitBreaker
             if (succeeded)
             {
                 _state.Remove(member); // close the circuit immediately rather than waiting for the next stats snapshot
+                _recoveredAt[member] = DateTimeOffset.UtcNow;
                 return;
             }
 
@@ -213,6 +220,20 @@ public sealed class MemberCircuitBreaker
             }
 
             state.ProbeClaimedAt = null;
+        }
+    }
+
+    /// <summary>
+    /// When <paramref name="member"/>'s circuit last closed after having been open (a successful
+    /// half-open probe, or its failure counters dropping back below threshold); null if it never
+    /// recovered or has since re-opened. Selection strategies use it to slow-start a recovered
+    /// member instead of granting it a full share immediately (docs/research/autoscaling.md §9.6 item 3).
+    /// </summary>
+    public DateTimeOffset? GetRecoveredAt(DataverseUserPool member)
+    {
+        lock (_lock)
+        {
+            return _recoveredAt.TryGetValue(member, out var at) ? at : null;
         }
     }
 
