@@ -15,6 +15,7 @@ internal sealed class PoolSizingController : IOperationOutcomeSink, IDisposable
         public readonly object Gate = new();
         public readonly int ConfiguredMaxSize = configuredMaxSize;
         public PoolSizingDecision? LastDecision;
+        public MemberRequestPacer Pacer = null!;
     }
 
     private readonly IPoolSizingStrategy _strategy;
@@ -28,13 +29,18 @@ internal sealed class PoolSizingController : IOperationOutcomeSink, IDisposable
         _strategy = options.Strategy;
         foreach (var member in members)
         {
-            var state = new MemberState(member.MaxSize);
+            var state = new MemberState(member.MaxSize) { Pacer = new MemberRequestPacer(options.TimeProvider) };
             _members[member] = state;
             Apply(member, state, new PoolSizingDecision(_strategy.GetInitialSize(member, state.ConfiguredMaxSize)));
         }
 
         _timer = options.TimeProvider.CreateTimer(_ => Tick(), null, options.TickInterval, options.TickInterval);
     }
+
+    public ValueTask BeforeAttemptAsync(object member, CancellationToken cancellationToken) =>
+        member is DataverseUserPool pool && _members.TryGetValue(pool, out var state)
+            ? state.Pacer.WaitAsync(cancellationToken)
+            : ValueTask.CompletedTask;
 
     public void Record(object member, PoolSizingOperationOutcome outcome)
     {
@@ -79,6 +85,7 @@ internal sealed class PoolSizingController : IOperationOutcomeSink, IDisposable
         var ceiling = _options.MaxSizeCeiling ?? checked(state.ConfiguredMaxSize * 4);
         var target = Math.Clamp(decision.TargetMaxSize, _options.MinSizeFloor, Math.Max(_options.MinSizeFloor, ceiling));
         state.LastDecision = decision with { TargetMaxSize = target };
+        state.Pacer.Configure(decision.MaxRequestsPerWindow, decision.SampleWindow);
         if (target != member.MaxSize)
         {
             member.SetMaxSize(target);

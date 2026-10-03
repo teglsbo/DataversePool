@@ -40,7 +40,6 @@ public class PoolSizingTests
     }
 
     [Theory]
-    [InlineData(ThrottleReason.RequestCount)]
     [InlineData(ThrottleReason.ExecutionTime)]
     [InlineData(ThrottleReason.Unknown)]
     public async Task Aimd_WindowBudgetThrottles_DoNotShrink(ThrottleReason reason)
@@ -120,6 +119,125 @@ public class PoolSizingTests
         Assert.Throws<ArgumentOutOfRangeException>(() => new AimdPoolSizingStrategy(new AimdPoolSizingStrategyOptions { DecreaseFactor = 1.0 }));
         Assert.Throws<ArgumentOutOfRangeException>(() => new AimdPoolSizingStrategy(new AimdPoolSizingStrategyOptions { IncreaseStep = 0 }));
         Assert.Throws<ArgumentOutOfRangeException>(() => new AimdPoolSizingStrategy(new AimdPoolSizingStrategyOptions { MinSize = 5, Ceiling = 3 }));
+    }
+
+    // ----- Pacer -----
+
+    [Fact]
+    public async Task Pacer_NoLimit_NeverWaits()
+    {
+        var pacer = new MemberRequestPacer(TimeProvider.System);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        for (var i = 0; i < 100; i++)
+        {
+            await pacer.WaitAsync(CancellationToken.None);
+        }
+
+        Assert.True(sw.ElapsedMilliseconds < 500);
+    }
+
+    [Fact]
+    public async Task Pacer_OverLimit_WaitsForWindowToSlide()
+    {
+        var pacer = new MemberRequestPacer(TimeProvider.System);
+        pacer.Configure(2, TimeSpan.FromMilliseconds(300));
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await pacer.WaitAsync(CancellationToken.None);
+        await pacer.WaitAsync(CancellationToken.None);
+        Assert.True(sw.ElapsedMilliseconds < 200);
+
+        await pacer.WaitAsync(CancellationToken.None);
+        Assert.True(sw.ElapsedMilliseconds >= 250, $"waited only {sw.ElapsedMilliseconds} ms");
+    }
+
+    [Fact]
+    public async Task Pacer_WaitIsCancellable()
+    {
+        var pacer = new MemberRequestPacer(TimeProvider.System);
+        pacer.Configure(1, TimeSpan.FromMinutes(5));
+        await pacer.WaitAsync(CancellationToken.None);
+        using var cts = new CancellationTokenSource(50);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await pacer.WaitAsync(cts.Token));
+    }
+
+    [Fact]
+    public async Task Aimd_RequestCountThrottle_CapsRateNotConcurrency_ThenRelaxes()
+    {
+        await using var m = NewMember();
+        var time = new ManualTime();
+        var aimd = new AimdPoolSizingStrategy(timeProvider: time);
+        aimd.GetInitialSize(m, 8);
+        for (var i = 0; i < 99; i++)
+        {
+            aimd.OnOperationCompleted(m, Ok(5));
+        }
+
+        var d = aimd.OnOperationCompleted(m, Throttle(ThrottleReason.RequestCount));
+
+        Assert.Equal(8, d?.TargetMaxSize);
+        Assert.Equal(80, d?.MaxRequestsPerWindow); // 100 sent * 0.8
+        Assert.Equal(TimeSpan.FromMinutes(5), d?.SampleWindow);
+
+        Assert.Null(aimd.OnTick(m, Stats(m), null)); // still cooling down
+        time.Advance(TimeSpan.FromSeconds(31));
+        Assert.Equal(88, aimd.OnTick(m, Stats(m), null)?.MaxRequestsPerWindow);
+
+        for (var i = 0; i < 30; i++)
+        {
+            d = aimd.OnTick(m, Stats(m), null);
+        }
+
+        Assert.Null(d?.MaxRequestsPerWindow); // grown past the drop point: limit removed
+    }
+
+    [Fact]
+    public async Task Aimd_SizeDecisions_KeepRepeatingActiveRateLimit()
+    {
+        await using var m = NewMember();
+        var time = new ManualTime();
+        var aimd = new AimdPoolSizingStrategy(timeProvider: time);
+        aimd.GetInitialSize(m, 8);
+        aimd.OnOperationCompleted(m, Throttle(ThrottleReason.RequestCount));
+        time.Advance(TimeSpan.FromSeconds(11));
+
+        var d = aimd.OnOperationCompleted(m, Throttle(ThrottleReason.ConcurrentRequests));
+
+        Assert.Equal(4, d?.TargetMaxSize);
+        Assert.NotNull(d?.MaxRequestsPerWindow);
+    }
+
+    [Fact]
+    public async Task Composite_PacingTakesTightestLimit()
+    {
+        await using var m = NewMember();
+        var a = new PacingScripted(100);
+        var b = new PacingScripted(40);
+        var c = new CompositePoolSizingStrategy(new IPoolSizingStrategy[] { a, b }, PoolSizingCombineMode.Max);
+        c.GetInitialSize(m, 8);
+
+        var d = c.OnTick(m, Stats(m), null);
+
+        Assert.Equal(40, d?.MaxRequestsPerWindow);
+    }
+
+    private sealed class PacingScripted(int limit) : IPoolSizingStrategy
+    {
+        public int GetInitialSize(DataverseUserPool member, int configuredMaxSize) => configuredMaxSize;
+        public PoolSizingDecision? OnTick(DataverseUserPool member, PoolStats currentStats, PoolSizingDecision? lastDecision) =>
+            new(8, limit, null, TimeSpan.FromMinutes(5));
+    }
+
+    [Fact]
+    public async Task Controller_AppliesPacingLimit_AndPacesAttempts()
+    {
+        await using var m = NewMember();
+        var s = new PacingScripted(1);
+        using var controller = new PoolSizingController(new[] { m }, new PoolSizingOptions { Strategy = s });
+        controller.Tick();
+
+        await controller.BeforeAttemptAsync(m, CancellationToken.None);
+        using var cts = new CancellationTokenSource(50);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await controller.BeforeAttemptAsync(m, cts.Token));
     }
 
     // ----- Gradient -----

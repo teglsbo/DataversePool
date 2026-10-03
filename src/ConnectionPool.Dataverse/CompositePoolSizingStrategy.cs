@@ -65,7 +65,7 @@ public sealed class CompositePoolSizingStrategy : IPoolSizingStrategy
             }
         }
 
-        return changed ? new PoolSizingDecision(Combine(votes)) : null;
+        return changed ? Build(votes, lasts) : null;
     }
 
     public PoolSizingDecision? OnTick(DataverseUserPool member, PoolStats currentStats, PoolSizingDecision? lastDecision)
@@ -83,7 +83,22 @@ public sealed class CompositePoolSizingStrategy : IPoolSizingStrategy
             }
         }
 
-        return changed ? new PoolSizingDecision(Combine(votes)) : null;
+        return changed ? Build(votes, lasts) : null;
+    }
+
+    // Pacing is a safety limit, so the tightest child limit wins regardless of the size combine mode.
+    private PoolSizingDecision Build(int[] votes, PoolSizingDecision?[] lasts)
+    {
+        PoolSizingDecision? tightest = null;
+        foreach (var last in lasts)
+        {
+            if (last is { MaxRequestsPerWindow: { } limit } d && (tightest is null || limit < tightest.Value.MaxRequestsPerWindow))
+            {
+                tightest = d;
+            }
+        }
+
+        return new PoolSizingDecision(Combine(votes), tightest?.MaxRequestsPerWindow, null, tightest?.SampleWindow);
     }
 
     private int Combine(int[] votes) => _mode == PoolSizingCombineMode.Min ? votes.Min() : votes.Max();

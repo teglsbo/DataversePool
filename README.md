@@ -584,8 +584,8 @@ var pool = new DataversePool(members, sizingOptions: new PoolSizingOptions
 });
 ```
 
-Only concurrent-request throttles shrink a member; request-count and execution-time throttles are
-rate budgets that a smaller pool does not fix. Sizing sees calls made through
+Only concurrent-request throttles shrink a member. A request-count throttle makes `Aimd` cap the
+request rate instead (calls are delayed, not failed), since a smaller pool does not fix a rate budget. Sizing sees calls made through
 `ExecuteWithThrottleRetryAsync` and `PooledOrganizationService` over a `DataversePool`. Watch the
 metrics above before relying on it. See [ADR-0026](docs/adr/0026-opt-in-automatic-pool-sizing.md).
 

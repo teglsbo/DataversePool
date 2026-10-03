@@ -31,8 +31,27 @@ public sealed class AimdPoolSizingStrategyOptions
     /// </summary>
     public TimeSpan DecreaseHoldoff { get; init; } = TimeSpan.FromSeconds(10);
 
+    /// <summary>
+    /// On a request-count throttle, the request rate is capped at this fraction of what was sent in
+    /// the last <see cref="RequestWindow"/>. Default 0.8.
+    /// </summary>
+    public double RequestRateFactor { get; init; } = 0.8;
+
+    /// <summary>Dataverse's request-count window. Default 5 minutes.</summary>
+    public TimeSpan RequestWindow { get; init; } = TimeSpan.FromMinutes(5);
+
     internal void Validate()
     {
+        if (RequestRateFactor is <= 0 or >= 1 || double.IsNaN(RequestRateFactor))
+        {
+            throw new ArgumentOutOfRangeException(nameof(RequestRateFactor), RequestRateFactor, "Must be between 0 and 1 (exclusive).");
+        }
+
+        if (RequestWindow <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(RequestWindow), RequestWindow, "Must be positive.");
+        }
+
         if (MinSize < 1)
         {
             throw new ArgumentOutOfRangeException(nameof(MinSize), MinSize, "Must be at least 1.");
@@ -82,6 +101,11 @@ public sealed class AimdPoolSizingStrategy : IPoolSizingStrategy
         public int Ceiling;
         public DateTimeOffset CooldownUntil;
         public DateTimeOffset NoDecreaseUntil;
+        public readonly Queue<DateTimeOffset> Sent = new();
+        public int? RateLimit;
+        public int RateLimitDropAbove;
+        public DateTimeOffset RateCooldownUntil;
+        public DateTimeOffset NoRateDecreaseUntil;
     }
 
     private readonly AimdPoolSizingStrategyOptions _options;
@@ -103,13 +127,24 @@ public sealed class AimdPoolSizingStrategy : IPoolSizingStrategy
 
     public PoolSizingDecision? OnOperationCompleted(DataverseUserPool member, PoolSizingOperationOutcome outcome)
     {
+        var state = StateFor(member);
+        var now = _time.GetUtcNow();
+        state.Sent.Enqueue(now);
+        while (state.Sent.Count > 0 && now - state.Sent.Peek() >= _options.RequestWindow)
+        {
+            state.Sent.Dequeue();
+        }
+
+        if (outcome.Outcome == PoolSizingOutcomeKind.Throttled && outcome.ThrottleReason == ThrottleReason.RequestCount)
+        {
+            return OnRequestCountThrottle(state, now, outcome);
+        }
+
         if (outcome.Outcome != PoolSizingOutcomeKind.Throttled || outcome.ThrottleReason != ThrottleReason.ConcurrentRequests)
         {
             return null;
         }
 
-        var state = StateFor(member);
-        var now = _time.GetUtcNow();
         if (now < state.NoDecreaseUntil)
         {
             return null;
@@ -124,19 +159,55 @@ public sealed class AimdPoolSizingStrategy : IPoolSizingStrategy
         var target = Math.Max(_options.MinSize, (int)Math.Round(state.Current * _options.DecreaseFactor, MidpointRounding.AwayFromZero));
         target = Math.Min(target, state.Current);
         state.Current = target;
-        return new PoolSizingDecision(target);
+        return Decide(state);
     }
 
-    public PoolSizingDecision? OnTick(DataverseUserPool member, PoolStats currentStats, PoolSizingDecision? lastDecision)
+    // Request-count throttles are a rate over a window: cap the rate (pacer), leave concurrency alone.
+    private PoolSizingDecision? OnRequestCountThrottle(State state, DateTimeOffset now, PoolSizingOperationOutcome outcome)
     {
-        var state = StateFor(member);
-        if (_time.GetUtcNow() < state.CooldownUntil || state.Current >= state.Ceiling)
+        if (now < state.NoRateDecreaseUntil)
         {
             return null;
         }
 
-        state.Current = Math.Min(state.Ceiling, state.Current + _options.IncreaseStep);
-        return new PoolSizingDecision(state.Current);
+        var cooldown = outcome.RetryAfter is { } retryAfter && retryAfter > _options.CooldownAfterThrottle
+            ? retryAfter
+            : _options.CooldownAfterThrottle;
+        state.NoRateDecreaseUntil = now + _options.DecreaseHoldoff;
+        state.RateCooldownUntil = now + cooldown;
+        var limit = Math.Max(1, (int)(state.Sent.Count * _options.RequestRateFactor));
+        state.RateLimit = Math.Min(limit, state.RateLimit ?? int.MaxValue);
+        state.RateLimitDropAbove = Math.Max(state.RateLimitDropAbove, state.Sent.Count * 2);
+        return Decide(state);
+    }
+
+    private PoolSizingDecision Decide(State state) =>
+        new(state.Current, state.RateLimit, null, state.RateLimit is null ? null : _options.RequestWindow);
+
+    public PoolSizingDecision? OnTick(DataverseUserPool member, PoolStats currentStats, PoolSizingDecision? lastDecision)
+    {
+        var state = StateFor(member);
+        var now = _time.GetUtcNow();
+        var changed = false;
+        if (state.RateLimit is { } rate && now >= state.RateCooldownUntil)
+        {
+            var grown = rate + Math.Max(1, rate / 10);
+            state.RateLimit = grown > state.RateLimitDropAbove ? null : grown;
+            if (state.RateLimit is null)
+            {
+                state.RateLimitDropAbove = 0;
+            }
+
+            changed = true;
+        }
+
+        if (now >= state.CooldownUntil && state.Current < state.Ceiling)
+        {
+            state.Current = Math.Min(state.Ceiling, state.Current + _options.IncreaseStep);
+            changed = true;
+        }
+
+        return changed ? Decide(state) : null;
     }
 
     private State StateFor(DataverseUserPool member) =>

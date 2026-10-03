@@ -28,6 +28,9 @@ internal sealed class LeaseAccessors<TLease>(
 internal interface IOperationOutcomeSink
 {
     void Record(object member, PoolSizingOperationOutcome outcome);
+
+    /// <summary>Called after a lease is held and before the attempt runs; may delay it (pacing).</summary>
+    ValueTask BeforeAttemptAsync(object member, CancellationToken cancellationToken) => ValueTask.CompletedTask;
 }
 
 internal static class DataverseLeaseAccessors
@@ -116,6 +119,15 @@ internal static class DataverseOperationExecutor
 
                 try
                 {
+                    if (sink is not null)
+                    {
+                        await sink.BeforeAttemptAsync(accessors.Member(lease), cancellationToken).ConfigureAwait(false);
+                        if (enabled || sink is not null)
+                        {
+                            attemptStart = Stopwatch.GetTimestamp(); // pacing wait is not call latency
+                        }
+                    }
+
                     var result = await operation(lease, cancellationToken).ConfigureAwait(false);
                     if (enabled)
                     {

@@ -66,9 +66,11 @@ public enum PoolSizingOutcomeKind { Success, Error, Throttled, Canceled }
 public enum ThrottleReason { RequestCount, ExecutionTime, ConcurrentRequests, Unknown }
 
 /// <summary>
-/// A strategy's output: the target <see cref="DataverseUserPool.MaxSize"/> for one member. The three
-/// pacing fields are reserved for the two sliding-window limits a concurrency count cannot fix
-/// (request count and execution time); no pacer consumes them yet, so the controller ignores them.
+/// A strategy's output: the target <see cref="DataverseUserPool.MaxSize"/> for one member, plus the
+/// member's current request-rate cap. <see cref="MaxRequestsPerWindow"/> (over <see cref="SampleWindow"/>)
+/// is applied by the controller's pacer, which delays attempts; <c>null</c> means unlimited, so a
+/// strategy that paces must repeat its limit in every decision. <see cref="MaxExecutionTimePerWindow"/>
+/// is reserved (no execution-time pacer yet) and ignored.
 /// </summary>
 public readonly record struct PoolSizingDecision(
     int TargetMaxSize,

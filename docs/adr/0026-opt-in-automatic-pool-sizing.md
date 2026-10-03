@@ -1,8 +1,8 @@
 # ADR-0026: Opt-in automatic pool sizing via `IPoolSizingStrategy`
 
 ## Status
-Accepted. `Fixed` (default), `DopHint`, `Aimd`, `Gradient` and `Composite` are implemented. The
-window-budget pacer and BBR-style probing are **not**.
+Accepted. `Fixed` (default), `DopHint`, `Aimd`, `Gradient` and `Composite` are implemented. A
+per-member request-rate pacer is implemented. The execution-time pacer and BBR-style probing are **not**.
 
 ## Context
 
@@ -35,7 +35,11 @@ limit fired before it shrinks anything.
 
 - `GetInitialSize(member, configuredMaxSize)`: a member does not expose its `PoolOptions`.
 - `OnOperationCompleted` returns `PoolSizingDecision?` so a reaction can be immediate.
-- Pacing fields on the decision exist but are ignored: no pacer consumes them yet.
+- Request-count pacing is implemented: `PoolSizingDecision.MaxRequestsPerWindow`/`SampleWindow` drive a
+  per-member sliding-window limiter (`MemberRequestPacer`). The executor calls the sink's
+  `BeforeAttemptAsync` after the lease is held and before the attempt runs; the wait is cancellable
+  and excluded from call latency. `null` means unlimited, so a pacing strategy repeats its limit in
+  every decision; `Composite` takes the tightest child limit. `MaxExecutionTimePerWindow` is ignored.
 - `TrickleMinSize` is not implemented.
 
 ### Strategy behaviour
@@ -43,7 +47,9 @@ limit fired before it shrinks anything.
 - `Aimd` halves only on `ConcurrentRequests`. A `DecreaseHoldoff` (10 s) ignores the burst of
   in-flight throttles that follow one congestion event, otherwise one event would collapse the
   size. Regrowth is +1 per tick after `max(CooldownAfterThrottle, Retry-After)`. Request-count,
-  execution-time and unknown throttles never change the size.
+  execution-time and unknown throttles never change the size. A request-count throttle instead caps
+  the request rate at 80% of what was sent in the last 5 min (pacer), holds it for the cooldown,
+  then relaxes it ~10% per tick and removes it once it passes twice the throttled volume.
 - `Gradient` samples successful latency per operation name; each tick it computes
   `minRtt / meanRtt` (clamped to [0.5, 1]), takes the minimum across operations, and moves the size
   toward `gradient * size + sqrt(size)` with smoothing. It never grows an under-used member, and
