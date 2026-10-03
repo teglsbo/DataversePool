@@ -94,5 +94,8 @@ response (`x-ms-ratelimit-burst-remaining-xrm-requests`, `x-ms-ratelimit-time-re
 - `DataversePool.GetResponseBudget(member)` returns the latest `ResponseBudget`.
 - If burst or time remaining falls to `LowBudgetFraction` (default 5 %) of the largest value seen,
   the member's pacer holds attempts for `LowBudgetBackoff` (default 5 s). It fails open afterwards.
-- Verified live (`LiveResponseBudgetTests`). Not verified: attribution under load, listener cost,
-  and number formats on other locales.
+- Verified live (`LiveResponseBudgetTests`). Attribution under 2,200 concurrent calls across 50 members
+  is verified locally (`ResponseObservationLoadTests`).
+- Listener cost, measured on loopback (median of 5 rounds): about 139 us/call without the listener,
+  160 us with it unattributed and 154 us attributed, so roughly 15-20 us per call. Real Dataverse calls
+  take tens of milliseconds, so this is negligible. Not verified: number formats on other locales.

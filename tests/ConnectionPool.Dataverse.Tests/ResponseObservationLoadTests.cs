@@ -84,4 +84,44 @@ public class ResponseObservationLoadTests
         }
         server.Stop();
     }
+
+    [Fact]
+    public async Task ListenerOverhead_IsReported()
+    {
+        const int calls = 3000, rounds = 5;
+        var prefix = $"http://127.0.0.1:{Random.Shared.Next(20001, 40000)}/";
+        using var server = StartEchoServer(prefix);
+        using var http = new HttpClient(new SocketsHttpHandler { MaxConnectionsPerServer = 16 });
+        var sink = new Sink();
+
+        async Task<double> RunAsync(bool attributed)
+        {
+            var sw = Stopwatch.StartNew();
+            await Task.WhenAll(Enumerable.Range(0, 16).Select(_ => Task.Run(async () =>
+            {
+                for (var n = 0; n < calls / 16; n++)
+                {
+                    if (attributed) { ResponseObservation.Current.Value = new ResponseObservation.Target(sink, sink); }
+                    try { using var r = await http.GetAsync(prefix + "1"); }
+                    finally { ResponseObservation.Current.Value = null; }
+                }
+            })));
+            return sw.Elapsed.TotalMilliseconds * 1000 / calls;
+        }
+
+        await RunAsync(false); // warm-up
+        var baseline = new List<double>();
+        var idle = new List<double>();
+        var active = new List<double>();
+        for (var r = 0; r < rounds; r++)
+        {
+            baseline.Add(await RunAsync(false));
+            using (ResponseObservation.Start()) { idle.Add(await RunAsync(false)); }
+            using (ResponseObservation.Start()) { active.Add(await RunAsync(true)); }
+        }
+
+        double Med(List<double> l) { l.Sort(); return l[l.Count / 2]; }
+        _output.WriteLine($"us/call  no listener: {Med(baseline):F1}  listener, unattributed: {Med(idle):F1}  listener, attributed: {Med(active):F1}");
+        server.Stop();
+    }
 }
