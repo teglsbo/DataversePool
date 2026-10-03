@@ -4,6 +4,8 @@ using System.Globalization;
 using System.Text;
 using ConnectionPool.Core;
 using Microsoft.Crm.Sdk.Messages;
+using Microsoft.Xrm.Sdk.Messages;
+using Microsoft.Xrm.Sdk.Metadata;
 using Xunit.Abstractions;
 
 namespace ConnectionPool.Dataverse.Tests;
@@ -35,6 +37,7 @@ public class LiveAimdSawtoothTests
         var minutes = EnvInt("DVPOOL_IT_SAWTOOTH_MINUTES", 10);
         var workers = EnvInt("DVPOOL_IT_SAWTOOTH_WORKERS", 1000);
         var maxSize = EnvInt("DVPOOL_IT_SAWTOOTH_MAXSIZE", 400);
+        var slow = Environment.GetEnvironmentVariable("DVPOOL_IT_SAWTOOTH_SLOW") == "1";
 
         // MaxRetryCount 0: the SDK must not absorb 429s, or the pool never sees them.
         var member = new DataverseUserPool(
@@ -46,7 +49,10 @@ public class LiveAimdSawtoothTests
 
         await using var pool = new DataversePool(member, sizingOptions: new PoolSizingOptions
         {
-            Strategy = new AimdPoolSizingStrategy(),
+            Strategy = new AimdPoolSizingStrategy(new AimdPoolSizingStrategyOptions
+            {
+                BinaryRecovery = Environment.GetEnvironmentVariable("DVPOOL_IT_SAWTOOTH_BINARY") == "1",
+            }),
             ObserveResponses = true,
         });
 
@@ -68,6 +74,13 @@ public class LiveAimdSawtoothTests
                         Interlocked.Increment(ref inFlight);
                         try
                         {
+                            if (slow)
+                            {
+                                var meta = (RetrieveAllEntitiesResponse)await client.ExecuteAsync(
+                                    new RetrieveAllEntitiesRequest { EntityFilters = EntityFilters.Entity, RetrieveAsIfPublished = false }, ct);
+                                return meta.EntityMetadata.Length;
+                            }
+
                             return (await client.ExecuteAsync(new WhoAmIRequest(), ct)).ResponseName.Length;
                         }
                         catch (Exception ex) when (DataverseThrottleDetector.TryGetThrottleReason(ex, out var reason))
@@ -82,8 +95,9 @@ public class LiveAimdSawtoothTests
                     });
                     Interlocked.Increment(ref ok);
                 }
-                catch
+                catch (Exception ex)
                 {
+                    reasons.AddOrUpdate("ex:" + ex.GetType().Name + ":" + ex.Message[..Math.Min(60, ex.Message.Length)].Replace(',', ';'), 1, (_, n) => n + 1);
                     Interlocked.Increment(ref failed);
                     await Task.Delay(250);
                 }
