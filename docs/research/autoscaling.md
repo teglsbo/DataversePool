@@ -206,7 +206,12 @@ Two further boundary facts, both **[MS]**, matter for a controller:
   `ExecutionTime` rejections. Three independent attempts (sustained reads at 2x and 5x budget;
   batched writes at 0.6x budget) have now failed to trip this facet on this tenant, strengthening
   the "tenant budget configured above default" explanation over the "execution time tracked
-  loosely vs. wall-clock" explanation, though the latter remains unfalsified.
+  loosely vs. wall-clock" explanation, though the latter remains unfalsified. **Fourth attempt,
+  2026-10-03:** a 50-worker sustained `RetrieveAllEntitiesRequest` probe (testing the hypothesis
+  that per-web-server dilution of the load, §2, hid the limit at 10-20 workers) ran 5m47s: 1,412
+  attempts, all succeeded, peak in-flight 50, 17,055,801 ms cumulative client-observed busy time
+  (14.2x the documented budget) — still **zero** throttles. Busy time scaled near-linearly with
+  workers without ever tripping, so dilution across servers alone is an unlikely explanation.
 - **Correct reaction:** reduce the *cost* of work (smaller batches, cheaper queries, fewer
   plugins triggered) and/or reduce sustained concurrency on expensive operation types
   specifically; a generic per-member concurrency cut helps but may be insufficient if individual
@@ -673,6 +678,27 @@ collect.
   such rather than silently omitted. No other `x-ms-*` response header beyond the ones already
   named was identified, by either the repo's assembly inspection or general-purpose research, as
   carrying server/node/scale-unit identity.
+- **Deliberate steering (manually seeding a captured `ARRAffinity` value into a fresh
+  `CookieContainer` to pin a *chosen* prior server, rather than whichever one a warmup call
+  happens to land on) is technically straightforward with the raw Web API path** — no reflection,
+  just a standard `Set-Cookie`/`Cookie` round-trip — and would let two or more long-lived
+  `HttpClient`s be pinned to two *different*, already-observed servers on purpose. This is
+  valuable as a **diagnostic-only** technique (e.g. saturating one pinned server's concurrency
+  while probing another to test whether service-protection state is truly enforced independently
+  per `(user, server)` rather than aggregated per user — directly testing §3.3/§4's central
+  hypothesis, strictly stronger evidence than observing distinct cookie values alone, §12.2 item
+  2). **It is explicitly not a viable production load-balancing actuator**, for two structural
+  reasons: (1) the set of reachable servers is bounded by whatever a client has already *observed*
+  via a prior response — there is no way to discover or route to a server never seen before, so a
+  newly scaled-out instance is permanently unreachable by this technique until some other,
+  affinity-off call happens to land on it first; and (2) the only "load" signal available this way
+  is this client's own prior 429 history against that one cookie value, which says nothing about
+  the server's current load from every *other* tenant/user hitting it — an essentially blind,
+  stale, self-referential sample, almost certainly worse than simply leaving affinity off (letting
+  Dataverse's own load balancer, which has real fleet-wide visibility, spread requests) combined
+  with the existing `Retry-After`/`ReportThrottled` backoff this repo already implements at the
+  app-user level. Any attempt to use this for routing optimization (rather than as a one-off
+  research probe) should be rejected on this basis unless that reasoning changes.
 
 ### 6.4 Capture mechanisms (none implemented; ranked by the repo's own review)
 
@@ -1245,6 +1271,42 @@ phased, not a single release:
 
 This phasing applies regardless of which strategies are ultimately implemented: it is a statement
 about evidence sequencing, not about algorithm preference.
+
+### 9.6 Member-selection health model (proposal — not implemented)
+
+Companion to §9.2's *sizing* strategies: this is about `ISlotSelectionStrategy` (which member serves
+the next acquire). Today's `LeastConnections`/`HealthAwareRoundRobin` treat health as binary —
+a member is eligible or not — and rank only by `LeasedCount`. A proposed
+`HealthWeightedLeastConnections` makes four distinctions the current model cannot:
+
+1. **429 is not a failure; do not route it through the breaker.** A throttle (ADR-0008) means the
+   member is healthy but over budget, and `Retry-After` already states exactly when to retry, so a
+   half-open probe adds nothing. Keep `ThrottledUntil` as the skip window. The gap is *recovery*:
+   when the window ends every queued caller hits the member at once and can immediately re-trip
+   `ConcurrentRequests`/`NumberOfRequests`. Replace the cliff with a **slow-start ramp**: after a
+   throttle, the member's effective concurrency cap starts low (e.g. 1-2, or a fraction of
+   `dop_hint`) and grows additively per success window back to full — the AIMD shape of §9.3
+   applied per member to selection rather than to `MaxSize`.
+2. **Rank by headroom, not raw leases.** Score eligible members by
+   `1 - leased / effectiveCap`, where `effectiveCap = min(MaxSize, dop_hint?, rampCap)`. The
+   `dop_hint` gauge (Phase 3 item 1) now makes this reachable. Ties still break round-robin.
+3. **Half-open stays for real failures, with a slow-start of its own.** Create/operational failures
+   (systemic: expired secret, org outage, network) keep today's breaker — a connection-level
+   failure is already discarded by `MarkUnhealthy`; the breaker is the *member*-level decision, and
+   discarding a member permanently would need the same re-test the probe provides. Addition: after a
+   successful probe, ramp the member in via the same slow-start instead of granting a full share.
+4. **Permanent-failure classification.** Auth failures (401/invalid secret/disabled app user,
+   AADSTS error codes) will not self-heal; probing every cooldown is noise. Classify them as
+   **quarantined**: skip the member, log once at error level, expose
+   `breaker_state` plus a distinct `quarantine_reason` tag, and re-probe only on a long interval
+   (e.g. 5-10 min) or an explicit operator `Reset`. Transient classes (network, 5xx, timeouts) keep
+   the normal short cooldown. Classification must be conservative: unknown errors are transient.
+
+Known limits to carry into the design: the operational-failure counter is pool-wide, so one bad
+request type or connection can still trip a member (per-slot counters are in `PLAN-2026-09-30.md`
+"Deferred"); and a 429 is scoped per user *and* per web server while `ThrottledUntil` covers the
+whole app user, so skipping the member is deliberately conservative. Suggested order: (1)+(2) first
+— they need only gauges that already exist — then (4), then (3)'s ramp.
 
 ## 10. Configurable settings proposal
 

@@ -64,6 +64,16 @@ public interface ISlotSelectionStrategy
     /// </summary>
     void ReportAcquireAbandoned(DataverseUserPool member, long? claimGeneration) =>
         ReportAcquireAbandoned(member);
+
+    /// <summary>
+    /// The <see cref="MemberCircuitBreaker"/> this strategy delegates circuit-breaking to, or
+    /// <c>null</c> for a strategy with no circuit-breaking at all (e.g. plain round-robin). Exists
+    /// purely so telemetry (<see cref="DataverseUserPoolMetrics"/>) can read a member's breaker
+    /// state for a <c>breaker_state</c> gauge without this interface needing to expose breaker
+    /// internals through every selection method. Default no-op: most callers never need to
+    /// override this.
+    /// </summary>
+    MemberCircuitBreaker? Breaker => null;
 }
 
 /// <summary>

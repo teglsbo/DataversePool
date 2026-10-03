@@ -120,4 +120,7 @@ public sealed class LeastConnectionsSlotSelectionStrategy : ISlotSelectionStrate
 
     public void ReportAcquireAbandoned(DataverseUserPool member, long? claimGeneration) =>
         _breaker.AbandonProbe(member, claimGeneration);
+
+    /// <inheritdoc />
+    public MemberCircuitBreaker Breaker => _breaker;
 }

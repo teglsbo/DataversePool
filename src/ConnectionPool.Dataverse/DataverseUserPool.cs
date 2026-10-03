@@ -79,6 +79,14 @@ public sealed class DataverseUserPool : IAsyncDisposable
     public bool IsThrottled => ThrottledUntil is { } until && until > DateTimeOffset.UtcNow;
 
     /// <summary>
+    /// Most recently observed <c>ServiceClient.RecommendedDegreesOfParallelism</c> (the
+    /// <c>x-ms-dop-hint</c> response header, see ADR-0025) across this member's connections, or
+    /// <c>null</c> if none has been observed yet. Not acted on automatically - see ADR-0025's open
+    /// questions for why an automatic DOP controller needs more research first.
+    /// </summary>
+    public int? RecommendedDegreesOfParallelism => _policy.LastRecommendedDegreesOfParallelism;
+
+    /// <summary>
     /// Records that Dataverse throttled this member for <paramref name="retryAfter"/>, so that a
     /// group pool's <see cref="ISlotSelectionStrategy"/> can steer new acquires toward other
     /// members until the window expires. Safe to call concurrently; overlapping reports only ever

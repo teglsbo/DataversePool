@@ -111,4 +111,7 @@ public sealed class HealthAwareRoundRobinSlotSelectionStrategy : ISlotSelectionS
 
     public void ReportAcquireAbandoned(DataverseUserPool member, long? claimGeneration) =>
         _breaker.AbandonProbe(member, claimGeneration);
+
+    /// <inheritdoc />
+    public MemberCircuitBreaker Breaker => _breaker;
 }

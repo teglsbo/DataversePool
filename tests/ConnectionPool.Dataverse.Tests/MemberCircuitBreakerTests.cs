@@ -308,4 +308,56 @@ public class MemberCircuitBreakerTests
 
         Assert.True(breaker.IsEligible(member, StatsWithFailures(0), DateTimeOffset.UtcNow));
     }
+
+    [Fact]
+    public void GetState_ReturnsClosed_WhenCircuitClosed()
+    {
+        var breaker = new MemberCircuitBreaker(failureThreshold: 3, cooldownPeriod: TimeSpan.FromSeconds(30));
+        var member = new DataverseUserPool("a", "dummy-a");
+
+        Assert.Equal(MemberCircuitState.Closed, breaker.GetState(member, StatsWithFailures(0), DateTimeOffset.UtcNow));
+    }
+
+    [Fact]
+    public void GetState_ReturnsOpen_WhenJustOpened_StillWithinCooldown()
+    {
+        var breaker = new MemberCircuitBreaker(failureThreshold: 3, cooldownPeriod: TimeSpan.FromSeconds(30));
+        var member = new DataverseUserPool("a", "dummy-a");
+        var stats = StatsWithFailures(5);
+
+        breaker.IsEligible(member, stats, DateTimeOffset.UtcNow); // opens
+
+        Assert.Equal(MemberCircuitState.Open, breaker.GetState(member, stats, DateTimeOffset.UtcNow));
+    }
+
+    [Fact]
+    public void GetState_ReturnsHalfOpen_AfterCooldownElapses_WithoutClaimingTheProbe()
+    {
+        var breaker = new MemberCircuitBreaker(failureThreshold: 2, cooldownPeriod: TimeSpan.FromMilliseconds(20));
+        var member = new DataverseUserPool("a", "dummy-a");
+        var stats = StatsWithFailures(5);
+
+        breaker.IsEligible(member, stats, DateTimeOffset.UtcNow); // opens
+        Thread.Sleep(30); // exceed cooldown - half-open
+
+        // Calling GetState repeatedly must be a pure read: it must not claim the probe slot that a
+        // real IsEligible call would claim.
+        Assert.Equal(MemberCircuitState.HalfOpen, breaker.GetState(member, stats, DateTimeOffset.UtcNow));
+        Assert.Equal(MemberCircuitState.HalfOpen, breaker.GetState(member, stats, DateTimeOffset.UtcNow));
+        Assert.Equal(MemberCircuitState.HalfOpen, breaker.GetState(member, stats, DateTimeOffset.UtcNow));
+
+        // The probe slot is still available for a real caller - proves GetState never consumed it.
+        Assert.True(breaker.IsEligible(member, stats, DateTimeOffset.UtcNow));
+    }
+
+    [Fact]
+    public void GetState_ClosesImmediately_OnceFailuresDropBelowThreshold()
+    {
+        var breaker = new MemberCircuitBreaker(failureThreshold: 3, cooldownPeriod: TimeSpan.FromMinutes(5));
+        var member = new DataverseUserPool("a", "dummy-a");
+
+        breaker.IsEligible(member, StatsWithFailures(5), DateTimeOffset.UtcNow); // opens, long cooldown
+
+        Assert.Equal(MemberCircuitState.Closed, breaker.GetState(member, StatsWithFailures(0), DateTimeOffset.UtcNow));
+    }
 }

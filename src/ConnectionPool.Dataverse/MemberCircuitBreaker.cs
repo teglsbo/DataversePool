@@ -215,4 +215,50 @@ public sealed class MemberCircuitBreaker
             state.ProbeClaimedAt = null;
         }
     }
+
+    /// <summary>
+    /// Non-mutating read of <paramref name="member"/>'s current breaker state - unlike
+    /// <see cref="IsEligible(DataverseUserPool, PoolStats, DateTimeOffset)"/>, this never claims a
+    /// half-open probe slot or opens/resets any bookkeeping; it exists purely so telemetry (e.g. a
+    /// <c>breaker_state</c> gauge) can observe what a selection round would currently see without
+    /// disturbing it. Safe to call as often as a metrics collector likes, concurrently with real
+    /// selection rounds.
+    /// </summary>
+    public MemberCircuitState GetState(DataverseUserPool member, PoolStats stats, DateTimeOffset now)
+    {
+        var isOpen = stats.ConsecutiveCreateFailures >= _failureThreshold
+            || stats.ConsecutiveOperationalFailures >= _failureThreshold;
+
+        lock (_lock)
+        {
+            if (!isOpen)
+            {
+                return MemberCircuitState.Closed;
+            }
+
+            if (!_state.TryGetValue(member, out var state) || now - state.OpenedAt < _cooldownPeriod)
+            {
+                return MemberCircuitState.Open;
+            }
+
+            return MemberCircuitState.HalfOpen;
+        }
+    }
+}
+
+/// <summary>
+/// A member's circuit-breaker state as seen by <see cref="MemberCircuitBreaker.GetState"/>. Numeric
+/// values are part of this type's public contract (used verbatim as a <c>breaker_state</c> gauge
+/// value by <see cref="DataverseUserPoolMetrics"/>) - do not renumber existing members.
+/// </summary>
+public enum MemberCircuitState
+{
+    /// <summary>Healthy - eligible for selection without restriction.</summary>
+    Closed = 0,
+
+    /// <summary>Past its cooldown, but not yet proven healthy again - only a single probe caller is eligible.</summary>
+    HalfOpen = 1,
+
+    /// <summary>Failing and still within its cooldown window - not eligible for selection.</summary>
+    Open = 2,
 }

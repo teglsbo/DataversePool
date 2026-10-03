@@ -62,6 +62,13 @@ public sealed class DataversePool : IAsyncDisposable
 
     public IReadOnlyList<DataverseUserPool> Members => _members;
 
+    /// <summary>
+    /// The member-selection strategy in use - exposed read-only so telemetry
+    /// (<see cref="DataverseUserPoolMetrics"/>) can read <see cref="ISlotSelectionStrategy.Breaker"/>
+    /// for a <c>breaker_state</c> gauge without this type needing its own breaker-forwarding API.
+    /// </summary>
+    public ISlotSelectionStrategy Strategy => _strategy;
+
     /// <summary>The <c>pool.name</c> tag value for operation metrics. See docs/adr/0024.</summary>
     internal string MetricsPoolName { get; }
 

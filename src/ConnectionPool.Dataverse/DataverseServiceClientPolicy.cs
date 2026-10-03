@@ -39,6 +39,12 @@ public sealed class DataverseServiceClientPolicy : IPooledResourcePolicy<Service
     private readonly SemaphoreSlim _baseInitGate = new(1, 1);
     private ServiceClient? _baseClient;
 
+    // -1 sentinel = "never observed yet"; ServiceClient.RecommendedDegreesOfParallelism is a plain
+    // int (not nullable), so this field distinguishes "genuinely 0" from "no response has fed it
+    // yet" without needing a lock just to read/write a nullable value. See
+    // LastRecommendedDegreesOfParallelism below.
+    private int _lastRecommendedDegreesOfParallelism = -1;
+
     public DataverseServiceClientPolicy(string connectionString, ILogger? logger = null, DataverseClientOptions? clientOptions = null)
     {
         if (string.IsNullOrWhiteSpace(connectionString))
@@ -125,6 +131,27 @@ public sealed class DataverseServiceClientPolicy : IPooledResourcePolicy<Service
         }
 
         baseline.Apply(resource);
+
+        // Sample x-ms-dop-hint (ADR-0025, PLAN-2026-09-30.md Phase 3 item 1) on every return, not
+        // just at creation - the hint can change over a connection's lifetime as Dataverse's own
+        // capacity view evolves (§3, docs/research/autoscaling.md), and OnReturned is called after
+        // every operation regardless of outcome, making it a cheap, already-invoked hook rather
+        // than a new polling loop.
+        Volatile.Write(ref _lastRecommendedDegreesOfParallelism, resource.RecommendedDegreesOfParallelism);
+    }
+
+    /// <summary>
+    /// Most recently observed <see cref="ServiceClient.RecommendedDegreesOfParallelism"/> across
+    /// every clone this policy has produced, sampled in <see cref="OnReturned"/>. Null until at
+    /// least one connection has been returned at least once.
+    /// </summary>
+    public int? LastRecommendedDegreesOfParallelism
+    {
+        get
+        {
+            var value = Volatile.Read(ref _lastRecommendedDegreesOfParallelism);
+            return value < 0 ? null : value;
+        }
     }
 
     public ValueTask DisposeResourceAsync(ServiceClient resource)

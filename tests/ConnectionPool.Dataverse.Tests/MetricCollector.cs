@@ -20,6 +20,7 @@ internal sealed class MetricCollector : IDisposable
                 listener.EnableMeasurementEvents(instrument);
             }
         };
+        _listener.SetMeasurementEventCallback<int>((i, v, tags, _) => Add(i, v, tags, throwFromCallback));
         _listener.SetMeasurementEventCallback<long>((i, v, tags, _) => Add(i, v, tags, throwFromCallback));
         _listener.SetMeasurementEventCallback<double>((i, v, tags, _) => Add(i, v, tags, throwFromCallback));
         _listener.Start();
@@ -43,6 +44,11 @@ internal sealed class MetricCollector : IDisposable
     public List<Measurement> Of(string instrument) => Measurements.Where(m => m.Instrument == instrument).ToList();
 
     public double Sum(string instrument) => Of(instrument).Sum(m => m.Value);
+
+    /// <summary>Forces every subscribed observable gauge's callback to run once, capturing its
+    /// current value into <see cref="Measurements"/>. Push-based instruments (counters,
+    /// histograms) don't need this - they report as the operations that drive them happen.</summary>
+    public void Collect() => _listener.RecordObservableInstruments();
 
     public void Dispose() => _listener.Dispose();
 }
