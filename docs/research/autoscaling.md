@@ -58,9 +58,9 @@
 - DataversePool already has the mechanical primitives this needs: runtime-adjustable `MaxSize`
   with graceful (non-instant) shrink (`docs/adr/0025`), per-member throttle state
   (`docs/adr/0008`), circuit breakers, and OpenTelemetry-shaped operation metrics
-  (`docs/adr/0024`). What is missing is (a) the SOAP-path 429-detection gap flagged in
-  `REVIEW-2026-09-30.md:201-223`, (b) a `RecommendedDegreesOfParallelism` gauge, and (c) the
-  controller itself — all open items, not yet built.
+  (`docs/adr/0024`). The SOAP-path 429-detection gap (`REVIEW-2026-09-30.md:201-223`) and the
+  `RecommendedDegreesOfParallelism` gauge are now done (see `docs/adr/0008`'s addendum and §9.6);
+  what is missing is the controller itself — not yet built.
 - Multi-replica deployments cannot coordinate through Dataverse's limits directly (no shared
   state is exposed), but AIMD-family controllers have proven distributed fairness/convergence
   properties without coordination (Chiu & Jain 1989, §8, §11) that make a coordination-free design
@@ -564,7 +564,7 @@ implementation discipline within `Aimd`/`Gradient`/`Composite`, re-using existin
 | Signal | Leading / lagging | Available today? | Noise | Informs which limit |
 |---|---|---|---|---|
 | `x-ms-dop-hint` / `RecommendedDegreesOfParallelism` | Leading (server tells you before you're throttled) | **Yes** — public property on `ServiceClient`, fed on both transports **[Measured]**, not yet wired to a pool gauge (`REVIEW-2026-09-30.md:396`) | Low-frequency changes, environment-level granularity, may lag real tenant capacity (§3) | Concurrency (§2.3), loosely |
-| 429 / concurrency error (`0x80072326`) | Lagging | Partially — `HttpOperationException` path works; SOAP-path string-match detection has a gap being fixed (`REVIEW-2026-09-30.md:201-223`, `docs/adr/0008`) | Low noise, unambiguous when it fires, but only fires *after* the SDK's own internal retry budget is exhausted unless `MaxRetryCount=0` (`docs/adr/0016`) | Concurrency (§2.3) directly |
+| 429 / concurrency error (`0x80072326`) | Lagging | Yes — both the `HttpOperationException` (Web API) and SOAP-fault paths are detected (`docs/adr/0008` addendum) | Low noise, unambiguous when it fires, but only fires *after* the SDK's own internal retry budget is exhausted unless `MaxRetryCount=0` (`docs/adr/0016`) | Concurrency (§2.3) directly |
 | 429 / request-count error (`0x80072322`) | Lagging | Same path as above once distinguished by error code | Low noise; distinguishable from concurrency 429 by SDK error code, currently **not** distinguished by `DataverseThrottleDetector`, which only detects "a throttle happened," not which facet **[Measured: gap]** | Request-rate limiter (§2.1) |
 | 429 / execution-time error (`0x80072321`) | Lagging | Same path, same gap | Same as above | Cost/duration budget (§2.2) |
 | Operation duration (`dataversepool.operation.duration`, per `dataverse.operation.name`) | Leading (queueing precedes hard rejection) | **Yes**, already instrumented per ADR-0024, tagged by low-cardinality `operation.name` and `pool.member.name` | High — Dataverse is a shared, multi-tenant, noisy backend; includes SDK-internal retry/backoff time when `MaxRetryCount>0` (`docs/adr/0024`); must bucket per operation type, not pool-wide, because read/create/bulk/metadata costs differ by >10x in this repo's own measurements (12s vs 55s p50/p95 on one path alone, `TODO.md:183-186`) | Execution-time budget (§2.2) primarily; secondarily an early-warning proxy for concurrency saturation (queueing) |

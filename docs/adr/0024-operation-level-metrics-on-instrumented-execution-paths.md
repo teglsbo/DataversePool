@@ -313,3 +313,13 @@ attribution, but live Dataverse access is not required for the core metric seman
   `PooledOrganizationServiceTests`, using a real `MeterListener`. Beyond them, tests also show that
   the lease is released before a same-member `Retry-After` wait, and that a throwing listener
   changes nothing.
+- **SOAP-path throttling (resolved).** Until 2026-10 the throttle reporter inside the executor only
+  recognized the Web API's HTTP 429, so on the SOAP transport a throttled call was classified
+  `error`, never `throttled`, and never fed `dataverse.operation.throttle.*`. `DataverseThrottleDetector`
+  now also recognizes the three service-protection `OrganizationServiceFault` codes (confirmed live
+  for `ConcurrentRequests` and `NumberOfRequests`; see ADR-0008's addendum), so the `throttled`
+  outcome and the throttle metrics are populated on both transports. The metrics do not yet say
+  *which* limit fired (request count, execution time, concurrency).
+- **Connection faults.** The executor also reports non-throttle transport failures to the lease
+  (`ReportIfConnectionFault`), recycling the connection and feeding the breaker. This changes pool
+  health, not the recorded outcome: such a call is still classified `error`.

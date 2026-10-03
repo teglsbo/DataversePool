@@ -72,3 +72,30 @@ maintenance nightmare during SDK upgrades). It was therefore deliberately reject
   to calling the Web API directly instead of through `ServiceClient`), a proactive
   header-based strategy can be added as a new, separate signal without changing the contract established
   here.
+
+## Addendum (2026-10): SOAP path, 429 vs. failure, and how members recover
+Confirmed live and implemented since the original decision (PLAN-2026-09-30.md Phases 2-3):
+
+- **The SOAP transport has no HTTP 429.** The Dataverse SDK may use SOAP under the hood, and there a
+  service-protection rejection surfaces as `FaultException<OrganizationServiceFault>` with one of
+  three error codes: `NumberOfRequests` (`0x80072322`), `ExecutionTime` (`0x80072321`) or
+  `ConcurrentRequests` (`0x80072326`), with the back-off in `ErrorDetails["Retry-After"]` (observed as
+  a boxed `TimeSpan`). The original detector only knew `HttpOperationException`, so SOAP throttles
+  went unnoticed. `DataverseThrottleDetector` now recognizes both. Confirmed live for
+  `ConcurrentRequests` and `NumberOfRequests`; `ExecutionTime` could not be provoked in four
+  attempts (see `docs/research/autoscaling.md` §2.2), so that code rests on documentation alone.
+- **A 429 is not a failure.** It never feeds the circuit breaker (`MemberCircuitBreaker`) and never
+  recycles the connection. It only sets `ThrottledUntil` (capped at `DefaultMaxRetryAfter`, ADR-0017).
+  Real failures take a separate path: connection-level faults call `MarkUnhealthy`
+  (`DataverseLease.ReportIfConnectionFault`), and known non-self-healing connect errors (revoked
+  secret, disabled app user, 401) quarantine the member (`DataverseFailureClassifier`).
+- **Recovery is a ramp, not a probe.** A throttled member is skipped until `ThrottledUntil`.
+  `HealthWeightedLeastConnectionsSlotSelectionStrategy` then lets it back in gradually
+  (start at 2 concurrent, +1 per 5 s) instead of releasing the whole queue onto it at once. The
+  same ramp applies after a half-open probe succeeds for a circuit-open member.
+- **Throttle state is per application user, not per server.** Dataverse limits are per user and per
+  web server, but `DataverseUserPool.IsThrottled` has no per-frontend granularity (the SDK exposes no
+  stable server identity), so the pool cannot steer around a single throttled frontend.
+- Operators can see all of this through the `dataversepool.member.*` gauges
+  (`throttled`, `throttled_until_seconds`, `dop_hint`, `breaker_state`, `quarantined`).
+  See `docs/research/autoscaling.md` §9.6.
