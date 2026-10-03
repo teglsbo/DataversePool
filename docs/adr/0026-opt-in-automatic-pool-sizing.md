@@ -119,3 +119,13 @@ response (`x-ms-ratelimit-burst-remaining-xrm-requests`, `x-ms-ratelimit-time-re
   seen (about 400 of 8000), all 55 following calls were held back by at least 2.5 s (backoff 3 s). The
   run stopped at 330 remaining and never reached a throttle.
 - Still unseen live: an `ExecutionTime` throttle, so that pacer remains unit-tested only.
+
+### Addendum: backend node and budget
+- `ResponseBudget.ServerId` is the last part of `X-Source` (the backend node), logged for diagnostics; the soak CSV
+  records it per member (`a_server_no`, `b_server_no`, `servers_seen`).
+- `ARRAffinity` identifies the node, but only when the client sends it back; the pool disables affinity cookies, so
+  without one each response got a fresh value. With a pinned cookie, a series stays on one `X-Source` node.
+- Three pinned series run one after another gave burst remaining 7959..7940, 7939..7920, 7919..7900: one
+  counter, not one per node. Jumps of 500-700 under concurrent load are likely delayed synchronisation of a shared
+  counter. Whether more front-end nodes give more budget in production is open; the logged node id lets a soak
+  run answer it.

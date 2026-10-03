@@ -203,6 +203,17 @@ public class ResponseObservationTests
     }
 
     [Fact]
+    public void TryParse_ReadsBackendNodeFromXSource()
+    {
+        using var r = new HttpResponseMessage();
+        r.Headers.TryAddWithoutValidation("x-ms-dop-hint", "4");
+        r.Headers.TryAddWithoutValidation("X-Source", "constant|node-17");
+
+        Assert.True(ResponseObservation.TryParse(r, DateTimeOffset.UnixEpoch, out var b));
+        Assert.Equal("node-17", b.ServerId);
+    }
+
+    [Fact]
     public void Options_Validate_RejectsBadBudgetSettings()
     {
         Assert.Throws<ArgumentOutOfRangeException>(() => new PoolSizingOptions { LowBudgetFraction = 0 }.Validate());

@@ -15,12 +15,14 @@ namespace ConnectionPool.Dataverse;
 /// <param name="DopHint"><c>x-ms-dop-hint</c>.</param>
 /// <param name="ServiceRequestId"><c>x-ms-service-request-id</c>, for Microsoft support correlation.</param>
 /// <param name="ObservedAt">When the response was observed.</param>
+/// <param name="ServerId">The backend node that answered: the last <c>|</c>-separated part of <c>X-Source</c>. Diagnostic only; the budget counter was not seen to differ per node.</param>
 public sealed record ResponseBudget(
     double? BurstRemainingRequests,
     double? TimeRemainingSeconds,
     int? DopHint,
     string? ServiceRequestId,
-    DateTimeOffset ObservedAt);
+    DateTimeOffset ObservedAt,
+    string? ServerId = null);
 
 /// <summary>
 /// Reads <see cref="ResponseBudget"/> from the SDK's own HTTP responses through the .NET HTTP
@@ -86,7 +88,8 @@ internal static class ResponseObservation
         double? time = ReadDouble(response, "x-ms-ratelimit-time-remaining-xrm-requests");
         var dopRaw = ReadRaw(response, "x-ms-dop-hint");
         int? dop = int.TryParse(dopRaw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var d) ? d : null;
-        budget = new ResponseBudget(burst, time, dop, ReadRaw(response, "x-ms-service-request-id"), observedAt);
+        var serverId = ReadRaw(response, "X-Source")?.Split('|').Last().Trim();
+        budget = new ResponseBudget(burst, time, dop, ReadRaw(response, "x-ms-service-request-id"), observedAt, string.IsNullOrEmpty(serverId) ? null : serverId);
         return burst is not null || time is not null || dop is not null;
     }
 

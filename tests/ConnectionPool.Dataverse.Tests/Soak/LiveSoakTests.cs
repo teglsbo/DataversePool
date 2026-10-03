@@ -116,6 +116,10 @@ public class LiveSoakTests
         _output.WriteLine(header);
         File.AppendAllText(progress, header + Environment.NewLine);
 
+        // Stable small number per backend node name, so the CSV shows which node answered without long ids.
+        var servers = new System.Collections.Concurrent.ConcurrentDictionary<string, int>();
+        double ServerNumber(string? id) => id is null ? double.NaN : servers.GetOrAdd(id, _ => servers.Count + 1);
+
         var runner = new SoakRunner(
             new SoakOptions
             {
@@ -161,6 +165,9 @@ public class LiveSoakTests
                 ["a_max_size"] = memberA.MaxSize,
                 ["b_max_size"] = memberB.MaxSize,
                 ["guard_tokens"] = bucket?.Available ?? double.NaN,
+                ["a_server_no"] = ServerNumber(pool.GetResponseBudget(memberA)?.ServerId),
+                ["b_server_no"] = ServerNumber(pool.GetResponseBudget(memberB)?.ServerId),
+                ["servers_seen"] = servers.Count,
             });
 
         var result = await runner.RunAsync(phases);

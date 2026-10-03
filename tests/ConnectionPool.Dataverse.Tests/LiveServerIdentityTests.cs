@@ -23,6 +23,7 @@ public class LiveServerIdentityTests
     private sealed class Collector : IObserver<DiagnosticListener>, IObserver<KeyValuePair<string, object?>>
     {
         public ConcurrentBag<Seen> Events { get; } = new();
+        public ConcurrentQueue<string> ArrRaw { get; } = new();
 
         public void OnNext(DiagnosticListener listener)
         {
@@ -61,6 +62,7 @@ public class LiveServerIdentityTests
                 if (arr is not null)
                 {
                     var value = arr.Split(';')[0]["ARRAffinity=".Length..];
+                    ArrRaw.Enqueue(value);
                     headers["_arr"] = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(value)))[..8];
                 }
             }
@@ -75,6 +77,48 @@ public class LiveServerIdentityTests
 
         public void OnError(Exception error) { }
         public void OnCompleted() { }
+    }
+
+    [SkippableFact]
+    public async Task PinnedAffinityCookie_ShowsWhetherItIdentifiesTheServer()
+    {
+        var connectionString = LiveDataverseCredentials.GetConnectionString(0);
+        Skip.If(string.IsNullOrEmpty(connectionString), "Set DVPOOL_IT_* credentials.");
+
+        var member = new DataverseUserPool("A", connectionString!, new PoolOptions { MaxSize = 8 });
+        await using var pool = new DataversePool(member);
+        var collector = new Collector();
+        using var subscription = DiagnosticListener.AllListeners.Subscribe(collector);
+
+        async Task CallAsync(string? cookie)
+        {
+            await pool.ExecuteWithThrottleRetryAsync("web", async (c, ct) =>
+            {
+                var custom = cookie is null ? null : new Dictionary<string, List<string>> { ["Cookie"] = new() { "ARRAffinity=" + cookie } };
+                using var r = await c.ExecuteWebRequestAsync(HttpMethod.Get, "WhoAmI()", string.Empty, custom, "application/json", ct);
+                return (int)r.StatusCode;
+            });
+        }
+
+        await Task.WhenAll(Enumerable.Range(0, 40).Select(_ => CallAsync(null)));
+        var cookies = collector.ArrRaw.Distinct().Take(3).ToArray();
+        _output.WriteLine($"captured {cookies.Length} distinct cookies");
+
+        foreach (var cookie in cookies)
+        {
+            collector.Events.Clear();
+            collector.ArrRaw.Clear();
+            for (var i = 0; i < 20; i++)
+            {
+                await CallAsync(cookie);
+            }
+
+            var events = collector.Events.ToArray();
+            var returned = collector.ArrRaw.Distinct().ToArray();
+            var budgets = events.Select(e => double.Parse(e.Headers["x-ms-ratelimit-burst-remaining-xrm-requests"].Replace(",", string.Empty), System.Globalization.CultureInfo.InvariantCulture)).ToArray();
+            var parts = events.Where(e => e.Headers.ContainsKey("_xsource")).Select(e => e.Headers["_xsource"].Split('|').Last()).Distinct().Count();
+            _output.WriteLine($"pinned cookie {cookie.GetHashCode():X}: {events.Length} responses, new cookie values returned={returned.Length}, same as sent={returned.Contains(cookie)}, burst {budgets.Min()}..{budgets.Max()}, X-Source part1 distinct={parts}");
+        }
     }
 
     [SkippableFact]
