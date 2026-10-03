@@ -122,6 +122,95 @@ public class PoolSizingTests
         Assert.Throws<ArgumentOutOfRangeException>(() => new AimdPoolSizingStrategy(new AimdPoolSizingStrategyOptions { MinSize = 5, Ceiling = 3 }));
     }
 
+    // ----- Gradient -----
+
+    private static PoolSizingOperationOutcome Ok(double ms, int inFlight = 8, string op = "op") =>
+        new(op, TimeSpan.FromMilliseconds(ms), PoolSizingOutcomeKind.Success, null, null, inFlight);
+
+    private static void Feed(GradientPoolSizingStrategy g, DataverseUserPool m, double ms, int n = 10, int inFlight = 8, string op = "op")
+    {
+        for (var i = 0; i < n; i++)
+        {
+            g.OnOperationCompleted(m, Ok(ms, inFlight, op));
+        }
+    }
+
+    [Fact]
+    public async Task Gradient_SlowerThanMinRtt_Shrinks()
+    {
+        await using var m = NewMember();
+        var g = new GradientPoolSizingStrategy(new GradientPoolSizingStrategyOptions { Smoothing = 1 }, new ManualTime());
+        g.GetInitialSize(m, 8);
+        Feed(g, m, 100);
+        Assert.Equal(8, g.OnTick(m, Stats(m), null)?.TargetMaxSize); // baseline window, headroom capped at ceiling
+
+        Feed(g, m, 400);
+        Assert.True(g.OnTick(m, Stats(m), null)?.TargetMaxSize < 8);
+    }
+
+    [Fact]
+    public async Task Gradient_TooFewSamples_HasNoOpinion()
+    {
+        await using var m = NewMember();
+        var g = new GradientPoolSizingStrategy(new GradientPoolSizingStrategyOptions { Smoothing = 1 }, new ManualTime());
+        g.GetInitialSize(m, 8);
+        Feed(g, m, 100, n: 3);
+        Assert.Null(g.OnTick(m, Stats(m), null));
+    }
+
+    [Fact]
+    public async Task Gradient_WorstOperationWins()
+    {
+        await using var m = NewMember();
+        var g = new GradientPoolSizingStrategy(new GradientPoolSizingStrategyOptions { Smoothing = 1 }, new ManualTime());
+        g.GetInitialSize(m, 8);
+        Feed(g, m, 100, op: "fast");
+        Feed(g, m, 100, op: "slow");
+        g.OnTick(m, Stats(m), null);
+
+        Feed(g, m, 100, op: "fast");
+        Feed(g, m, 500, op: "slow");
+        Assert.True(g.OnTick(m, Stats(m), null)?.TargetMaxSize < 8);
+    }
+
+    [Fact]
+    public async Task Gradient_IdleMember_DoesNotGrow()
+    {
+        await using var m = NewMember(maxSize: 8);
+        var g = new GradientPoolSizingStrategy(new GradientPoolSizingStrategyOptions { Ceiling = 16 }, new ManualTime());
+        g.GetInitialSize(m, 8);
+        Feed(g, m, 100, inFlight: 1);
+        Assert.Equal(8, g.OnTick(m, Stats(m), null)?.TargetMaxSize);
+
+        var busy = NewMember("busy", 8);
+        var g2 = new GradientPoolSizingStrategy(new GradientPoolSizingStrategyOptions { Ceiling = 16 }, new ManualTime());
+        g2.GetInitialSize(busy, 8);
+        Feed(g2, busy, 100, inFlight: 8);
+        Assert.True(g2.OnTick(busy, Stats(busy), null)?.TargetMaxSize > 8);
+        await busy.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Gradient_IgnoresFailuresAndThrottles()
+    {
+        await using var m = NewMember();
+        var g = new GradientPoolSizingStrategy(timeProvider: new ManualTime());
+        g.GetInitialSize(m, 8);
+        for (var i = 0; i < 20; i++)
+        {
+            g.OnOperationCompleted(m, Throttle(ThrottleReason.ConcurrentRequests));
+        }
+
+        Assert.Null(g.OnTick(m, Stats(m), null));
+    }
+
+    [Fact]
+    public void Gradient_InvalidOptions_Throw()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => new GradientPoolSizingStrategy(new GradientPoolSizingStrategyOptions { Smoothing = 0 }));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new GradientPoolSizingStrategy(new GradientPoolSizingStrategyOptions { MinSamples = 0 }));
+    }
+
     // ----- DopHint / Fixed -----
 
     [Fact]

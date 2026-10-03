@@ -578,7 +578,8 @@ var pool = new DataversePool(members, sizingOptions: new PoolSizingOptions
 {
     Strategy = new CompositePoolSizingStrategy(
         new DopHintPoolSizingStrategy(),   // follow Dataverse's x-ms-dop-hint
-        new AimdPoolSizingStrategy()),     // halve on concurrent-request throttles, regrow slowly
+        new AimdPoolSizingStrategy(),      // halve on concurrent-request throttles, regrow slowly
+        new GradientPoolSizingStrategy()), // shrink when call latency climbs above its baseline
     MinSizeFloor = 2,
 });
 ```

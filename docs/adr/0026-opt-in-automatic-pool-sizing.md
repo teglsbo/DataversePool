@@ -1,7 +1,7 @@
 # ADR-0026: Opt-in automatic pool sizing via `IPoolSizingStrategy`
 
 ## Status
-Accepted. `Fixed` (default), `DopHint`, `Aimd` and `Composite` are implemented. `Gradient`, the
+Accepted. `Fixed` (default), `DopHint`, `Aimd`, `Gradient` and `Composite` are implemented. The
 window-budget pacer and BBR-style probing are **not**.
 
 ## Context
@@ -44,6 +44,10 @@ limit fired before it shrinks anything.
   in-flight throttles that follow one congestion event, otherwise one event would collapse the
   size. Regrowth is +1 per tick after `max(CooldownAfterThrottle, Retry-After)`. Request-count,
   execution-time and unknown throttles never change the size.
+- `Gradient` samples successful latency per operation name; each tick it computes
+  `minRtt / meanRtt` (clamped to [0.5, 1]), takes the minimum across operations, and moves the size
+  toward `gradient * size + sqrt(size)` with smoothing. It never grows an under-used member, and
+  re-learns `minRtt` every 5 min. Latency is weak evidence on Dataverse, so pair it with `Aimd`.
 - `DopHint` follows `RecommendedDegreesOfParallelism` on tick and has no opinion until a hint exists.
 - `Composite` keeps each child's latest vote per member and combines with `Min` (default) or `Max`,
   so a silent child does not lose its earlier, lower vote.
