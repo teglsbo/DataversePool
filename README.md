@@ -330,6 +330,12 @@ fewest leased connections (`PoolStats.LeasedCount`), with the same dead-member c
 var pool = new DataversePool(members, new LeastConnectionsSlotSelectionStrategy());
 ```
 
+`HealthWeightedLeastConnectionsSlotSelectionStrategy` goes one step further: it ranks members by
+*headroom* (`(cap - leased) / cap`, where `cap` is the smaller of the pool's `MaxSize` and the
+server's `x-ms-dop-hint`), and after a member's throttle window ends it ramps that member back in
+(cap starts at 2, +1 every 5 s by default) instead of releasing every queued caller onto it at once.
+The ramp is a ranking preference, not a hard limit. See `docs/research/autoscaling.md` §9.6.
+
 **Throttle-aware routing.** Both strategies also skip a member that's currently marked as
 Dataverse-throttled. `DataversePool.AcquireAsync()` returns a `DataverseLease` (not a
 plain lease) specifically so you can report a 429 back to the member that actually served the

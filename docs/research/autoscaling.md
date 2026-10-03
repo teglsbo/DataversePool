@@ -1308,6 +1308,10 @@ request type or connection can still trip a member (per-slot counters are in `PL
 whole app user, so skipping the member is deliberately conservative. Suggested order: (1)+(2) first
 — they need only gauges that already exist — then (4), then (3)'s ramp.
 
+**Status:** items (1) and (2) are implemented as `HealthWeightedLeastConnectionsSlotSelectionStrategy`
+(headroom ranking; stateless post-throttle ramp derived from `ThrottledUntil`; `dop_hint` cap).
+Items (3)'s probe ramp and (4) are not started.
+
 ## 10. Configurable settings proposal
 
 Strategy selection and shared/global settings are listed first; strategy-specific tunables live on
