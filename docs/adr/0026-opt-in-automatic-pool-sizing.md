@@ -138,3 +138,14 @@ response (`x-ms-ratelimit-burst-remaining-xrm-requests`, `x-ms-ratelimit-time-re
   counter, not one per node. Jumps of 500-700 under concurrent load are likely delayed synchronisation of a shared
   counter. Whether more front-end nodes give more budget in production is open; the logged node id lets a soak
   run answer it.
+
+### Addendum: Aimd against an unbounded consumer
+- Live (sandbox user, 1000 workers, MaxSize 400, default options): the 8000 requests/5 min budget bound the run, so
+  size never changed (no concurrency 429s). The request budget, not pool size, was the limit there.
+- Simulation (`AimdSimulationTests`, 1000 workers, MaxSize 400, defaults, modelled concurrency limits 20/52/100):
+  Aimd halves from 400 to under the limit within about a minute, then saw-tooths between about 0.5x and 1.0x the limit,
+  serving about 73-74% of the ideal. No per-environment tuning was needed.
+- Opt-in `AimdPoolSizingStrategyOptions.BinaryRecovery`: after a concurrency throttle, regrowth closes half the gap to the
+  size that was throttled and holds one below it for `RequestWindow`, then probes additively. Simulated: 90-92% served,
+  same or fewer throttles, far fewer size changes. Not yet validated live (needs an environment whose request budget
+  does not dominate).

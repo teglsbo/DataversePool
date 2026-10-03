@@ -229,6 +229,29 @@ public class AimdSimulationTests
     }
 
     [Fact]
+    public void BinaryRecovery_RegrowsFaster_AndServesMoreThanAdditiveGrowth()
+    {
+        foreach (var limit in new[] { 20, 52, 100 })
+        {
+            Result Run(bool binary) => Simulate(new Scenario(
+                $"{(binary ? "BinaryRecovery" : "default")}, concurrency limit {limit}",
+                ConcurrencyLimit: limit,
+                RequestsPerWindow: int.MaxValue,
+                StartSize: 400,
+                Latency: TimeSpan.FromMilliseconds(150),
+                RetryAfter: TimeSpan.FromSeconds(2),
+                Duration: TimeSpan.FromMinutes(30),
+                Options: new AimdPoolSizingStrategyOptions { BinaryRecovery = binary }));
+
+            var additive = Run(false);
+            var binaryResult = Run(true);
+
+            Assert.True(binaryResult.Efficiency > additive.Efficiency, $"limit {limit}: {binaryResult.Efficiency:P0} vs {additive.Efficiency:P0}");
+            Assert.True(binaryResult.ThrottleFraction <= additive.ThrottleFraction + 0.01);
+        }
+    }
+
+    [Fact]
     public void DefaultAimd_WithABindingRequestBudget_StaysStable()
     {
         var r = Simulate(new Scenario(

@@ -37,6 +37,14 @@ public sealed class AimdPoolSizingStrategyOptions
     /// </summary>
     public double RequestRateFactor { get; init; } = 0.8;
 
+    /// <summary>
+    /// Opt-in. After a concurrency throttle the size it happened at is remembered as too big. Regrowth then closes
+    /// half the gap to it each tick and holds one below it, instead of adding <see cref="IncreaseStep"/>; once
+    /// <see cref="RequestWindow"/> has passed the memory is dropped and additive growth probes upward again.
+    /// Cuts recovery time and time spent far below the limit. Default: <c>false</c>.
+    /// </summary>
+    public bool BinaryRecovery { get; init; }
+
     /// <summary>Dataverse's request-count window. Default 5 minutes.</summary>
     public TimeSpan RequestWindow { get; init; } = TimeSpan.FromMinutes(5);
 
@@ -132,6 +140,8 @@ public sealed class AimdPoolSizingStrategy : IPoolSizingStrategy
         public int Current;
         public int Ceiling;
         public int MaxProbed;
+        public int? Bad;
+        public DateTimeOffset BadAt;
         public bool Probing;
         public bool ProbeReached;
         public DateTimeOffset ProbeEndsAt;
@@ -231,6 +241,8 @@ public sealed class AimdPoolSizingStrategy : IPoolSizingStrategy
 
         var target = Math.Max(_options.MinSize, (int)Math.Round(state.Current * _options.DecreaseFactor, MidpointRounding.AwayFromZero));
         target = Math.Min(target, state.Current);
+        state.Bad = state.Current;
+        state.BadAt = now;
         state.Current = target;
         return Decide(state);
     }
@@ -337,8 +349,9 @@ public sealed class AimdPoolSizingStrategy : IPoolSizingStrategy
 
         if (now >= state.CooldownUntil && state.Current < state.Ceiling)
         {
-            state.Current = Math.Min(state.Ceiling, state.Current + _options.IncreaseStep);
-            changed = true;
+            var grown = Math.Min(state.Ceiling, NextSize(state, now));
+            changed = grown != state.Current;
+            state.Current = grown;
         }
 
         if (!changed
@@ -357,6 +370,24 @@ public sealed class AimdPoolSizingStrategy : IPoolSizingStrategy
         }
 
         return changed ? Decide(state) : null;
+    }
+
+    private int NextSize(State state, DateTimeOffset now)
+    {
+        if (!_options.BinaryRecovery || state.Bad is not { } bad)
+        {
+            return state.Current + _options.IncreaseStep;
+        }
+
+        if (now - state.BadAt >= _options.RequestWindow)
+        {
+            state.Bad = null;
+            return state.Current + _options.IncreaseStep;
+        }
+
+        // Known-bad size above, last back-off below: close half the gap, hold just under the bad size.
+        var room = bad - 1 - state.Current;
+        return room <= 0 ? state.Current : state.Current + Math.Max(1, room / 2);
     }
 
     private State StateFor(DataverseUserPool member) =>
