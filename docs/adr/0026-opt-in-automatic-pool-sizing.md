@@ -2,7 +2,7 @@
 
 ## Status
 Accepted. `Fixed` (default), `DopHint`, `Aimd`, `Gradient` and `Composite` are implemented. A
-per-member request-rate pacer is implemented. The execution-time pacer and BBR-style probing are **not**.
+per-member request-rate pacer is implemented. `Aimd` probing is implemented (opt-in). The execution-time pacer is **not**.
 
 ## Context
 
@@ -50,6 +50,11 @@ limit fired before it shrinks anything.
   execution-time and unknown throttles never change the size. A request-count throttle instead caps
   the request rate at 80% of what was sent in the last 5 min (pacer), holds it for the cooldown,
   then relaxes it ~10% per tick and removes it once it passes twice the throttled volume.
+- `Aimd` probing (`ProbeInterval`, default off): after the interval with no throttle, while the member
+  reached its size since the last tick, it tries `ProbeStep` more for `ProbeDuration`. If the probe
+  size was actually reached without a concurrency throttle the ceiling moves up (never past
+  `MaxProbedSize`, default 2x configured); if not reached it reverts; a concurrency throttle reverts
+  to the proven size at once, without halving.
 - `Gradient` samples successful latency per operation name; each tick it computes
   `minRtt / meanRtt` (clamped to [0.5, 1]), takes the minimum across operations, and moves the size
   toward `gradient * size + sqrt(size)` with smoothing. It never grows an under-used member, and

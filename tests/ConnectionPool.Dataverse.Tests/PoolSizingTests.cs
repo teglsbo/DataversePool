@@ -121,6 +121,112 @@ public class PoolSizingTests
         Assert.Throws<ArgumentOutOfRangeException>(() => new AimdPoolSizingStrategy(new AimdPoolSizingStrategyOptions { MinSize = 5, Ceiling = 3 }));
     }
 
+    // ----- Aimd probing -----
+
+    private static AimdPoolSizingStrategy Prober(ManualTime time) =>
+        new(new AimdPoolSizingStrategyOptions { ProbeInterval = TimeSpan.FromMinutes(10) }, time);
+
+    [Fact]
+    public async Task AimdProbe_IsOffByDefault()
+    {
+        await using var m = NewMember();
+        var time = new ManualTime();
+        var aimd = new AimdPoolSizingStrategy(timeProvider: time);
+        aimd.GetInitialSize(m, 8);
+        aimd.OnOperationCompleted(m, Ok(5, inFlight: 8));
+        time.Advance(TimeSpan.FromHours(1));
+        Assert.Null(aimd.OnTick(m, Stats(m), null));
+    }
+
+    [Fact]
+    public async Task AimdProbe_NeedsQuietIntervalAndSaturation()
+    {
+        await using var m = NewMember();
+        var time = new ManualTime();
+        var aimd = Prober(time);
+        aimd.GetInitialSize(m, 8);
+
+        aimd.OnOperationCompleted(m, Ok(5, inFlight: 8));
+        time.Advance(TimeSpan.FromMinutes(5));
+        Assert.Null(aimd.OnTick(m, Stats(m), null)); // not quiet long enough
+
+        time.Advance(TimeSpan.FromMinutes(6));
+        Assert.Null(aimd.OnTick(m, Stats(m), null)); // quiet, but saw no saturation since last tick
+
+        aimd.OnOperationCompleted(m, Ok(5, inFlight: 8));
+        Assert.Equal(9, aimd.OnTick(m, Stats(m), null)?.TargetMaxSize);
+    }
+
+    [Fact]
+    public async Task AimdProbe_UsedWithoutThrottle_RaisesCeiling()
+    {
+        await using var m = NewMember();
+        var time = new ManualTime();
+        var aimd = Prober(time);
+        aimd.GetInitialSize(m, 8);
+        time.Advance(TimeSpan.FromMinutes(11));
+        aimd.OnOperationCompleted(m, Ok(5, inFlight: 8));
+        Assert.Equal(9, aimd.OnTick(m, Stats(m), null)?.TargetMaxSize);
+
+        aimd.OnOperationCompleted(m, Ok(5, inFlight: 9));
+        time.Advance(TimeSpan.FromSeconds(61));
+        Assert.Equal(9, aimd.OnTick(m, Stats(m), null)?.TargetMaxSize);
+
+        // New ceiling is 9: a later throttle halves from there.
+        time.Advance(TimeSpan.FromMinutes(1));
+        Assert.Equal(5, aimd.OnOperationCompleted(m, Throttle(ThrottleReason.ConcurrentRequests))?.TargetMaxSize);
+    }
+
+    [Fact]
+    public async Task AimdProbe_Unused_RevertsWithoutRaisingCeiling()
+    {
+        await using var m = NewMember();
+        var time = new ManualTime();
+        var aimd = Prober(time);
+        aimd.GetInitialSize(m, 8);
+        time.Advance(TimeSpan.FromMinutes(11));
+        aimd.OnOperationCompleted(m, Ok(5, inFlight: 8));
+        aimd.OnTick(m, Stats(m), null);
+
+        time.Advance(TimeSpan.FromSeconds(61));
+        Assert.Equal(8, aimd.OnTick(m, Stats(m), null)?.TargetMaxSize);
+    }
+
+    [Fact]
+    public async Task AimdProbe_ThrottleDuringProbe_RevertsToProvenSizeWithoutHalving()
+    {
+        await using var m = NewMember();
+        var time = new ManualTime();
+        var aimd = Prober(time);
+        aimd.GetInitialSize(m, 8);
+        time.Advance(TimeSpan.FromMinutes(11));
+        aimd.OnOperationCompleted(m, Ok(5, inFlight: 8));
+        aimd.OnTick(m, Stats(m), null);
+
+        var d = aimd.OnOperationCompleted(m, Throttle(ThrottleReason.ConcurrentRequests));
+
+        Assert.Equal(8, d?.TargetMaxSize);
+    }
+
+    [Fact]
+    public async Task AimdProbe_NeverExceedsMaxProbedSize()
+    {
+        await using var m = NewMember(maxSize: 8);
+        var time = new ManualTime();
+        var aimd = new AimdPoolSizingStrategy(new AimdPoolSizingStrategyOptions { ProbeInterval = TimeSpan.FromMinutes(1), MaxProbedSize = 9 }, time);
+        aimd.GetInitialSize(m, 8);
+        time.Advance(TimeSpan.FromMinutes(2));
+        aimd.OnOperationCompleted(m, Ok(5, inFlight: 8));
+        aimd.OnTick(m, Stats(m), null); // probe to 9
+        aimd.OnOperationCompleted(m, Ok(5, inFlight: 9));
+        time.Advance(TimeSpan.FromSeconds(61));
+        aimd.OnTick(m, Stats(m), null); // accepted
+
+        time.Advance(TimeSpan.FromMinutes(2));
+        aimd.OnOperationCompleted(m, Ok(5, inFlight: 9));
+        Assert.Null(aimd.OnTick(m, Stats(m), null));
+    }
+
     // ----- Pacer -----
 
     [Fact]

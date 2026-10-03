@@ -40,8 +40,40 @@ public sealed class AimdPoolSizingStrategyOptions
     /// <summary>Dataverse's request-count window. Default 5 minutes.</summary>
     public TimeSpan RequestWindow { get; init; } = TimeSpan.FromMinutes(5);
 
+    /// <summary>
+    /// Opt-in probing (BBR ProbeBW style): after this long with no throttle while the member is
+    /// saturated at its ceiling, briefly try <see cref="ProbeStep"/> more. If the probe is used without
+    /// a throttle the ceiling moves up; on a concurrency throttle it reverts immediately. Lets the
+    /// strategy find capacity that grew after it was throttled. Default: <c>null</c> (off).
+    /// </summary>
+    public TimeSpan? ProbeInterval { get; init; }
+
+    /// <summary>Sizes added during a probe. Default 1.</summary>
+    public int ProbeStep { get; init; } = 1;
+
+    /// <summary>How long a probe is observed before being accepted. Default 60 s.</summary>
+    public TimeSpan ProbeDuration { get; init; } = TimeSpan.FromSeconds(60);
+
+    /// <summary>The ceiling never probes past this. Unset: twice the member's configured MaxSize.</summary>
+    public int? MaxProbedSize { get; init; }
+
     internal void Validate()
     {
+        if (ProbeInterval is { } pi && pi <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(ProbeInterval), pi, "Must be positive.");
+        }
+
+        if (ProbeStep < 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(ProbeStep), ProbeStep, "Must be at least 1.");
+        }
+
+        if (ProbeDuration <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(ProbeDuration), ProbeDuration, "Must be positive.");
+        }
+
         if (RequestRateFactor is <= 0 or >= 1 || double.IsNaN(RequestRateFactor))
         {
             throw new ArgumentOutOfRangeException(nameof(RequestRateFactor), RequestRateFactor, "Must be between 0 and 1 (exclusive).");
@@ -99,6 +131,12 @@ public sealed class AimdPoolSizingStrategy : IPoolSizingStrategy
     {
         public int Current;
         public int Ceiling;
+        public int MaxProbed;
+        public bool Probing;
+        public bool ProbeReached;
+        public DateTimeOffset ProbeEndsAt;
+        public DateTimeOffset QuietSince;
+        public int MaxInFlight;
         public DateTimeOffset CooldownUntil;
         public DateTimeOffset NoDecreaseUntil;
         public readonly Queue<DateTimeOffset> Sent = new();
@@ -129,6 +167,21 @@ public sealed class AimdPoolSizingStrategy : IPoolSizingStrategy
     {
         var state = StateFor(member);
         var now = _time.GetUtcNow();
+        if (outcome.Outcome == PoolSizingOutcomeKind.Throttled)
+        {
+            state.QuietSince = now;
+        }
+
+        if (state.Probing && outcome.Outcome == PoolSizingOutcomeKind.Throttled && outcome.ThrottleReason == ThrottleReason.ConcurrentRequests)
+        {
+            // The probe overshot: go back to the proven size, no further decrease.
+            state.Probing = false;
+            state.Current = state.Ceiling;
+            state.CooldownUntil = now + _options.CooldownAfterThrottle;
+            return Decide(state);
+        }
+
+        state.MaxInFlight = Math.Max(state.MaxInFlight, outcome.InFlightCount);
         state.Sent.Enqueue(now);
         while (state.Sent.Count > 0 && now - state.Sent.Peek() >= _options.RequestWindow)
         {
@@ -189,6 +242,32 @@ public sealed class AimdPoolSizingStrategy : IPoolSizingStrategy
         var state = StateFor(member);
         var now = _time.GetUtcNow();
         var changed = false;
+        var saturated = state.MaxInFlight >= state.Current;
+        state.MaxInFlight = 0;
+
+        if (state.Probing)
+        {
+            state.ProbeReached |= saturated;
+            if (now < state.ProbeEndsAt)
+            {
+                return null;
+            }
+
+            // Accept only if the probe size was actually reached; otherwise it proved nothing.
+            state.Probing = false;
+            state.QuietSince = now;
+            if (state.ProbeReached)
+            {
+                state.Ceiling = state.Current;
+            }
+            else
+            {
+                state.Current = state.Ceiling;
+            }
+
+            return Decide(state);
+        }
+
         if (state.RateLimit is { } rate && now >= state.RateCooldownUntil)
         {
             var grown = rate + Math.Max(1, rate / 10);
@@ -207,6 +286,21 @@ public sealed class AimdPoolSizingStrategy : IPoolSizingStrategy
             changed = true;
         }
 
+        if (!changed
+            && _options.ProbeInterval is { } interval
+            && saturated
+            && state.Current >= state.Ceiling
+            && state.Ceiling < state.MaxProbed
+            && now >= state.CooldownUntil
+            && now - state.QuietSince >= interval)
+        {
+            state.Probing = true;
+            state.ProbeReached = false;
+            state.ProbeEndsAt = now + _options.ProbeDuration;
+            state.Current = Math.Min(state.MaxProbed, state.Ceiling + _options.ProbeStep);
+            return Decide(state);
+        }
+
         return changed ? Decide(state) : null;
     }
 
@@ -217,5 +311,7 @@ public sealed class AimdPoolSizingStrategy : IPoolSizingStrategy
     {
         Current = configuredMaxSize,
         Ceiling = Math.Max(_options.MinSize, _options.Ceiling ?? configuredMaxSize),
+        MaxProbed = Math.Max(_options.MinSize, _options.MaxProbedSize ?? configuredMaxSize * 2),
+        QuietSince = _time.GetUtcNow(),
     };
 }

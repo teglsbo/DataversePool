@@ -1042,7 +1042,7 @@ without a code fork).
 > **Status:** implemented for `Fixed`, `DopHint`, `Aimd`, `Gradient` and `Composite` (`docs/adr/0026`). Deviations
 > from the sketch below: `GetInitialSize` also takes the configured max size, `OnOperationCompleted`
 > returns the decision, the pacing fields are ignored, and `Aimd` has a decrease holdoff but no
-> probing. `Gradient` is also implemented (mean latency per tick window, smoothed, no p-quantiles). A request-count pacer is implemented (`Aimd` sets it on `RequestCount` throttles); the execution-time pacer and `TrickleMinSize` are still open.
+> probing. `Gradient` is also implemented (mean latency per tick window, smoothed, no p-quantiles). A request-count pacer is implemented (`Aimd` sets it on `RequestCount` throttles); `Aimd` probing is implemented (opt-in, `ProbeInterval`); the execution-time pacer and `TrickleMinSize` are still open.
 
 Named and shaped to sit next to `ISlotSelectionStrategy`, with the same conventions: an
 XML-doc-driven interface in `ConnectionPool.Dataverse`, default-interface-method no-ops for
