@@ -9,6 +9,9 @@ internal sealed class MemberRequestPacer(TimeProvider time)
 {
     private readonly object _gate = new();
     private readonly Queue<DateTimeOffset> _starts = new();
+    private readonly Queue<(DateTimeOffset At, TimeSpan Duration)> _executions = new();
+    private TimeSpan _executionSum;
+    private TimeSpan? _executionLimit;
     private int? _limit;
     private TimeSpan _window = TimeSpan.FromMinutes(5);
 
@@ -17,10 +20,30 @@ internal sealed class MemberRequestPacer(TimeProvider time)
         get { lock (_gate) { return (_limit, _window); } }
     }
 
-    public void Configure(int? maxRequestsPerWindow, TimeSpan? window)
+    /// <summary>Adds a finished attempt's duration to the execution-time budget window.</summary>
+    public void RecordExecution(TimeSpan duration)
     {
         lock (_gate)
         {
+            if (_executionLimit is not null)
+            {
+                _executions.Enqueue((time.GetUtcNow(), duration));
+                _executionSum += duration;
+            }
+        }
+    }
+
+    public void Configure(int? maxRequestsPerWindow, TimeSpan? window, TimeSpan? maxExecutionTimePerWindow = null)
+    {
+        lock (_gate)
+        {
+            _executionLimit = maxExecutionTimePerWindow is { } e ? (e > TimeSpan.Zero ? e : TimeSpan.FromMilliseconds(1)) : null;
+            if (_executionLimit is null)
+            {
+                _executions.Clear();
+                _executionSum = TimeSpan.Zero;
+            }
+
             _limit = maxRequestsPerWindow is { } l ? Math.Max(1, l) : null;
             if (window is { } w && w > TimeSpan.Zero)
             {
@@ -36,7 +59,7 @@ internal sealed class MemberRequestPacer(TimeProvider time)
             TimeSpan delay;
             lock (_gate)
             {
-                if (_limit is not { } limit)
+                if (_limit is null && _executionLimit is null)
                 {
                     return;
                 }
@@ -47,13 +70,29 @@ internal sealed class MemberRequestPacer(TimeProvider time)
                     _starts.Dequeue();
                 }
 
-                if (_starts.Count < limit)
+                while (_executions.Count > 0 && now - _executions.Peek().At >= _window)
+                {
+                    _executionSum -= _executions.Dequeue().Duration;
+                }
+
+                var countBlocked = _limit is { } limit && _starts.Count >= limit;
+                var timeBlocked = _executionLimit is { } budget && _executionSum >= budget && _executions.Count > 0;
+                if (!countBlocked && !timeBlocked)
                 {
                     _starts.Enqueue(now);
                     return;
                 }
 
-                delay = _starts.Peek() + _window - now;
+                delay = TimeSpan.Zero;
+                if (countBlocked)
+                {
+                    delay = _starts.Peek() + _window - now;
+                }
+
+                if (timeBlocked)
+                {
+                    delay = TimeSpan.FromTicks(Math.Max(delay.Ticks, (_executions.Peek().At + _window - now).Ticks));
+                }
             }
 
             await Task.Delay(delay > TimeSpan.Zero ? delay : TimeSpan.FromMilliseconds(1), time, cancellationToken).ConfigureAwait(false);

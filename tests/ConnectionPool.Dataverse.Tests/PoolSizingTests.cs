@@ -40,7 +40,6 @@ public class PoolSizingTests
     }
 
     [Theory]
-    [InlineData(ThrottleReason.ExecutionTime)]
     [InlineData(ThrottleReason.Unknown)]
     public async Task Aimd_WindowBudgetThrottles_DoNotShrink(ThrottleReason reason)
     {
@@ -344,6 +343,78 @@ public class PoolSizingTests
         await controller.BeforeAttemptAsync(m, CancellationToken.None);
         using var cts = new CancellationTokenSource(50);
         await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await controller.BeforeAttemptAsync(m, cts.Token));
+    }
+
+    // ----- Execution-time pacing -----
+
+    [Fact]
+    public async Task Aimd_ExecutionTimeThrottle_CapsBusyTimeNotConcurrency_ThenRelaxes()
+    {
+        await using var m = NewMember();
+        var time = new ManualTime();
+        var aimd = new AimdPoolSizingStrategy(timeProvider: time);
+        aimd.GetInitialSize(m, 8);
+        for (var i = 0; i < 100; i++)
+        {
+            aimd.OnOperationCompleted(m, Ok(1000)); // 100 s of busy time
+        }
+
+        var d = aimd.OnOperationCompleted(m, Throttle(ThrottleReason.ExecutionTime));
+
+        Assert.Equal(8, d?.TargetMaxSize);
+        Assert.Equal(TimeSpan.FromSeconds(80), d?.MaxExecutionTimePerWindow);
+        Assert.Null(d?.MaxRequestsPerWindow);
+        Assert.Equal(TimeSpan.FromMinutes(5), d?.SampleWindow);
+
+        time.Advance(TimeSpan.FromSeconds(31));
+        Assert.Equal(TimeSpan.FromSeconds(88), aimd.OnTick(m, Stats(m), null)?.MaxExecutionTimePerWindow);
+
+        PoolSizingDecision? last = null;
+        for (var i = 0; i < 30; i++)
+        {
+            last = aimd.OnTick(m, Stats(m), null);
+        }
+
+        Assert.Null(last?.MaxExecutionTimePerWindow);
+    }
+
+    [Fact]
+    public async Task Pacer_ExecutionBudget_DelaysUntilBusyTimeLeavesWindow()
+    {
+        var pacer = new MemberRequestPacer(TimeProvider.System);
+        pacer.Configure(null, TimeSpan.FromMilliseconds(300), TimeSpan.FromMilliseconds(100));
+        await pacer.WaitAsync(CancellationToken.None);
+        pacer.RecordExecution(TimeSpan.FromMilliseconds(150)); // budget (100 ms) now exhausted
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await pacer.WaitAsync(CancellationToken.None);
+        Assert.True(sw.ElapsedMilliseconds >= 250, $"waited only {sw.ElapsedMilliseconds} ms");
+    }
+
+    [Fact]
+    public async Task Pacer_ClearingExecutionLimit_StopsDelaying()
+    {
+        var pacer = new MemberRequestPacer(TimeProvider.System);
+        pacer.Configure(null, TimeSpan.FromMinutes(5), TimeSpan.FromMilliseconds(1));
+        pacer.RecordExecution(TimeSpan.FromSeconds(10));
+        pacer.Configure(null, TimeSpan.FromMinutes(5), null);
+        await pacer.WaitAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Composite_ExecutionBudget_TakesTightest()
+    {
+        await using var m = NewMember();
+        var c = new CompositePoolSizingStrategy(new ExecScripted(60), new ExecScripted(20));
+        c.GetInitialSize(m, 8);
+        Assert.Equal(TimeSpan.FromSeconds(20), c.OnTick(m, Stats(m), null)?.MaxExecutionTimePerWindow);
+    }
+
+    private sealed class ExecScripted(int seconds) : IPoolSizingStrategy
+    {
+        public int GetInitialSize(DataverseUserPool member, int configuredMaxSize) => configuredMaxSize;
+        public PoolSizingDecision? OnTick(DataverseUserPool member, PoolStats currentStats, PoolSizingDecision? lastDecision) =>
+            new(8, null, TimeSpan.FromSeconds(seconds), TimeSpan.FromMinutes(5));
     }
 
     // ----- Gradient -----

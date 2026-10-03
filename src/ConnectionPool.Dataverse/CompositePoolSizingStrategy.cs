@@ -98,7 +98,17 @@ public sealed class CompositePoolSizingStrategy : IPoolSizingStrategy
             }
         }
 
-        return new PoolSizingDecision(Combine(votes), tightest?.MaxRequestsPerWindow, null, tightest?.SampleWindow);
+        TimeSpan? execution = null;
+        foreach (var last in lasts)
+        {
+            if (last?.MaxExecutionTimePerWindow is { } e && (execution is null || e < execution))
+            {
+                execution = e;
+                tightest ??= last;
+            }
+        }
+
+        return new PoolSizingDecision(Combine(votes), tightest?.MaxRequestsPerWindow, execution, tightest?.SampleWindow);
     }
 
     private int Combine(int[] votes) => _mode == PoolSizingCombineMode.Min ? votes.Min() : votes.Max();

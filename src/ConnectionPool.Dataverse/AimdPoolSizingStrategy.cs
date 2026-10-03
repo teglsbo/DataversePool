@@ -140,6 +140,10 @@ public sealed class AimdPoolSizingStrategy : IPoolSizingStrategy
         public DateTimeOffset CooldownUntil;
         public DateTimeOffset NoDecreaseUntil;
         public readonly Queue<DateTimeOffset> Sent = new();
+        public readonly Queue<(DateTimeOffset At, TimeSpan Duration)> Busy = new();
+        public TimeSpan BusySum;
+        public TimeSpan? ExecLimit;
+        public TimeSpan ExecDropAbove;
         public int? RateLimit;
         public int RateLimitDropAbove;
         public DateTimeOffset RateCooldownUntil;
@@ -183,6 +187,17 @@ public sealed class AimdPoolSizingStrategy : IPoolSizingStrategy
 
         state.MaxInFlight = Math.Max(state.MaxInFlight, outcome.InFlightCount);
         state.Sent.Enqueue(now);
+        if (outcome.Outcome is PoolSizingOutcomeKind.Success or PoolSizingOutcomeKind.Error)
+        {
+            state.Busy.Enqueue((now, outcome.Duration));
+            state.BusySum += outcome.Duration;
+        }
+
+        while (state.Busy.Count > 0 && now - state.Busy.Peek().At >= _options.RequestWindow)
+        {
+            state.BusySum -= state.Busy.Dequeue().Duration;
+        }
+
         while (state.Sent.Count > 0 && now - state.Sent.Peek() >= _options.RequestWindow)
         {
             state.Sent.Dequeue();
@@ -191,6 +206,11 @@ public sealed class AimdPoolSizingStrategy : IPoolSizingStrategy
         if (outcome.Outcome == PoolSizingOutcomeKind.Throttled && outcome.ThrottleReason == ThrottleReason.RequestCount)
         {
             return OnRequestCountThrottle(state, now, outcome);
+        }
+
+        if (outcome.Outcome == PoolSizingOutcomeKind.Throttled && outcome.ThrottleReason == ThrottleReason.ExecutionTime)
+        {
+            return OnExecutionTimeThrottle(state, now, outcome);
         }
 
         if (outcome.Outcome != PoolSizingOutcomeKind.Throttled || outcome.ThrottleReason != ThrottleReason.ConcurrentRequests)
@@ -234,8 +254,31 @@ public sealed class AimdPoolSizingStrategy : IPoolSizingStrategy
         return Decide(state);
     }
 
+    // Execution-time throttle: cap the busy time Dataverse sees per window (pacer), leave concurrency alone.
+    private PoolSizingDecision? OnExecutionTimeThrottle(State state, DateTimeOffset now, PoolSizingOperationOutcome outcome)
+    {
+        if (now < state.NoRateDecreaseUntil)
+        {
+            return null;
+        }
+
+        var cooldown = outcome.RetryAfter is { } retryAfter && retryAfter > _options.CooldownAfterThrottle
+            ? retryAfter
+            : _options.CooldownAfterThrottle;
+        state.NoRateDecreaseUntil = now + _options.DecreaseHoldoff;
+        state.RateCooldownUntil = now + cooldown;
+        var limit = TimeSpan.FromTicks(Math.Max(TimeSpan.TicksPerSecond, (long)(state.BusySum.Ticks * _options.RequestRateFactor)));
+        state.ExecLimit = state.ExecLimit is { } existing && existing < limit ? existing : limit;
+        state.ExecDropAbove = state.ExecDropAbove > state.BusySum * 2 ? state.ExecDropAbove : state.BusySum * 2;
+        return Decide(state);
+    }
+
     private PoolSizingDecision Decide(State state) =>
-        new(state.Current, state.RateLimit, null, state.RateLimit is null ? null : _options.RequestWindow);
+        new(
+            state.Current,
+            state.RateLimit,
+            state.ExecLimit,
+            state.RateLimit is null && state.ExecLimit is null ? null : _options.RequestWindow);
 
     public PoolSizingDecision? OnTick(DataverseUserPool member, PoolStats currentStats, PoolSizingDecision? lastDecision)
     {
@@ -266,6 +309,18 @@ public sealed class AimdPoolSizingStrategy : IPoolSizingStrategy
             }
 
             return Decide(state);
+        }
+
+        if (state.ExecLimit is { } exec && now >= state.RateCooldownUntil)
+        {
+            var grown = exec + TimeSpan.FromTicks(Math.Max(TimeSpan.TicksPerSecond, exec.Ticks / 10));
+            state.ExecLimit = grown > state.ExecDropAbove ? null : grown;
+            if (state.ExecLimit is null)
+            {
+                state.ExecDropAbove = TimeSpan.Zero;
+            }
+
+            changed = true;
         }
 
         if (state.RateLimit is { } rate && now >= state.RateCooldownUntil)

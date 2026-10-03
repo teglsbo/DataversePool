@@ -49,6 +49,11 @@ internal sealed class PoolSizingController : IOperationOutcomeSink, IDisposable
             return;
         }
 
+        if (outcome.Outcome is PoolSizingOutcomeKind.Success or PoolSizingOutcomeKind.Error)
+        {
+            state.Pacer.RecordExecution(outcome.Duration);
+        }
+
         lock (state.Gate)
         {
             var withLoad = outcome with { InFlightCount = pool.GetStats().LeasedCount };
@@ -85,7 +90,7 @@ internal sealed class PoolSizingController : IOperationOutcomeSink, IDisposable
         var ceiling = _options.MaxSizeCeiling ?? checked(state.ConfiguredMaxSize * 4);
         var target = Math.Clamp(decision.TargetMaxSize, _options.MinSizeFloor, Math.Max(_options.MinSizeFloor, ceiling));
         state.LastDecision = decision with { TargetMaxSize = target };
-        state.Pacer.Configure(decision.MaxRequestsPerWindow, decision.SampleWindow);
+        state.Pacer.Configure(decision.MaxRequestsPerWindow, decision.SampleWindow, decision.MaxExecutionTimePerWindow);
         if (target != member.MaxSize)
         {
             member.SetMaxSize(target);

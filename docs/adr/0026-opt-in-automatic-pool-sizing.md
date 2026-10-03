@@ -2,7 +2,8 @@
 
 ## Status
 Accepted. `Fixed` (default), `DopHint`, `Aimd`, `Gradient` and `Composite` are implemented. A
-per-member request-rate pacer is implemented. `Aimd` probing is implemented (opt-in). The execution-time pacer is **not**.
+per-member request-rate pacer is implemented. `Aimd` probing is implemented (opt-in). The execution-time pacer is implemented too, but never exercised against a real
+ExecutionTime throttle (none could be reproduced).
 
 ## Context
 
@@ -43,8 +44,10 @@ limit fired before it shrinks anything.
   per-member sliding-window limiter (`MemberRequestPacer`). The executor calls the sink's
   `BeforeAttemptAsync` after the lease is held and before the attempt runs; the wait is cancellable
   and excluded from call latency. `null` means unlimited, so a pacing strategy repeats its limit in
-  every decision; `Composite` takes the tightest child limit. `MaxExecutionTimePerWindow` is ignored.
-- `TrickleMinSize` is not implemented.
+  every decision; `Composite` takes the tightest child limit. `MaxExecutionTimePerWindow` works the same way: the pacer sums the durations of finished attempts
+  in the window and delays new ones while the sum is at the limit.
+- `TrickleMinSize` is not implemented as a separate option: `PoolSizingOptions.MinSizeFloor` and
+  `Aimd.MinSize` already keep a throttled member at a trickle so it still produces samples.
 
 ### Strategy behaviour
 
@@ -53,7 +56,8 @@ limit fired before it shrinks anything.
   size. Regrowth is +1 per tick after `max(CooldownAfterThrottle, Retry-After)`. Request-count,
   execution-time and unknown throttles never change the size. A request-count throttle instead caps
   the request rate at 80% of what was sent in the last 5 min (pacer), holds it for the cooldown,
-  then relaxes it ~10% per tick and removes it once it passes twice the throttled volume.
+  then relaxes it ~10% per tick and removes it once it passes twice the throttled volume. An
+  execution-time throttle caps busy time per window the same way (80% of the last 5 min).
 - `Aimd` probing (`ProbeInterval`, default off): after the interval with no throttle, while the member
   reached its size since the last tick, it tries `ProbeStep` more for `ProbeDuration`. If the probe
   size was actually reached without a concurrency throttle the ceiling moves up (never past
