@@ -65,6 +65,11 @@ public sealed class DataversePool : IAsyncDisposable
     /// </summary>
     public ResponseBudget? GetResponseBudget(DataverseUserPool member) => _sizing?.GetBudget(member);
 
+    /// <summary>Per backend node statistics (responses, lowest and highest burst budget) observed for
+    /// <paramref name="member"/>; empty unless response observation is on. Diagnostic only.</summary>
+    public IReadOnlyList<ServerNodeStats> GetServerNodeStats(DataverseUserPool member) =>
+        _sizing?.GetServerStats(member) ?? [];
+
     /// <summary>Convenience constructor for the common single-member case - equivalent to
     /// <c>new DataversePool(new[] { member }, strategy, allUnavailableBehavior)</c>. Prefer this
     /// (rather than using <paramref name="member"/> directly) if you might ever add more members

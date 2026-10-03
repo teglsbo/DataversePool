@@ -116,10 +116,6 @@ public class LiveSoakTests
         _output.WriteLine(header);
         File.AppendAllText(progress, header + Environment.NewLine);
 
-        // Stable small number per backend node name, so the CSV shows which node answered without long ids.
-        var servers = new System.Collections.Concurrent.ConcurrentDictionary<string, int>();
-        double ServerNumber(string? id) => id is null ? double.NaN : servers.GetOrAdd(id, _ => servers.Count + 1);
-
         var runner = new SoakRunner(
             new SoakOptions
             {
@@ -165,19 +161,22 @@ public class LiveSoakTests
                 ["a_max_size"] = memberA.MaxSize,
                 ["b_max_size"] = memberB.MaxSize,
                 ["guard_tokens"] = bucket?.Available ?? double.NaN,
-                ["a_server_no"] = ServerNumber(pool.GetResponseBudget(memberA)?.ServerId),
-                ["b_server_no"] = ServerNumber(pool.GetResponseBudget(memberB)?.ServerId),
-                ["servers_seen"] = servers.Count,
+                ["a_nodes"] = pool.GetServerNodeStats(memberA).Count,
+                ["b_nodes"] = pool.GetServerNodeStats(memberB).Count,
             });
 
         var result = await runner.RunAsync(phases);
         // With the guard on, spike throughput is set by the guard's refill rate, so it says nothing about the pool.
         var verdict = SoakAnalyzer.Analyze(result, new SoakThresholds { ThroughputFloorFraction = bucket is null ? 0.65 : 0 });
-        var report = SoakAnalyzer.Report(result, verdict);
+        var report = SoakAnalyzer.Report(result, verdict) + NodeReport("A", pool.GetServerNodeStats(memberA)) + NodeReport("B", pool.GetServerNodeStats(memberB));
         _output.WriteLine(report);
         File.WriteAllText(Path.Combine(dir, "report.txt"), report);
         SoakAnalyzer.WriteCsv(result, Path.Combine(dir, "samples.csv"));
 
         Assert.True(verdict.Passed, report);
     }
+
+    private static string NodeReport(string name, IReadOnlyList<ServerNodeStats> nodes) =>
+        $"{Environment.NewLine}Backend nodes for identity {name}: {nodes.Count}{Environment.NewLine}" +
+        string.Concat(nodes.Select(n => $"  {n.ServerId}: {n.Responses} responses, burst left {n.MinBurst:0}..{n.MaxBurst:0}{Environment.NewLine}"));
 }

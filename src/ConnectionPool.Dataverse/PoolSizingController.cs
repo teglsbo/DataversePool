@@ -19,6 +19,7 @@ internal sealed class PoolSizingController : IOperationOutcomeSink, IDisposable
         public ResponseBudget? Budget;
         public double MaxBurstSeen;
         public double MaxTimeSeen;
+        public readonly Dictionary<string, ServerNodeStats> Nodes = new();
     }
 
     private readonly IPoolSizingStrategy _strategy;
@@ -51,6 +52,25 @@ internal sealed class PoolSizingController : IOperationOutcomeSink, IDisposable
     public ResponseBudget? GetBudget(DataverseUserPool member) =>
         _members.TryGetValue(member, out var state) ? Volatile.Read(ref state.Budget) : null;
 
+    private const int MaxTrackedNodes = 256;
+
+    private static double? Min(double? a, double? b) => a is null ? b : b is null ? a : Math.Min(a.Value, b.Value);
+
+    private static double? Max(double? a, double? b) => a is null ? b : b is null ? a : Math.Max(a.Value, b.Value);
+
+    public IReadOnlyList<ServerNodeStats> GetServerStats(DataverseUserPool member)
+    {
+        if (!_members.TryGetValue(member, out var state))
+        {
+            return [];
+        }
+
+        lock (state.Gate)
+        {
+            return state.Nodes.Values.OrderBy(n => n.ServerId, StringComparer.Ordinal).ToArray();
+        }
+    }
+
     public void OnResponse(object member, ResponseBudget budget)
     {
         if (member is not DataverseUserPool pool || !_members.TryGetValue(pool, out var state))
@@ -63,6 +83,14 @@ internal sealed class PoolSizingController : IOperationOutcomeSink, IDisposable
         var low = false;
         lock (state.Gate)
         {
+            if (budget.ServerId is { } node && (state.Nodes.ContainsKey(node) || state.Nodes.Count < MaxTrackedNodes))
+            {
+                var burstNow = budget.BurstRemainingRequests;
+                state.Nodes[node] = state.Nodes.TryGetValue(node, out var prev)
+                    ? new ServerNodeStats(node, prev.Responses + 1, Min(prev.MinBurst, burstNow), Max(prev.MaxBurst, burstNow))
+                    : new ServerNodeStats(node, 1, burstNow, burstNow);
+            }
+
             if (budget.BurstRemainingRequests is { } burst)
             {
                 state.MaxBurstSeen = Math.Max(state.MaxBurstSeen, burst);

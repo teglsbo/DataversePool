@@ -15,7 +15,7 @@ namespace ConnectionPool.Dataverse;
 /// <param name="DopHint"><c>x-ms-dop-hint</c>.</param>
 /// <param name="ServiceRequestId"><c>x-ms-service-request-id</c>, for Microsoft support correlation.</param>
 /// <param name="ObservedAt">When the response was observed.</param>
-/// <param name="ServerId">The backend node that answered: the last <c>|</c>-separated part of <c>X-Source</c>. Diagnostic only; the budget counter was not seen to differ per node.</param>
+/// <param name="ServerId">The backend node that answered: the last value of the <c>X-Source</c> header (sent as two values; the first is constant). Diagnostic only; the budget counter was not seen to differ per node.</param>
 public sealed record ResponseBudget(
     double? BurstRemainingRequests,
     double? TimeRemainingSeconds,
@@ -23,6 +23,10 @@ public sealed record ResponseBudget(
     string? ServiceRequestId,
     DateTimeOffset ObservedAt,
     string? ServerId = null);
+
+/// <summary>Per backend node (see <see cref="ResponseBudget.ServerId"/>): how many responses it answered
+/// and the lowest and highest burst budget seen in them. Diagnostic only.</summary>
+public sealed record ServerNodeStats(string ServerId, long Responses, double? MinBurst, double? MaxBurst);
 
 /// <summary>
 /// Reads <see cref="ResponseBudget"/> from the SDK's own HTTP responses through the .NET HTTP
@@ -88,7 +92,7 @@ internal static class ResponseObservation
         double? time = ReadDouble(response, "x-ms-ratelimit-time-remaining-xrm-requests");
         var dopRaw = ReadRaw(response, "x-ms-dop-hint");
         int? dop = int.TryParse(dopRaw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var d) ? d : null;
-        var serverId = ReadRaw(response, "X-Source")?.Split('|').Last().Trim();
+        var serverId = response.Headers.TryGetValues("X-Source", out var sources) ? sources.LastOrDefault()?.Split('|').Last().Trim() : null;
         budget = new ResponseBudget(burst, time, dop, ReadRaw(response, "x-ms-service-request-id"), observedAt, string.IsNullOrEmpty(serverId) ? null : serverId);
         return burst is not null || time is not null || dop is not null;
     }
