@@ -50,13 +50,20 @@ public sealed class DataversePool : IAsyncDisposable
 
         _strategy = strategy ?? new HealthAwareRoundRobinSlotSelectionStrategy();
         _allUnavailableBehavior = allUnavailableBehavior;
-        if (sizingOptions is not null && sizingOptions.Strategy is not FixedPoolSizingStrategy)
+        if (sizingOptions is not null && (sizingOptions.Strategy is not FixedPoolSizingStrategy || sizingOptions.ObserveResponses))
         {
             _sizing = new PoolSizingController(_members, sizingOptions);
         }
     }
 
     internal IOperationOutcomeSink? SizingSink => _sizing;
+
+    /// <summary>
+    /// EXPERIMENTAL. The latest service-protection budget Dataverse reported for <paramref name="member"/>
+    /// (<see cref="PoolSizingOptions.ObserveResponses"/>), or <c>null</c> if observation is off or no
+    /// response has been seen yet.
+    /// </summary>
+    public ResponseBudget? GetResponseBudget(DataverseUserPool member) => _sizing?.GetBudget(member);
 
     /// <summary>Convenience constructor for the common single-member case - equivalent to
     /// <c>new DataversePool(new[] { member }, strategy, allUnavailableBehavior)</c>. Prefer this

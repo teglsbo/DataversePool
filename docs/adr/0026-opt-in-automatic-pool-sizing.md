@@ -79,3 +79,20 @@ limit fired before it shrinks anything.
   reproduced and concurrency throttling needs sustained load.
 - Recommended for production only after observing it with the ADR-0024 metrics on a non-critical
   tenant.
+
+## Addendum: experimental response observer
+
+`PoolSizingOptions.ObserveResponses` (default off) reads the budget headers Dataverse sends on every
+response (`x-ms-ratelimit-burst-remaining-xrm-requests`, `x-ms-ratelimit-time-remaining-xrm-requests`,
+`x-ms-dop-hint`, `x-ms-service-request-id`), for both SOAP and Web API.
+
+- A `DiagnosticListener` on `HttpHandlerDiagnosticListener` sees each response. It is attributed to a
+  member through an `AsyncLocal` the executor sets only around the attempt. It lives in the core
+  assembly because correlation needs that executor hook.
+- The listener filter must admit `System.Net.Http.HttpRequestOut` as well as `.Stop`; the runtime
+  checks the activity name before emitting `Stop`.
+- `DataversePool.GetResponseBudget(member)` returns the latest `ResponseBudget`.
+- If burst or time remaining falls to `LowBudgetFraction` (default 5 %) of the largest value seen,
+  the member's pacer holds attempts for `LowBudgetBackoff` (default 5 s). It fails open afterwards.
+- Verified live (`LiveResponseBudgetTests`). Not verified: attribution under load, listener cost,
+  and number formats on other locales.

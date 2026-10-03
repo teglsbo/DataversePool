@@ -16,12 +16,16 @@ internal sealed class PoolSizingController : IOperationOutcomeSink, IDisposable
         public readonly int ConfiguredMaxSize = configuredMaxSize;
         public PoolSizingDecision? LastDecision;
         public MemberRequestPacer Pacer = null!;
+        public ResponseBudget? Budget;
+        public double MaxBurstSeen;
+        public double MaxTimeSeen;
     }
 
     private readonly IPoolSizingStrategy _strategy;
     private readonly PoolSizingOptions _options;
     private readonly Dictionary<DataverseUserPool, MemberState> _members = new();
     private readonly ITimer _timer;
+    private readonly IDisposable? _observer;
 
     public PoolSizingController(IReadOnlyList<DataverseUserPool> members, PoolSizingOptions options)
     {
@@ -34,7 +38,47 @@ internal sealed class PoolSizingController : IOperationOutcomeSink, IDisposable
             Apply(member, state, new PoolSizingDecision(_strategy.GetInitialSize(member, state.ConfiguredMaxSize)));
         }
 
+        if (options.ObserveResponses)
+        {
+            _observer = ResponseObservation.Start(options.TimeProvider);
+        }
+
         _timer = options.TimeProvider.CreateTimer(_ => Tick(), null, options.TickInterval, options.TickInterval);
+    }
+
+    public bool ObservesResponses => _options.ObserveResponses;
+
+    public ResponseBudget? GetBudget(DataverseUserPool member) =>
+        _members.TryGetValue(member, out var state) ? Volatile.Read(ref state.Budget) : null;
+
+    public void OnResponse(object member, ResponseBudget budget)
+    {
+        if (member is not DataverseUserPool pool || !_members.TryGetValue(pool, out var state))
+        {
+            return;
+        }
+
+        Volatile.Write(ref state.Budget, budget);
+        var low = false;
+        lock (state.Gate)
+        {
+            if (budget.BurstRemainingRequests is { } burst)
+            {
+                state.MaxBurstSeen = Math.Max(state.MaxBurstSeen, burst);
+                low |= burst <= state.MaxBurstSeen * _options.LowBudgetFraction;
+            }
+
+            if (budget.TimeRemainingSeconds is { } seconds)
+            {
+                state.MaxTimeSeen = Math.Max(state.MaxTimeSeen, seconds);
+                low |= seconds <= state.MaxTimeSeen * _options.LowBudgetFraction;
+            }
+        }
+
+        if (low)
+        {
+            state.Pacer.HoldUntil(budget.ObservedAt + _options.LowBudgetBackoff);
+        }
     }
 
     public ValueTask BeforeAttemptAsync(object member, CancellationToken cancellationToken) =>
@@ -97,5 +141,9 @@ internal sealed class PoolSizingController : IOperationOutcomeSink, IDisposable
         }
     }
 
-    public void Dispose() => _timer.Dispose();
+    public void Dispose()
+    {
+        _timer.Dispose();
+        _observer?.Dispose();
+    }
 }

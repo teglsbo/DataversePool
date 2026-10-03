@@ -22,6 +22,26 @@ public sealed class PoolSizingOptions
     /// </summary>
     public int? MaxSizeCeiling { get; init; }
 
+    /// <summary>
+    /// EXPERIMENTAL. Read Dataverse's <c>x-ms-ratelimit-*</c> budget headers from the SDK's HTTP
+    /// responses (<see cref="DataversePool.GetResponseBudget"/>) and briefly hold back new attempts on a
+    /// member whose remaining request or execution-time budget is nearly spent, before Dataverse has to
+    /// throttle it. Works with any strategy, including the default. Default: off.
+    /// </summary>
+    public bool ObserveResponses { get; init; }
+
+    /// <summary>
+    /// With <see cref="ObserveResponses"/>: hold attempts back when the remaining budget falls to this
+    /// fraction of the largest value seen for the member. Default 0.05.
+    /// </summary>
+    public double LowBudgetFraction { get; init; } = 0.05;
+
+    /// <summary>
+    /// With <see cref="ObserveResponses"/>: how long a low budget holds attempts back before one is let
+    /// through to refresh the reading (fail-open). Default 5 s.
+    /// </summary>
+    public TimeSpan LowBudgetBackoff { get; init; } = TimeSpan.FromSeconds(5);
+
     /// <summary>Test seam for the tick timer and strategy clocks.</summary>
     internal TimeProvider TimeProvider { get; init; } = TimeProvider.System;
 
@@ -32,6 +52,16 @@ public sealed class PoolSizingOptions
         if (TickInterval <= TimeSpan.Zero)
         {
             throw new ArgumentOutOfRangeException(nameof(TickInterval), TickInterval, "Must be a positive duration.");
+        }
+
+        if (LowBudgetFraction is <= 0 or >= 1 || double.IsNaN(LowBudgetFraction))
+        {
+            throw new ArgumentOutOfRangeException(nameof(LowBudgetFraction), LowBudgetFraction, "Must be between 0 and 1 (exclusive).");
+        }
+
+        if (LowBudgetBackoff <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(LowBudgetBackoff), LowBudgetBackoff, "Must be a positive duration.");
         }
 
         if (MinSizeFloor < 1)

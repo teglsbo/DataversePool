@@ -31,6 +31,14 @@ internal interface IOperationOutcomeSink
 
     /// <summary>Called after a lease is held and before the attempt runs; may delay it (pacing).</summary>
     ValueTask BeforeAttemptAsync(object member, CancellationToken cancellationToken) => ValueTask.CompletedTask;
+
+    /// <summary>True if the sink wants <see cref="OnResponse"/> calls for attempts it is attached to.</summary>
+    bool ObservesResponses => false;
+
+    /// <summary>The budget headers of an HTTP response made during an attempt on <paramref name="member"/>.</summary>
+    void OnResponse(object member, ResponseBudget budget)
+    {
+    }
 }
 
 internal static class DataverseLeaseAccessors
@@ -128,6 +136,11 @@ internal static class DataverseOperationExecutor
                         }
                     }
 
+                    if (sink is { ObservesResponses: true })
+                    {
+                        ResponseObservation.Current.Value = new ResponseObservation.Target(sink, accessors.Member(lease));
+                    }
+
                     var result = await operation(lease, cancellationToken).ConfigureAwait(false);
                     if (enabled)
                     {
@@ -188,6 +201,7 @@ internal static class DataverseOperationExecutor
                 }
                 finally
                 {
+                    ResponseObservation.Current.Value = null;
                     if (enabled)
                     {
                         recorder.ActiveChanged(scope, memberName, -1);

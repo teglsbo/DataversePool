@@ -726,3 +726,9 @@ pool creation/isolation/health-check timing — several behaviors here look like
 ## License
 
 [MIT](LICENSE)
+
+### Experimental: response budget observer
+
+Set `PoolSizingOptions.ObserveResponses = true` to read Dataverse's rate-limit headers from every
+response. `pool.GetResponseBudget(member)` returns the latest values, and a nearly exhausted budget
+briefly holds that member's requests. Off by default; see ADR-0026.

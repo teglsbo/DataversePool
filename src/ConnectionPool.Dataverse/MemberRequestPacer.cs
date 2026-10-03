@@ -12,12 +12,25 @@ internal sealed class MemberRequestPacer(TimeProvider time)
     private readonly Queue<(DateTimeOffset At, TimeSpan Duration)> _executions = new();
     private TimeSpan _executionSum;
     private TimeSpan? _executionLimit;
+    private DateTimeOffset _holdUntil;
     private int? _limit;
     private TimeSpan _window = TimeSpan.FromMinutes(5);
 
     public (int? Limit, TimeSpan Window) Current
     {
         get { lock (_gate) { return (_limit, _window); } }
+    }
+
+    /// <summary>Delays every new attempt until <paramref name="until"/> (a fail-open, time-bounded gate).</summary>
+    public void HoldUntil(DateTimeOffset until)
+    {
+        lock (_gate)
+        {
+            if (until > _holdUntil)
+            {
+                _holdUntil = until;
+            }
+        }
     }
 
     /// <summary>Adds a finished attempt's duration to the execution-time budget window.</summary>
@@ -59,12 +72,18 @@ internal sealed class MemberRequestPacer(TimeProvider time)
             TimeSpan delay;
             lock (_gate)
             {
+                var now = time.GetUtcNow();
+                if (now < _holdUntil)
+                {
+                    delay = _holdUntil - now;
+                    goto wait;
+                }
+
                 if (_limit is null && _executionLimit is null)
                 {
                     return;
                 }
 
-                var now = time.GetUtcNow();
                 while (_starts.Count > 0 && now - _starts.Peek() >= _window)
                 {
                     _starts.Dequeue();
@@ -95,6 +114,7 @@ internal sealed class MemberRequestPacer(TimeProvider time)
                 }
             }
 
+        wait:
             await Task.Delay(delay > TimeSpan.Zero ? delay : TimeSpan.FromMilliseconds(1), time, cancellationToken).ConfigureAwait(false);
         }
     }
