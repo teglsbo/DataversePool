@@ -106,3 +106,16 @@ response (`x-ms-ratelimit-burst-remaining-xrm-requests`, `x-ms-ratelimit-time-re
   take tens of milliseconds, so this is negligible. Numbers are parsed independently of the
   current culture: `1,199.97` (as sent) and `1.199,97` are accepted, ambiguous values such as `1,5` are
   ignored rather than guessed.
+
+## Addendum: live results for request-count throttling and the low-budget hold
+
+`LiveBudgetDrainTests` (opt-in, `DVPOOL_IT_DRAIN=1`) spends the second identity's request budget.
+
+- A real Web API request-count 429 was reproduced: `0x80072322`, "Number of requests exceeded the limit
+  of 8000 over time window of 300 seconds." The decoder returns `RequestCount`. About 8000 cheap
+  `WhoAmI()` calls at 16 concurrent took under a minute. The limit is 8000 per 300 s per user, which is
+  also the burst budget the headers report.
+- The low-budget hold fired live: with the observer on, after burst remaining fell to 5 % of the maximum
+  seen (about 400 of 8000), all 55 following calls were held back by at least 2.5 s (backoff 3 s). The
+  run stopped at 330 remaining and never reached a throttle.
+- Still unseen live: an `ExecutionTime` throttle, so that pacer remains unit-tested only.

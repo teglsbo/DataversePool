@@ -696,6 +696,19 @@ public class PoolSizingTests
     }
 
     [Fact]
+    public void ThrottleReason_WebApiRequestCount429_IsDecodedFromResponseBody_AsSeenLive()
+    {
+        var ex = new HttpOperationException("Operation returned an invalid status code 'TooManyRequests'")
+        {
+            Response = new HttpResponseMessageWrapper(
+                new HttpResponseMessage((HttpStatusCode)429),
+                content: "{\"error\":{\"code\":\"0x80072322\",\"message\":\"Number of requests exceeded the limit of 8000 over time window of 300 seconds.\"}}"),
+        };
+        Assert.True(DataverseThrottleDetector.TryGetThrottleReason(ex, out var reason));
+        Assert.Equal(ThrottleReason.RequestCount, reason);
+    }
+
+    [Fact]
     public void ThrottleReason_NonThrottle_ReturnsFalse() =>
         Assert.False(DataverseThrottleDetector.TryGetThrottleReason(new InvalidOperationException(), out _));
 }
