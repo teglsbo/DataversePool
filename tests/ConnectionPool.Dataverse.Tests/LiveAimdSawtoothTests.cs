@@ -38,6 +38,8 @@ public class LiveAimdSawtoothTests
         var workers = EnvInt("DVPOOL_IT_SAWTOOTH_WORKERS", 1000);
         var maxSize = EnvInt("DVPOOL_IT_SAWTOOTH_MAXSIZE", 400);
         var slow = Environment.GetEnvironmentVariable("DVPOOL_IT_SAWTOOTH_SLOW") == "1";
+        var slowData = Environment.GetEnvironmentVariable("DVPOOL_IT_SAWTOOTH_SLOW") == "data";
+        var createMode = Environment.GetEnvironmentVariable("DVPOOL_IT_SAWTOOTH_SLOW") == "create";
 
         // MaxRetryCount 0: the SDK must not absorb 429s, or the pool never sees them.
         var member = new DataverseUserPool(
@@ -74,6 +76,17 @@ public class LiveAimdSawtoothTests
                         Interlocked.Increment(ref inFlight);
                         try
                         {
+                            if (createMode)
+                            {
+                                var account = new Microsoft.Xrm.Sdk.Entity("account") { ["name"] = "dvpool-sim-" + Guid.NewGuid().ToString("N") };
+                                return (await client.CreateAsync(account, ct)).GetHashCode();
+                            }
+
+                            if (slowData)
+                            {
+                                return (await client.RetrieveMultipleAsync(new Microsoft.Xrm.Sdk.Query.QueryExpression("asyncoperation") { ColumnSet = new Microsoft.Xrm.Sdk.Query.ColumnSet(true), TopCount = 5000 }, ct)).Entities.Count;
+                            }
+
                             if (slow)
                             {
                                 var meta = (RetrieveAllEntitiesResponse)await client.ExecuteAsync(
